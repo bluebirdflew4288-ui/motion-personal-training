@@ -1,0 +1,1740 @@
+{
+  "format": "motion-training-backup",
+  "version": 1,
+  "exportedAt": 1792510333532,
+  "appVersion": "1.0.0",
+  "counts": {
+    "plans": 1,
+    "sessions": 2,
+    "activeSessions": 1
+  },
+  "data": {
+    "plans": [
+      {
+        "id": "plan-v32",
+        "name": "三分化训练计划 V3.2",
+        "presetId": "v3.2",
+        "cursor": 1,
+        "createdAt": 1792509546505,
+        "updatedAt": 1792509996536,
+        "days": [
+          {
+            "id": "day-chest-a",
+            "name": "胸 A",
+            "focus": "chest",
+            "round": "A",
+            "kind": "train",
+            "warmups": [
+              {
+                "id": "w-chest-1",
+                "name": "弹力带水平拉开",
+                "en": "BAND PULL-APART",
+                "unit": "reps",
+                "targetText": "2 × 10–15"
+              },
+              {
+                "id": "w-chest-2",
+                "name": "弹力带绕肩",
+                "en": "BAND PASS-THROUGH",
+                "unit": "reps",
+                "targetText": "1–2 × 8–12"
+              },
+              {
+                "id": "w-chest-3",
+                "name": "辅助双杠臂屈伸",
+                "en": "ASSISTED DIP",
+                "unit": "reps",
+                "targetText": "1 × 5–8"
+              },
+              {
+                "id": "w-chest-4",
+                "name": "卧推轻重量递增",
+                "en": "BENCH RAMP-UP",
+                "unit": "reps",
+                "targetText": "1–2 组 · 按需",
+                "optional": true
+              }
+            ],
+            "exercises": [
+              {
+                "id": "ex-ca-1",
+                "name": "双杠臂屈伸",
+                "en": "CHEST DIP",
+                "restSec": 150,
+                "target": {
+                  "kind": "straight",
+                  "sets": 3,
+                  "setsMax": 3,
+                  "repsMin": 6,
+                  "repsMax": 10,
+                  "weightMode": "bodyweight_plus",
+                  "suggestedWeightKg": null
+                }
+              },
+              {
+                "id": "ex-ca-2",
+                "name": "自由杠铃卧推",
+                "en": "BARBELL BENCH PRESS",
+                "restSec": 180,
+                "substitutes": [
+                  "哑铃卧推"
+                ],
+                "target": {
+                  "kind": "straight",
+                  "sets": 3,
+                  "setsMax": 3,
+                  "repsMin": 6,
+                  "repsMax": 10,
+                  "weightMode": "external",
+                  "suggestedWeightKg": null
+                }
+              },
+              {
+                "id": "ex-ca-3",
+                "name": "史密斯上斜卧推",
+                "en": "SMITH INCLINE PRESS",
+                "restSec": 120,
+                "substitutes": [
+                  "上斜哑铃卧推"
+                ],
+                "target": {
+                  "kind": "straight",
+                  "sets": 2,
+                  "setsMax": 2,
+                  "repsMin": 8,
+                  "repsMax": 12,
+                  "weightMode": "external",
+                  "suggestedWeightKg": null
+                }
+              },
+              {
+                "id": "ex-ca-4",
+                "name": "蝴蝶机夹胸",
+                "en": "PEC DECK FLY",
+                "restSec": 75,
+                "target": {
+                  "kind": "straight",
+                  "sets": 1,
+                  "setsMax": 1,
+                  "repsMin": 12,
+                  "repsMax": 15,
+                  "weightMode": "external",
+                  "suggestedWeightKg": null
+                }
+              },
+              {
+                "id": "ex-ca-5",
+                "name": "器械推肩",
+                "en": "MACHINE SHOULDER PRESS",
+                "restSec": 90,
+                "target": {
+                  "kind": "straight",
+                  "sets": 2,
+                  "setsMax": 2,
+                  "repsMin": 10,
+                  "repsMax": 12,
+                  "weightMode": "external",
+                  "suggestedWeightKg": null
+                }
+              },
+              {
+                "id": "ex-ca-6",
+                "name": "绳索下压",
+                "en": "CABLE PUSHDOWN",
+                "restSec": 75,
+                "target": {
+                  "kind": "straight",
+                  "sets": 2,
+                  "setsMax": 2,
+                  "repsMin": 10,
+                  "repsMax": 15,
+                  "weightMode": "external",
+                  "suggestedWeightKg": null
+                }
+              },
+              {
+                "id": "ex-ca-7",
+                "name": "哑铃颈后臂屈伸",
+                "en": "OVERHEAD DB EXTENSION",
+                "restSec": 90,
+                "target": {
+                  "kind": "straight",
+                  "sets": 2,
+                  "setsMax": 2,
+                  "repsMin": 10,
+                  "repsMax": 15,
+                  "weightMode": "external",
+                  "suggestedWeightKg": null,
+                  "dumbbellBasis": "per_hand"
+                }
+              },
+              {
+                "id": "ex-ca-8",
+                "name": "绳索卷腹",
+                "en": "CABLE CRUNCH",
+                "restSec": 60,
+                "target": {
+                  "kind": "straight",
+                  "sets": 2,
+                  "setsMax": 2,
+                  "repsMin": 15,
+                  "repsMax": 25,
+                  "weightMode": "external",
+                  "suggestedWeightKg": null
+                }
+              }
+            ]
+          },
+          {
+            "id": "day-back-a",
+            "name": "背 A",
+            "focus": "back",
+            "round": "A",
+            "kind": "train",
+            "warmups": [
+              {
+                "id": "w-back-1",
+                "name": "跪姿肘撑肩胛控制",
+                "en": "KNEELING SCAPULAR",
+                "unit": "breath",
+                "targetText": "2 组 × 约 10 次呼吸"
+              },
+              {
+                "id": "w-back-2",
+                "name": "动态平板支撑屈髋",
+                "en": "PLANK HIP FLEXION",
+                "unit": "reps",
+                "targetText": "2 × 15"
+              }
+            ],
+            "exercises": [
+              {
+                "id": "ex-ba-1",
+                "name": "正手宽握引体向上",
+                "en": "WIDE-GRIP PULL-UP",
+                "restSec": 210,
+                "target": {
+                  "kind": "straight",
+                  "sets": 4,
+                  "setsMax": 4,
+                  "repsMin": 8,
+                  "repsMax": 12,
+                  "weightMode": "bodyweight_plus",
+                  "suggestedWeightKg": null
+                }
+              },
+              {
+                "id": "ex-ba-2",
+                "name": "分体悍马划船",
+                "en": "HAMMER ROW",
+                "restSec": 120,
+                "substitutes": [
+                  "胸托划船",
+                  "坐姿绳索划船"
+                ],
+                "target": {
+                  "kind": "straight",
+                  "sets": 3,
+                  "setsMax": 3,
+                  "repsMin": 8,
+                  "repsMax": 12,
+                  "weightMode": "external",
+                  "suggestedWeightKg": null
+                }
+              },
+              {
+                "id": "ex-ba-3",
+                "name": "中立握高位下拉",
+                "en": "NEUTRAL-GRIP PULLDOWN",
+                "restSec": 120,
+                "target": {
+                  "kind": "straight",
+                  "sets": 1,
+                  "setsMax": 2,
+                  "repsMin": 10,
+                  "repsMax": 12,
+                  "weightMode": "external",
+                  "suggestedWeightKg": null
+                }
+              },
+              {
+                "id": "ex-ba-4",
+                "name": "面拉",
+                "en": "FACE PULL",
+                "restSec": 75,
+                "target": {
+                  "kind": "straight",
+                  "sets": 2,
+                  "setsMax": 2,
+                  "repsMin": 12,
+                  "repsMax": 20,
+                  "weightMode": "external",
+                  "suggestedWeightKg": null
+                }
+              },
+              {
+                "id": "ex-ba-5",
+                "name": "固定器械二头弯举",
+                "en": "MACHINE CURL",
+                "restSec": 90,
+                "target": {
+                  "kind": "straight",
+                  "sets": 2,
+                  "setsMax": 2,
+                  "repsMin": 10,
+                  "repsMax": 12,
+                  "weightMode": "external",
+                  "suggestedWeightKg": null
+                }
+              },
+              {
+                "id": "ex-ba-6",
+                "name": "哑铃锤式弯举",
+                "en": "HAMMER CURL",
+                "restSec": 90,
+                "target": {
+                  "kind": "straight",
+                  "sets": 2,
+                  "setsMax": 2,
+                  "repsMin": 10,
+                  "repsMax": 15,
+                  "weightMode": "external",
+                  "suggestedWeightKg": null,
+                  "dumbbellBasis": "per_hand"
+                }
+              },
+              {
+                "id": "ex-ba-7",
+                "name": "悬垂举腿",
+                "en": "HANGING LEG RAISE",
+                "restSec": 60,
+                "target": {
+                  "kind": "straight",
+                  "sets": 2,
+                  "setsMax": 2,
+                  "repsMin": 10,
+                  "repsMax": 15,
+                  "weightMode": "bodyweight",
+                  "suggestedWeightKg": null
+                }
+              }
+            ]
+          },
+          {
+            "id": "day-legs-a",
+            "name": "腿 A",
+            "focus": "legs",
+            "round": "A",
+            "kind": "train",
+            "warmups": [
+              {
+                "id": "w-legs-1",
+                "name": "跑步机坡走",
+                "en": "INCLINE WALK",
+                "unit": "time",
+                "targetText": "5–8 分钟"
+              },
+              {
+                "id": "w-legs-2",
+                "name": "徒手深蹲",
+                "en": "BODYWEIGHT SQUAT",
+                "unit": "reps",
+                "targetText": "1 × 8–12 · 按需",
+                "optional": true
+              },
+              {
+                "id": "w-legs-3",
+                "name": "哈克 / 倒蹬递增热身",
+                "en": "RAMP-UP SETS",
+                "unit": "reps",
+                "targetText": "40–50%×8–10 → 60–70%×4–6 → 80–85%×2–3"
+              }
+            ],
+            "exercises": [
+              {
+                "id": "ex-la-1",
+                "name": "正向哈克深蹲",
+                "en": "HACK SQUAT",
+                "restSec": 150,
+                "target": {
+                  "kind": "straight",
+                  "sets": 3,
+                  "setsMax": 3,
+                  "repsMin": 6,
+                  "repsMax": 10,
+                  "weightMode": "external",
+                  "suggestedWeightKg": null
+                }
+              },
+              {
+                "id": "ex-la-2",
+                "name": "坐姿腿屈伸",
+                "en": "LEG EXTENSION",
+                "restSec": 90,
+                "target": {
+                  "kind": "straight",
+                  "sets": 2,
+                  "setsMax": 2,
+                  "repsMin": 10,
+                  "repsMax": 12,
+                  "weightMode": "external",
+                  "suggestedWeightKg": null
+                }
+              },
+              {
+                "id": "ex-la-3",
+                "name": "坐姿腿弯举",
+                "en": "SEATED LEG CURL",
+                "restSec": 90,
+                "target": {
+                  "kind": "straight",
+                  "sets": 3,
+                  "setsMax": 3,
+                  "repsMin": 10,
+                  "repsMax": 12,
+                  "weightMode": "external",
+                  "suggestedWeightKg": null
+                }
+              },
+              {
+                "id": "ex-la-4",
+                "name": "哈克提踵",
+                "en": "HACK SQUAT CALF RAISE",
+                "restSec": 75,
+                "target": {
+                  "kind": "straight",
+                  "sets": 2,
+                  "setsMax": 2,
+                  "repsMin": 10,
+                  "repsMax": 15,
+                  "weightMode": "external",
+                  "suggestedWeightKg": null
+                }
+              },
+              {
+                "id": "ex-la-5",
+                "name": "坐姿髋内收机",
+                "en": "HIP ADDUCTION",
+                "restSec": 75,
+                "target": {
+                  "kind": "straight",
+                  "sets": 2,
+                  "setsMax": 2,
+                  "repsMin": 10,
+                  "repsMax": 15,
+                  "weightMode": "external",
+                  "suggestedWeightKg": null
+                }
+              },
+              {
+                "id": "ex-lateral",
+                "name": "哑铃侧平举",
+                "en": "DB LATERAL RAISE",
+                "restSec": 180,
+                "note": "三轮 = 三个正式大组；阶段间休 10–30 秒，轮间至少 3 分钟。侧平举专项热身不计入正式组。",
+                "target": {
+                  "kind": "dropSet",
+                  "rounds": 3,
+                  "weightMode": "external",
+                  "dumbbellBasis": "per_hand",
+                  "restInSec": 20,
+                  "restAfterSec": 180,
+                  "stages": [
+                    {
+                      "label": "第一阶段",
+                      "weightKg": 7.5,
+                      "repsMin": 10,
+                      "repsMax": 16,
+                      "toFailure": false,
+                      "targetText": "7.5 kg · 10–16 次"
+                    },
+                    {
+                      "label": "第二阶段",
+                      "weightKg": 5,
+                      "repsMin": 10,
+                      "repsMax": 16,
+                      "toFailure": false,
+                      "targetText": "5 kg · 10–16 次"
+                    },
+                    {
+                      "label": "第三阶段",
+                      "weightKg": 5,
+                      "repsMin": null,
+                      "repsMax": null,
+                      "toFailure": true,
+                      "targetText": "5 kg · 技术性力竭"
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "ex-la-7",
+                "name": "绳索卷腹",
+                "en": "CABLE CRUNCH",
+                "restSec": 60,
+                "target": {
+                  "kind": "straight",
+                  "sets": 2,
+                  "setsMax": 2,
+                  "repsMin": 15,
+                  "repsMax": 25,
+                  "weightMode": "external",
+                  "suggestedWeightKg": null
+                }
+              },
+              {
+                "id": "ex-la-8",
+                "name": "正手抬腕",
+                "en": "REVERSE WRIST CURL",
+                "restSec": 75,
+                "target": {
+                  "kind": "straight",
+                  "sets": 3,
+                  "setsMax": 3,
+                  "repsMin": 15,
+                  "repsMax": 20,
+                  "weightMode": "external",
+                  "suggestedWeightKg": null
+                }
+              }
+            ]
+          },
+          {
+            "id": "day-rest-1",
+            "name": "恢复",
+            "focus": "chest",
+            "round": "A",
+            "kind": "rest",
+            "restNote": "睡眠 · 步行 · 放松，不做抗阻训练。",
+            "warmups": [],
+            "exercises": []
+          },
+          {
+            "id": "day-chest-b",
+            "name": "胸 B",
+            "focus": "chest",
+            "round": "B",
+            "kind": "train",
+            "warmups": [
+              {
+                "id": "w-chest-1",
+                "name": "弹力带水平拉开",
+                "en": "BAND PULL-APART",
+                "unit": "reps",
+                "targetText": "2 × 10–15"
+              },
+              {
+                "id": "w-chest-2",
+                "name": "弹力带绕肩",
+                "en": "BAND PASS-THROUGH",
+                "unit": "reps",
+                "targetText": "1–2 × 8–12"
+              },
+              {
+                "id": "w-chest-3",
+                "name": "辅助双杠臂屈伸",
+                "en": "ASSISTED DIP",
+                "unit": "reps",
+                "targetText": "1 × 5–8"
+              },
+              {
+                "id": "w-chest-4",
+                "name": "卧推轻重量递增",
+                "en": "BENCH RAMP-UP",
+                "unit": "reps",
+                "targetText": "1–2 组 · 按需",
+                "optional": true
+              }
+            ],
+            "exercises": [
+              {
+                "id": "ex-cb-1",
+                "name": "双杠臂屈伸",
+                "en": "CHEST DIP",
+                "restSec": 120,
+                "target": {
+                  "kind": "straight",
+                  "sets": 2,
+                  "setsMax": 2,
+                  "repsMin": 8,
+                  "repsMax": 12,
+                  "weightMode": "bodyweight_plus",
+                  "suggestedWeightKg": null
+                }
+              },
+              {
+                "id": "ex-cb-2",
+                "name": "自由杠铃卧推",
+                "en": "BARBELL BENCH PRESS",
+                "restSec": 150,
+                "substitutes": [
+                  "哑铃卧推"
+                ],
+                "target": {
+                  "kind": "straight",
+                  "sets": 3,
+                  "setsMax": 3,
+                  "repsMin": 8,
+                  "repsMax": 12,
+                  "weightMode": "external",
+                  "suggestedWeightKg": null
+                }
+              },
+              {
+                "id": "ex-cb-3",
+                "name": "史密斯上斜卧推",
+                "en": "SMITH INCLINE PRESS",
+                "restSec": 90,
+                "substitutes": [
+                  "片挂式上斜推胸"
+                ],
+                "target": {
+                  "kind": "straight",
+                  "sets": 2,
+                  "setsMax": 2,
+                  "repsMin": 10,
+                  "repsMax": 15,
+                  "weightMode": "external",
+                  "suggestedWeightKg": null
+                }
+              },
+              {
+                "id": "ex-cb-4",
+                "name": "蝴蝶机夹胸",
+                "en": "PEC DECK FLY",
+                "restSec": 75,
+                "target": {
+                  "kind": "straight",
+                  "sets": 2,
+                  "setsMax": 2,
+                  "repsMin": 12,
+                  "repsMax": 20,
+                  "weightMode": "external",
+                  "suggestedWeightKg": null
+                }
+              },
+              {
+                "id": "ex-cb-5",
+                "name": "器械推肩",
+                "en": "MACHINE SHOULDER PRESS",
+                "restSec": 90,
+                "target": {
+                  "kind": "straight",
+                  "sets": 2,
+                  "setsMax": 2,
+                  "repsMin": 12,
+                  "repsMax": 15,
+                  "weightMode": "external",
+                  "suggestedWeightKg": null
+                }
+              },
+              {
+                "id": "ex-cb-6",
+                "name": "绳索下压",
+                "en": "CABLE PUSHDOWN",
+                "restSec": 75,
+                "target": {
+                  "kind": "straight",
+                  "sets": 2,
+                  "setsMax": 2,
+                  "repsMin": 12,
+                  "repsMax": 15,
+                  "weightMode": "external",
+                  "suggestedWeightKg": null
+                }
+              },
+              {
+                "id": "ex-cb-7",
+                "name": "哑铃颈后臂屈伸",
+                "en": "OVERHEAD DB EXTENSION",
+                "restSec": 90,
+                "target": {
+                  "kind": "straight",
+                  "sets": 2,
+                  "setsMax": 2,
+                  "repsMin": 12,
+                  "repsMax": 15,
+                  "weightMode": "external",
+                  "suggestedWeightKg": null,
+                  "dumbbellBasis": "per_hand"
+                }
+              },
+              {
+                "id": "ex-cb-8",
+                "name": "悬垂举腿",
+                "en": "HANGING LEG RAISE",
+                "restSec": 60,
+                "target": {
+                  "kind": "straight",
+                  "sets": 2,
+                  "setsMax": 2,
+                  "repsMin": 10,
+                  "repsMax": 15,
+                  "weightMode": "bodyweight",
+                  "suggestedWeightKg": null
+                }
+              }
+            ]
+          },
+          {
+            "id": "day-back-b",
+            "name": "背 B",
+            "focus": "back",
+            "round": "B",
+            "kind": "train",
+            "warmups": [
+              {
+                "id": "w-back-1",
+                "name": "跪姿肘撑肩胛控制",
+                "en": "KNEELING SCAPULAR",
+                "unit": "breath",
+                "targetText": "2 组 × 约 10 次呼吸"
+              },
+              {
+                "id": "w-back-2",
+                "name": "动态平板支撑屈髋",
+                "en": "PLANK HIP FLEXION",
+                "unit": "reps",
+                "targetText": "2 × 15"
+              }
+            ],
+            "exercises": [
+              {
+                "id": "ex-bb-1",
+                "name": "正手宽握引体向上",
+                "en": "WIDE-GRIP PULL-UP",
+                "restSec": 210,
+                "target": {
+                  "kind": "straight",
+                  "sets": 4,
+                  "setsMax": 4,
+                  "repsMin": 8,
+                  "repsMax": 12,
+                  "weightMode": "bodyweight_plus",
+                  "suggestedWeightKg": null
+                }
+              },
+              {
+                "id": "ex-bb-2",
+                "name": "胸托划船",
+                "en": "CHEST-SUPPORTED ROW",
+                "restSec": 120,
+                "substitutes": [
+                  "分体悍马划船"
+                ],
+                "target": {
+                  "kind": "straight",
+                  "sets": 3,
+                  "setsMax": 3,
+                  "repsMin": 10,
+                  "repsMax": 12,
+                  "weightMode": "external",
+                  "suggestedWeightKg": null
+                }
+              },
+              {
+                "id": "ex-bb-3",
+                "name": "大剪刀弧线下拉",
+                "en": "ARC PULLDOWN",
+                "restSec": 120,
+                "target": {
+                  "kind": "straight",
+                  "sets": 1,
+                  "setsMax": 2,
+                  "repsMin": 12,
+                  "repsMax": 15,
+                  "weightMode": "external",
+                  "suggestedWeightKg": null
+                }
+              },
+              {
+                "id": "ex-bb-4",
+                "name": "绳索直臂下拉",
+                "en": "STRAIGHT-ARM PULLDOWN",
+                "restSec": 90,
+                "note": "不是必须完成，按当天状态决定是否增加。",
+                "target": {
+                  "kind": "straight",
+                  "sets": 0,
+                  "setsMax": 2,
+                  "repsMin": 12,
+                  "repsMax": 15,
+                  "weightMode": "external",
+                  "suggestedWeightKg": null
+                }
+              },
+              {
+                "id": "ex-bb-5",
+                "name": "反向蝴蝶机飞鸟",
+                "en": "REVERSE PEC DECK",
+                "restSec": 75,
+                "target": {
+                  "kind": "straight",
+                  "sets": 3,
+                  "setsMax": 3,
+                  "repsMin": 12,
+                  "repsMax": 20,
+                  "weightMode": "external",
+                  "suggestedWeightKg": null
+                }
+              },
+              {
+                "id": "ex-bb-6",
+                "name": "上斜哑铃弯举",
+                "en": "INCLINE DB CURL",
+                "restSec": 90,
+                "target": {
+                  "kind": "straight",
+                  "sets": 2,
+                  "setsMax": 2,
+                  "repsMin": 10,
+                  "repsMax": 15,
+                  "weightMode": "external",
+                  "suggestedWeightKg": null,
+                  "dumbbellBasis": "per_hand"
+                }
+              },
+              {
+                "id": "ex-bb-7",
+                "name": "哑铃锤式弯举",
+                "en": "HAMMER CURL",
+                "restSec": 90,
+                "target": {
+                  "kind": "straight",
+                  "sets": 2,
+                  "setsMax": 2,
+                  "repsMin": 12,
+                  "repsMax": 15,
+                  "weightMode": "external",
+                  "suggestedWeightKg": null,
+                  "dumbbellBasis": "per_hand"
+                }
+              },
+              {
+                "id": "ex-bb-8",
+                "name": "绳索卷腹",
+                "en": "CABLE CRUNCH",
+                "restSec": 60,
+                "target": {
+                  "kind": "straight",
+                  "sets": 2,
+                  "setsMax": 2,
+                  "repsMin": 15,
+                  "repsMax": 25,
+                  "weightMode": "external",
+                  "suggestedWeightKg": null
+                }
+              }
+            ]
+          },
+          {
+            "id": "day-legs-b",
+            "name": "腿 B",
+            "focus": "legs",
+            "round": "B",
+            "kind": "train",
+            "warmups": [
+              {
+                "id": "w-legs-1",
+                "name": "跑步机坡走",
+                "en": "INCLINE WALK",
+                "unit": "time",
+                "targetText": "5–8 分钟"
+              },
+              {
+                "id": "w-legs-2",
+                "name": "徒手深蹲",
+                "en": "BODYWEIGHT SQUAT",
+                "unit": "reps",
+                "targetText": "1 × 8–12 · 按需",
+                "optional": true
+              },
+              {
+                "id": "w-legs-3",
+                "name": "哈克 / 倒蹬递增热身",
+                "en": "RAMP-UP SETS",
+                "unit": "reps",
+                "targetText": "40–50%×8–10 → 60–70%×4–6 → 80–85%×2–3"
+              }
+            ],
+            "exercises": [
+              {
+                "id": "ex-lb-1",
+                "name": "倒蹬",
+                "en": "LEG PRESS",
+                "restSec": 120,
+                "target": {
+                  "kind": "straight",
+                  "sets": 3,
+                  "setsMax": 3,
+                  "repsMin": 10,
+                  "repsMax": 15,
+                  "weightMode": "external",
+                  "suggestedWeightKg": null
+                }
+              },
+              {
+                "id": "ex-lb-2",
+                "name": "坐姿腿屈伸",
+                "en": "LEG EXTENSION",
+                "restSec": 90,
+                "target": {
+                  "kind": "straight",
+                  "sets": 2,
+                  "setsMax": 2,
+                  "repsMin": 12,
+                  "repsMax": 15,
+                  "weightMode": "external",
+                  "suggestedWeightKg": null
+                }
+              },
+              {
+                "id": "ex-lb-3",
+                "name": "坐姿腿弯举",
+                "en": "SEATED LEG CURL",
+                "restSec": 90,
+                "target": {
+                  "kind": "straight",
+                  "sets": 3,
+                  "setsMax": 3,
+                  "repsMin": 12,
+                  "repsMax": 15,
+                  "weightMode": "external",
+                  "suggestedWeightKg": null
+                }
+              },
+              {
+                "id": "ex-lb-4",
+                "name": "哈克提踵",
+                "en": "HACK SQUAT CALF RAISE",
+                "restSec": 75,
+                "target": {
+                  "kind": "straight",
+                  "sets": 2,
+                  "setsMax": 2,
+                  "repsMin": 12,
+                  "repsMax": 20,
+                  "weightMode": "external",
+                  "suggestedWeightKg": null
+                }
+              },
+              {
+                "id": "ex-lb-5",
+                "name": "坐姿髋内收机",
+                "en": "HIP ADDUCTION",
+                "restSec": 75,
+                "target": {
+                  "kind": "straight",
+                  "sets": 2,
+                  "setsMax": 2,
+                  "repsMin": 12,
+                  "repsMax": 20,
+                  "weightMode": "external",
+                  "suggestedWeightKg": null
+                }
+              },
+              {
+                "id": "ex-lateral-b",
+                "name": "哑铃侧平举",
+                "en": "DB LATERAL RAISE",
+                "restSec": 180,
+                "note": "三轮 = 三个正式大组；阶段间休 10–30 秒，轮间至少 3 分钟。侧平举专项热身不计入正式组。",
+                "target": {
+                  "kind": "dropSet",
+                  "rounds": 3,
+                  "weightMode": "external",
+                  "dumbbellBasis": "per_hand",
+                  "restInSec": 20,
+                  "restAfterSec": 180,
+                  "stages": [
+                    {
+                      "label": "第一阶段",
+                      "weightKg": 7.5,
+                      "repsMin": 10,
+                      "repsMax": 16,
+                      "toFailure": false,
+                      "targetText": "7.5 kg · 10–16 次"
+                    },
+                    {
+                      "label": "第二阶段",
+                      "weightKg": 5,
+                      "repsMin": 10,
+                      "repsMax": 16,
+                      "toFailure": false,
+                      "targetText": "5 kg · 10–16 次"
+                    },
+                    {
+                      "label": "第三阶段",
+                      "weightKg": 5,
+                      "repsMin": null,
+                      "repsMax": null,
+                      "toFailure": true,
+                      "targetText": "5 kg · 技术性力竭"
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "ex-lb-7",
+                "name": "悬垂举腿",
+                "en": "HANGING LEG RAISE",
+                "restSec": 60,
+                "target": {
+                  "kind": "straight",
+                  "sets": 2,
+                  "setsMax": 2,
+                  "repsMin": 10,
+                  "repsMax": 15,
+                  "weightMode": "bodyweight",
+                  "suggestedWeightKg": null
+                }
+              },
+              {
+                "id": "ex-lb-8",
+                "name": "反手抬腕",
+                "en": "WRIST CURL",
+                "restSec": 75,
+                "target": {
+                  "kind": "straight",
+                  "sets": 3,
+                  "setsMax": 3,
+                  "repsMin": 15,
+                  "repsMax": 25,
+                  "weightMode": "external",
+                  "suggestedWeightKg": null
+                }
+              }
+            ]
+          },
+          {
+            "id": "day-rest-2",
+            "name": "完全休息",
+            "focus": "chest",
+            "round": "A",
+            "kind": "rest",
+            "restNote": "不做抗阻训练。",
+            "warmups": [],
+            "exercises": []
+          }
+        ]
+      }
+    ],
+    "sessions": [
+      {
+        "id": "sess-mvguai2i-x33nbb",
+        "planId": "plan-v32",
+        "planName": "三分化训练计划 V3.2",
+        "day": {
+          "dayId": "day-chest-b",
+          "dayName": "胸 B",
+          "focus": "chest",
+          "round": "B",
+          "partText": "胸 B"
+        },
+        "cycleIndexAtStart": 1,
+        "startedAt": 1792510199802,
+        "endedAt": null,
+        "status": "active",
+        "pausedMs": 0,
+        "pausedAt": null,
+        "warmups": [
+          {
+            "id": "w-chest-1",
+            "name": "弹力带水平拉开",
+            "unit": "reps",
+            "targetText": "2 × 10–15",
+            "done": false
+          },
+          {
+            "id": "w-chest-2",
+            "name": "弹力带绕肩",
+            "unit": "reps",
+            "targetText": "1–2 × 8–12",
+            "done": false
+          },
+          {
+            "id": "w-chest-3",
+            "name": "辅助双杠臂屈伸",
+            "unit": "reps",
+            "targetText": "1 × 5–8",
+            "done": false
+          },
+          {
+            "id": "w-chest-4",
+            "name": "卧推轻重量递增",
+            "unit": "reps",
+            "targetText": "1–2 组 · 按需",
+            "done": false
+          }
+        ],
+        "exercises": [
+          {
+            "id": "sex-mvguai2i-i7a2bk",
+            "planExerciseId": "ex-cb-1",
+            "name": "双杠臂屈伸",
+            "en": "CHEST DIP",
+            "restSec": 120,
+            "target": {
+              "kind": "straight",
+              "sets": 2,
+              "setsMax": 2,
+              "repsMin": 8,
+              "repsMax": 12,
+              "weightMode": "bodyweight_plus",
+              "suggestedWeightKg": null
+            },
+            "status": "pending",
+            "sets": [
+              {
+                "id": "set-mvguai2i-bxjz15",
+                "roundIndex": 1,
+                "stageIndex": 1,
+                "reps": null,
+                "weightKg": null,
+                "status": "blank"
+              },
+              {
+                "id": "set-mvguai2i-adxbuq",
+                "roundIndex": 2,
+                "stageIndex": 1,
+                "reps": null,
+                "weightKg": null,
+                "status": "blank"
+              }
+            ],
+            "note": ""
+          },
+          {
+            "id": "sex-mvguai2i-rxed47",
+            "planExerciseId": "ex-cb-2",
+            "name": "自由杠铃卧推",
+            "en": "BARBELL BENCH PRESS",
+            "restSec": 150,
+            "target": {
+              "kind": "straight",
+              "sets": 3,
+              "setsMax": 3,
+              "repsMin": 8,
+              "repsMax": 12,
+              "weightMode": "external",
+              "suggestedWeightKg": null
+            },
+            "status": "pending",
+            "sets": [
+              {
+                "id": "set-mvguai2i-44ctyi",
+                "roundIndex": 1,
+                "stageIndex": 1,
+                "reps": null,
+                "weightKg": null,
+                "status": "blank"
+              },
+              {
+                "id": "set-mvguai2i-vw7707",
+                "roundIndex": 2,
+                "stageIndex": 1,
+                "reps": null,
+                "weightKg": null,
+                "status": "blank"
+              },
+              {
+                "id": "set-mvguai2i-a1m759",
+                "roundIndex": 3,
+                "stageIndex": 1,
+                "reps": null,
+                "weightKg": null,
+                "status": "blank"
+              }
+            ],
+            "note": ""
+          },
+          {
+            "id": "sex-mvguai2i-mvu0qj",
+            "planExerciseId": "ex-cb-3",
+            "name": "史密斯上斜卧推",
+            "en": "SMITH INCLINE PRESS",
+            "restSec": 90,
+            "target": {
+              "kind": "straight",
+              "sets": 2,
+              "setsMax": 2,
+              "repsMin": 10,
+              "repsMax": 15,
+              "weightMode": "external",
+              "suggestedWeightKg": null
+            },
+            "status": "pending",
+            "sets": [
+              {
+                "id": "set-mvguai2i-bj3pg3",
+                "roundIndex": 1,
+                "stageIndex": 1,
+                "reps": null,
+                "weightKg": null,
+                "status": "blank"
+              },
+              {
+                "id": "set-mvguai2i-zbje7j",
+                "roundIndex": 2,
+                "stageIndex": 1,
+                "reps": null,
+                "weightKg": null,
+                "status": "blank"
+              }
+            ],
+            "note": ""
+          },
+          {
+            "id": "sex-mvguai2i-bnxs7a",
+            "planExerciseId": "ex-cb-4",
+            "name": "蝴蝶机夹胸",
+            "en": "PEC DECK FLY",
+            "restSec": 75,
+            "target": {
+              "kind": "straight",
+              "sets": 2,
+              "setsMax": 2,
+              "repsMin": 12,
+              "repsMax": 20,
+              "weightMode": "external",
+              "suggestedWeightKg": null
+            },
+            "status": "pending",
+            "sets": [
+              {
+                "id": "set-mvguai2i-oa7l23",
+                "roundIndex": 1,
+                "stageIndex": 1,
+                "reps": null,
+                "weightKg": null,
+                "status": "blank"
+              },
+              {
+                "id": "set-mvguai2i-1kfpot",
+                "roundIndex": 2,
+                "stageIndex": 1,
+                "reps": null,
+                "weightKg": null,
+                "status": "blank"
+              }
+            ],
+            "note": ""
+          },
+          {
+            "id": "sex-mvguai2i-ddoixr",
+            "planExerciseId": "ex-cb-5",
+            "name": "器械推肩",
+            "en": "MACHINE SHOULDER PRESS",
+            "restSec": 90,
+            "target": {
+              "kind": "straight",
+              "sets": 2,
+              "setsMax": 2,
+              "repsMin": 12,
+              "repsMax": 15,
+              "weightMode": "external",
+              "suggestedWeightKg": null
+            },
+            "status": "pending",
+            "sets": [
+              {
+                "id": "set-mvguai2i-d4y2vc",
+                "roundIndex": 1,
+                "stageIndex": 1,
+                "reps": null,
+                "weightKg": null,
+                "status": "blank"
+              },
+              {
+                "id": "set-mvguai2i-8oed77",
+                "roundIndex": 2,
+                "stageIndex": 1,
+                "reps": null,
+                "weightKg": null,
+                "status": "blank"
+              }
+            ],
+            "note": ""
+          },
+          {
+            "id": "sex-mvguai2i-kr3apd",
+            "planExerciseId": "ex-cb-6",
+            "name": "绳索下压",
+            "en": "CABLE PUSHDOWN",
+            "restSec": 75,
+            "target": {
+              "kind": "straight",
+              "sets": 2,
+              "setsMax": 2,
+              "repsMin": 12,
+              "repsMax": 15,
+              "weightMode": "external",
+              "suggestedWeightKg": null
+            },
+            "status": "pending",
+            "sets": [
+              {
+                "id": "set-mvguai2i-0j7n5m",
+                "roundIndex": 1,
+                "stageIndex": 1,
+                "reps": null,
+                "weightKg": null,
+                "status": "blank"
+              },
+              {
+                "id": "set-mvguai2i-qhbe51",
+                "roundIndex": 2,
+                "stageIndex": 1,
+                "reps": null,
+                "weightKg": null,
+                "status": "blank"
+              }
+            ],
+            "note": ""
+          },
+          {
+            "id": "sex-mvguai2i-toqtm8",
+            "planExerciseId": "ex-cb-7",
+            "name": "哑铃颈后臂屈伸",
+            "en": "OVERHEAD DB EXTENSION",
+            "restSec": 90,
+            "target": {
+              "kind": "straight",
+              "sets": 2,
+              "setsMax": 2,
+              "repsMin": 12,
+              "repsMax": 15,
+              "weightMode": "external",
+              "suggestedWeightKg": null,
+              "dumbbellBasis": "per_hand"
+            },
+            "status": "pending",
+            "sets": [
+              {
+                "id": "set-mvguai2i-c9gq3j",
+                "roundIndex": 1,
+                "stageIndex": 1,
+                "reps": null,
+                "weightKg": null,
+                "status": "blank"
+              },
+              {
+                "id": "set-mvguai2i-hwawz9",
+                "roundIndex": 2,
+                "stageIndex": 1,
+                "reps": null,
+                "weightKg": null,
+                "status": "blank"
+              }
+            ],
+            "note": ""
+          },
+          {
+            "id": "sex-mvguai2i-63k0d2",
+            "planExerciseId": "ex-cb-8",
+            "name": "悬垂举腿",
+            "en": "HANGING LEG RAISE",
+            "restSec": 60,
+            "target": {
+              "kind": "straight",
+              "sets": 2,
+              "setsMax": 2,
+              "repsMin": 10,
+              "repsMax": 15,
+              "weightMode": "bodyweight",
+              "suggestedWeightKg": null
+            },
+            "status": "pending",
+            "sets": [
+              {
+                "id": "set-mvguai2i-ws0rod",
+                "roundIndex": 1,
+                "stageIndex": 1,
+                "reps": null,
+                "weightKg": null,
+                "status": "blank"
+              },
+              {
+                "id": "set-mvguai2i-r1usum",
+                "roundIndex": 2,
+                "stageIndex": 1,
+                "reps": null,
+                "weightKg": null,
+                "status": "blank"
+              }
+            ],
+            "note": ""
+          }
+        ],
+        "note": ""
+      },
+      {
+        "id": "sess-mvgtygjx-mp6g4x",
+        "planId": "plan-v32",
+        "planName": "三分化训练计划 V3.2",
+        "day": {
+          "dayId": "day-chest-a",
+          "dayName": "胸 A",
+          "focus": "chest",
+          "round": "A",
+          "partText": "胸 A"
+        },
+        "cycleIndexAtStart": 0,
+        "startedAt": 1792509637965,
+        "endedAt": 1792509996527,
+        "status": "completed",
+        "pausedMs": 0,
+        "pausedAt": null,
+        "warmups": [
+          {
+            "id": "w-chest-1",
+            "name": "弹力带水平拉开",
+            "unit": "reps",
+            "targetText": "2 × 10–15",
+            "done": false
+          },
+          {
+            "id": "w-chest-2",
+            "name": "弹力带绕肩",
+            "unit": "reps",
+            "targetText": "1–2 × 8–12",
+            "done": false
+          },
+          {
+            "id": "w-chest-3",
+            "name": "辅助双杠臂屈伸",
+            "unit": "reps",
+            "targetText": "1 × 5–8",
+            "done": false
+          },
+          {
+            "id": "w-chest-4",
+            "name": "卧推轻重量递增",
+            "unit": "reps",
+            "targetText": "1–2 组 · 按需",
+            "done": false
+          }
+        ],
+        "exercises": [
+          {
+            "id": "sex-mvgtygjx-zmoqhi",
+            "planExerciseId": "ex-ca-1",
+            "name": "双杠臂屈伸",
+            "en": "CHEST DIP",
+            "restSec": 150,
+            "target": {
+              "kind": "straight",
+              "sets": 3,
+              "setsMax": 3,
+              "repsMin": 6,
+              "repsMax": 10,
+              "weightMode": "bodyweight_plus",
+              "suggestedWeightKg": null
+            },
+            "status": "pending",
+            "sets": [
+              {
+                "id": "set-mvgtygjx-6lkuwl",
+                "roundIndex": 1,
+                "stageIndex": 1,
+                "reps": 10,
+                "weightKg": null,
+                "status": "done"
+              },
+              {
+                "id": "set-mvgtygjx-ykf7i1",
+                "roundIndex": 2,
+                "stageIndex": 1,
+                "reps": 9,
+                "weightKg": null,
+                "status": "done"
+              },
+              {
+                "id": "set-mvgtygjx-fg0bie",
+                "roundIndex": 3,
+                "stageIndex": 1,
+                "reps": 8,
+                "weightKg": null,
+                "status": "done"
+              },
+              {
+                "id": "set-mvgu55bt-exlm0v",
+                "roundIndex": 4,
+                "stageIndex": 1,
+                "reps": 7,
+                "weightKg": null,
+                "status": "done"
+              }
+            ],
+            "note": ""
+          },
+          {
+            "id": "sex-mvgtygjx-zzonr7",
+            "planExerciseId": "ex-ca-2",
+            "name": "自由杠铃卧推",
+            "en": "BARBELL BENCH PRESS",
+            "restSec": 180,
+            "target": {
+              "kind": "straight",
+              "sets": 3,
+              "setsMax": 3,
+              "repsMin": 6,
+              "repsMax": 10,
+              "weightMode": "external",
+              "suggestedWeightKg": null
+            },
+            "status": "pending",
+            "sets": [
+              {
+                "id": "set-mvgtygjx-omadoh",
+                "roundIndex": 1,
+                "stageIndex": 1,
+                "reps": null,
+                "weightKg": null,
+                "status": "blank"
+              },
+              {
+                "id": "set-mvgtygjx-qijp4m",
+                "roundIndex": 2,
+                "stageIndex": 1,
+                "reps": null,
+                "weightKg": null,
+                "status": "blank"
+              },
+              {
+                "id": "set-mvgtygjx-pl8wbt",
+                "roundIndex": 3,
+                "stageIndex": 1,
+                "reps": null,
+                "weightKg": null,
+                "status": "blank"
+              }
+            ],
+            "note": ""
+          },
+          {
+            "id": "sex-mvgtygjx-61cm33",
+            "planExerciseId": "ex-ca-3",
+            "name": "史密斯上斜卧推",
+            "en": "SMITH INCLINE PRESS",
+            "restSec": 120,
+            "target": {
+              "kind": "straight",
+              "sets": 2,
+              "setsMax": 2,
+              "repsMin": 8,
+              "repsMax": 12,
+              "weightMode": "external",
+              "suggestedWeightKg": null
+            },
+            "status": "pending",
+            "sets": [
+              {
+                "id": "set-mvgtygjx-cjezhw",
+                "roundIndex": 1,
+                "stageIndex": 1,
+                "reps": null,
+                "weightKg": null,
+                "status": "blank"
+              },
+              {
+                "id": "set-mvgtygjx-0dpiol",
+                "roundIndex": 2,
+                "stageIndex": 1,
+                "reps": null,
+                "weightKg": null,
+                "status": "blank"
+              }
+            ],
+            "note": ""
+          },
+          {
+            "id": "sex-mvgtygjx-ep07hi",
+            "planExerciseId": "ex-ca-4",
+            "name": "蝴蝶机夹胸",
+            "en": "PEC DECK FLY",
+            "restSec": 75,
+            "target": {
+              "kind": "straight",
+              "sets": 1,
+              "setsMax": 1,
+              "repsMin": 12,
+              "repsMax": 15,
+              "weightMode": "external",
+              "suggestedWeightKg": null
+            },
+            "status": "pending",
+            "sets": [
+              {
+                "id": "set-mvgtygjx-7ph2sn",
+                "roundIndex": 1,
+                "stageIndex": 1,
+                "reps": null,
+                "weightKg": null,
+                "status": "blank"
+              }
+            ],
+            "note": ""
+          },
+          {
+            "id": "sex-mvgtygjx-xss6jk",
+            "planExerciseId": "ex-ca-5",
+            "name": "器械推肩",
+            "en": "MACHINE SHOULDER PRESS",
+            "restSec": 90,
+            "target": {
+              "kind": "straight",
+              "sets": 2,
+              "setsMax": 2,
+              "repsMin": 10,
+              "repsMax": 12,
+              "weightMode": "external",
+              "suggestedWeightKg": null
+            },
+            "status": "pending",
+            "sets": [
+              {
+                "id": "set-mvgtygjx-ttioo3",
+                "roundIndex": 1,
+                "stageIndex": 1,
+                "reps": null,
+                "weightKg": null,
+                "status": "blank"
+              },
+              {
+                "id": "set-mvgtygjx-bos1gh",
+                "roundIndex": 2,
+                "stageIndex": 1,
+                "reps": null,
+                "weightKg": null,
+                "status": "blank"
+              }
+            ],
+            "note": ""
+          },
+          {
+            "id": "sex-mvgtygjx-n9s48g",
+            "planExerciseId": "ex-ca-6",
+            "name": "绳索下压",
+            "en": "CABLE PUSHDOWN",
+            "restSec": 75,
+            "target": {
+              "kind": "straight",
+              "sets": 2,
+              "setsMax": 2,
+              "repsMin": 10,
+              "repsMax": 15,
+              "weightMode": "external",
+              "suggestedWeightKg": null
+            },
+            "status": "pending",
+            "sets": [
+              {
+                "id": "set-mvgtygjx-cnbxlm",
+                "roundIndex": 1,
+                "stageIndex": 1,
+                "reps": null,
+                "weightKg": null,
+                "status": "blank"
+              },
+              {
+                "id": "set-mvgtygjx-c8c8tc",
+                "roundIndex": 2,
+                "stageIndex": 1,
+                "reps": null,
+                "weightKg": null,
+                "status": "blank"
+              }
+            ],
+            "note": ""
+          },
+          {
+            "id": "sex-mvgtygjx-mxvgww",
+            "planExerciseId": "ex-ca-7",
+            "name": "哑铃颈后臂屈伸",
+            "en": "OVERHEAD DB EXTENSION",
+            "restSec": 90,
+            "target": {
+              "kind": "straight",
+              "sets": 2,
+              "setsMax": 2,
+              "repsMin": 10,
+              "repsMax": 15,
+              "weightMode": "external",
+              "suggestedWeightKg": null,
+              "dumbbellBasis": "per_hand"
+            },
+            "status": "pending",
+            "sets": [
+              {
+                "id": "set-mvgtygjx-0n0tk3",
+                "roundIndex": 1,
+                "stageIndex": 1,
+                "reps": null,
+                "weightKg": null,
+                "status": "blank"
+              },
+              {
+                "id": "set-mvgtygjx-t019c1",
+                "roundIndex": 2,
+                "stageIndex": 1,
+                "reps": null,
+                "weightKg": null,
+                "status": "blank"
+              }
+            ],
+            "note": ""
+          },
+          {
+            "id": "sex-mvgtygjx-a3gcpz",
+            "planExerciseId": "ex-ca-8",
+            "name": "绳索卷腹",
+            "en": "CABLE CRUNCH",
+            "restSec": 60,
+            "target": {
+              "kind": "straight",
+              "sets": 2,
+              "setsMax": 2,
+              "repsMin": 15,
+              "repsMax": 25,
+              "weightMode": "external",
+              "suggestedWeightKg": null
+            },
+            "status": "pending",
+            "sets": [
+              {
+                "id": "set-mvgtygjx-noz7eq",
+                "roundIndex": 1,
+                "stageIndex": 1,
+                "reps": null,
+                "weightKg": null,
+                "status": "blank"
+              },
+              {
+                "id": "set-mvgtygjx-mcp3ky",
+                "roundIndex": 2,
+                "stageIndex": 1,
+                "reps": null,
+                "weightKg": null,
+                "status": "blank"
+              }
+            ],
+            "note": ""
+          }
+        ],
+        "note": "",
+        "advancedCycle": true,
+        "cycleIndexAfter": 1
+      }
+    ],
+    "settings": [
+      {
+        "key": "app",
+        "theme": "dark",
+        "lastExportAt": 1792510333520,
+        "lastBackupPromptAt": null,
+        "seenVersion": null
+      }
+    ]
+  }
+}

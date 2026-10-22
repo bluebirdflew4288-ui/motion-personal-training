@@ -1,0 +1,102 @@
+/* MOTION 设计令牌 —— 延续 08「拼贴 ZINE」，但为长期使用重新定标。
+   核对要点：
+   · 正文最小 14px，辅助信息 ≥ 12px；不再用 5–8px 小字制造精致感。
+   · 浅色为默认纸张主题；深色单独定义纸张、油墨、砖红与描边，不是简单反色。
+   · 纸纹、胶带、照片一律 pointer-events:none，且不覆盖交互元素。 */
+
+:root {
+  /* 纸张与油墨（浅色） */
+  --paper: #f4efe2;
+  --paper-2: #fbf7ec;
+  --paper-3: #ebe4d3;
+  --paper-edge: #ddd6c6;
+  --ink: #16130e;
+  --ink-2: #45403a;
+  --ink-3: #6f6858;
+  --ink-4: #968d7c;
+  --rule: rgba(22, 19, 14, 0.16);
+  --rule-strong: rgba(22, 19, 14, 0.42);
+  --brick: #b23a20;
+  --brick-deep: #8e2c17;
+  --brick-soft: rgba(178, 58, 32, 0.1);
+  --tape: rgba(226, 205, 150, 0.72);
+  --tape-2: rgba(240, 228, 190, 0.7);
+  --ok: #3e5a3a;
+  --warn: #8a5a12;
+  --shadow-1: 2px 4px 12px rgba(60, 50, 35, 0.22);
+  --shadow-2: 0 10px 28px rgba(60, 50, 35, 0.18);
+  --grain-opacity: 0.3;
+  --halftone-opacity: 0.34;
+  --photo-filter: grayscale(1) contrast(1.38) brightness(0.95);
+  --focus: #1f5fbf;
+
+  /* 字体 */
+  --f-display: 'Anton', 'PingFang SC', 'Hiragino Sans GB', system-ui, sans-serif;
+  --f-serif: 'Songti SC', 'STSong', 'Noto Serif SC', Georgia, serif;
+  --f-sans: 'PingFang SC', 'Hiragino Sans GB', 'Noto Sans SC', system-ui, sans-serif;
+  --f-mono: 'PlexMono', ui-monospace, 'SF Mono', Menlo, monospace;
+  /* 品牌/刊头装饰字体 */
+  --f-grotesk: 'Syne', 'PingFang SC', system-ui, sans-serif;
+  /* 功能数字：等宽、清楚、tabular（审计 R2-10：不再用扁宽装饰字） */
+  --f-num: 'PlexMono', ui-monospace, 'SF Mono', Menlo, monospace;
+  --f-news: 'LibreFranklin', 'PingFang SC', system-ui, sans-serif;
+
+  /* 尺度 */
+  --fs-11: 11px;
+  --fs-12: 12px;
+  --fs-13: 13px;
+  --fs-14: 14px;
+  --fs-15: 15px;
+  --fs-16: 16px;
+  --fs-18: 18px;
+  --fs-20: 20px;
+  --fs-24: 24px;
+  --fs-28: 28px;
+  --fs-34: 34px;
+  --fs-44: 44px;
+
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --sp-7: 32px;
+  --sp-8: 40px;
+
+  --r-sm: 4px;
+  --r-md: 8px;
+  --r-pill: 999px;
+
+  --tap: 44px;
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --content-max: 560px;
+}
+
+[data-theme='dark'] {
+  /* 深色：牛皮纸灯下 —— 纸变成深墨绿褐，油墨变成暖白，砖红提亮以保持对比 */
+  --paper: #17150f;
+  --paper-2: #201d15;
+  --paper-3: #2a2619;
+  --paper-edge: #353020;
+  --ink: #f2ece0;
+  --ink-2: #d8d0c0;
+  --ink-3: #ada392;
+  --ink-4: #8b8272;
+  --rule: rgba(242, 236, 224, 0.16);
+  --rule-strong: rgba(242, 236, 224, 0.42);
+  --brick: #e2704c;
+  --brick-deep: #f08a68;
+  --brick-soft: rgba(226, 112, 76, 0.16);
+  --tape: rgba(150, 130, 86, 0.42);
+  --tape-2: rgba(168, 148, 100, 0.38);
+  --ok: #8fbf7f;
+  --warn: #e0b25a;
+  --shadow-1: 2px 4px 14px rgba(0, 0, 0, 0.5);
+  --shadow-2: 0 12px 32px rgba(0, 0, 0, 0.45);
+  --grain-opacity: 0.16;
+  --halftone-opacity: 0.2;
+  --photo-filter: grayscale(0.72) contrast(1.1) brightness(0.78) sepia(0.12);
+  --focus: #86b4ff;
+}

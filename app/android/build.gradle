@@ -1,0 +1,72 @@
+// Top-level build file where you can add configuration options common to all sub-projects/modules.
+
+buildscript {
+    
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:8.13.0'
+        classpath 'com.google.gms:google-services:4.4.4'
+
+        // NOTE: Do not place your application dependencies here; they belong
+        // in the individual module build.gradle files
+    }
+}
+
+apply from: "variables.gradle"
+
+/*
+ * ── 构建目录必须放在支持扩展属性的文件系统上（APFS），不能放在 exFAT ──
+ *
+ * 本项目源码位于 exFAT 外置卷。exFAT 没有原生 xattr 支持，macOS 会把每个
+ * 扩展属性写成同目录下的 AppleDouble 文件 `._<name>`。
+ * Gradle / aapt2 在生成资源中间产物时会写 xattr，于是资源目录里出现
+ * `._layout`、`._drawable` 这类“文件” —— aapt2 把它们当成资源目录，直接失败：
+ *
+ *   A failure occurred while executing ParseLibraryResourcesTask
+ *     > '.../packageDebugResources/._drawable' is not a directory
+ *
+ * 删一次也没用：下一次构建又会生成。正确做法是把**构建输出**放回 APFS，
+ * 源码仍留在项目内（源码/配置快照不受影响）。
+ *
+ * 目录可用 MOTION_ANDROID_BUILD_DIR 覆盖；默认 $HOME/.motion-android-build。
+ */
+def motionBuildRoot = System.getenv('MOTION_ANDROID_BUILD_DIR')
+        ?: (System.getProperty('user.home') + '/.motion-android-build')
+
+/*
+ * 构建目录的**项目指纹**：只按 rootProject.name 会把两个同名（android）的项目
+ * 映射到同一目录，互相覆盖 APK。这里用「项目根绝对路径」的短哈希，
+ * 并把同一个算法同步给 scripts/build-android.mjs 的产物查找
+ * （那边用相同的输入与算法，见 MOTION_PROJECT_KEY 说明）。
+ *
+ * 算法必须两边一致：
+ *   key = <name 清洗后的前 24 字符>-<sha256(realpath(projectRoot)).substring(0,12)>
+ * Gradle 侧用 java.security.MessageDigest 算，Node 侧用 crypto.createHash('sha256')。
+ */
+def motionProjectRoot = rootProject.projectDir.getCanonicalPath()
+def motionDigest = java.security.MessageDigest.getInstance('SHA-256')
+motionDigest.update(motionProjectRoot.getBytes('UTF-8'))
+def motionPathHash = motionDigest.digest().encodeHex().toString().substring(0, 12)
+def motionNamePart = rootProject.name.replaceAll('[^A-Za-z0-9._-]', '_')
+if (motionNamePart.length() > 24) motionNamePart = motionNamePart.substring(0, 24)
+def motionProjectKey = motionNamePart + '-' + motionPathHash
+
+// 供构建脚本/诊断读取
+ext.motionProjectKey = motionProjectKey
+ext.motionBuildRootResolved = motionBuildRoot
+
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    // 每个子项目独立目录，避免互相覆盖
+    buildDir = new File(motionBuildRoot, motionProjectKey + '/' + (project.path == ':' ? '_root' : project.path.replaceAll(':', '_')))
+}
+
+task clean(type: Delete) {
+    delete rootProject.buildDir
+}

@@ -1,0 +1,90 @@
+# ── MOTION 项目仓库忽略清单 ─────────────────────────────────
+# 目标：私有仓库只保存「日后能继续维护 0.1.2」所需内容。
+# 历史包 / 旧 dist / 旧回滚 / 验收报告 / 本地归档留在本机，不入库。
+
+# ── 依赖与构建缓存 ──
+node_modules/
+.gradle/
+build/
+**/build/
+app/android/native-test/out/
+*.tsbuildinfo
+.gradle-cache/
+
+# ── Web 构建产物（历史版本全部不入库）──
+app/dist/
+app/dist-v*/
+app/dist-android/
+app/dist-baseline-*/
+dist-web-next/
+
+# ── Android 构建中间物 ──
+app/android/.gradle/
+app/android/app/build/
+app/android/build/
+app/android/capacitor-cordova-android-plugins/build/
+*.apk.idsig
+
+# ── 机器相关配置（含本机 SDK 路径，不能入库）──
+app/android/local.properties
+*.local
+
+# ── 签名材料：任何私钥/证书/密码文件绝不入库 ──
+*.jks
+*.keystore
+keystore.properties
+**/keystore.properties
+*.p12
+*.pfx
+
+# ── 凭据 / 环境变量 / 会话 ──
+.env
+.env.*
+*.pem
+*.key
+secrets.*
+**/credentials.json
+
+# ── 本地归档与临时工作目录 ──
+_archive/
+app/.patch/
+app/.probe/
+app/.prevalidate.mjs
+
+# ── 历史回滚快照（仅保留测试真实依赖的 fixture 子树，见文件末尾例外）──
+# 注意：这里整体忽略，末尾用精确白名单只放行 v2 的 src/domain 子树。
+_rollback/*
+
+# ── 验收报告与截图（体积大、含大量 PNG，本地保留）──
+verify/
+verify-v*/
+verify-android*/
+verify-plan-*/
+verify-zero-byte/
+
+# ── 本地服务信息 ──
+LAN-INFO*.txt
+
+# ── macOS / exFAT 元数据 ──
+.DS_Store
+._*
+**/._*
+.AppleDouble
+
+# ── 测试产物 ──
+test-results/
+coverage/
+
+# ── 例外：历史迁移测试的真实依赖（必须入库，否则克隆后断链）──
+# app/test/v4-backup.test.ts 与 v5-migrate-delete.test.ts 会动态 import
+#   ../../_rollback/v2-snapshot-20261021b/src/domain/
+# 只放行这一棵子树，其它快照（v1/v3…v8、dist-android 备份等）仍整体忽略。
+# 逐级取消忽略是 Git 的要求：父目录必须先放行，子项才能被重新包含。
+!_rollback/v2-snapshot-20261021b/
+!_rollback/v2-snapshot-20261021b/src/
+!_rollback/v2-snapshot-20261021b/src/**
+_rollback/v2-snapshot-20261021b/test/
+_rollback/v2-snapshot-20261021b/dist*/
+
+# ── 本项目 git 元数据目录（gitdir，自身不能入库）──
+.git-motion/
