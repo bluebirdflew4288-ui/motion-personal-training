@@ -88,3 +88,15 @@ _rollback/v2-snapshot-20261021b/dist*/
 
 # ── 本项目 git 元数据目录（gitdir，自身不能入库）──
 .git-motion/
+
+# ── 最高优先级排除（放在最后以确保覆盖上面的白名单例外）──
+# AppleDouble / exFAT 元数据即使落在白名单子树内也必须排除
+_rollback/v2-snapshot-20261021b/src/**/._*
+_rollback/v2-snapshot-20261021b/src/._*
+_rollback/v2-snapshot-20261021b/src/**/.DS_Store
+
+# ── 施工期一次性补丁/探针脚本（不是生产代码，不入库）──
+# 形如 .fix-*.mjs / .patch-*.mjs 的临时修改脚本
+app/**/.*-*.mjs
+app/**/.fix*.mjs
+app/**/.patch*.mjs
