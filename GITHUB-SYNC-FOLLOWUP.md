@@ -104,10 +104,22 @@ _archive/gitdir-migration-20261022/
   git-motion/                         ⚠ 不合格副本（见下）
 ```
 
-### ⚠ 明确标记的不合格副本
-`_archive/gitdir-migration-20261022/git-motion/` 只有 **336 个真实 Git 文件**，
-缺 527 个 AppleDouble，**不满足「原件完整保真」要求，不可作回滚使用**。
-目录内已放置 `INVALID-DO-NOT-USE-FOR-ROLLBACK.txt` 标记。
+### ⚠ 明确标记的不合格副本（按实际数量记录）
+`_archive/gitdir-migration-20261022/git-motion/` 当前 **862 个文件**
+（525 个 AppleDouble + 337 个真实 Git 文件），与原件 863 相比
+**只缺 3 个成员**：
+
+```
+objects/._info
+objects/._pack
+refs/._tags
+```
+
+另多出 2 个是本轮放置的标记文件（`INVALID-DO-NOT-USE-FOR-ROLLBACK.txt` 及其 AppleDouble）。
+
+**结论**：虽然只缺 3 个成员，但既然要求是「原件完整保真」，
+这份副本仍**不满足该要求，不可作为回滚依据**。
+唯一合格的完整备份是 `git-motion-full-863.tar.gz`（863/863 逐字节校验通过）。
 
 ### 旧原件（回滚来源，完整保留）
 ```
@@ -115,12 +127,58 @@ _archive/gitdir-migration-20261022/
 ```
 已加入 `.gitignore`，作为回滚来源长期保留。
 
-### 回滚方法（如需）
-```bash
-cd "<项目根>"
-cp _archive/gitdir-migration-20261022/dot-git-pointer.bak .git
-# 或手工写回：gitdir: <项目根>/.git-motion
-```
+### 恢复方法（如需，**不要把活动元数据退回 exFAT**）
+
+> ⚠️ **不要**直接 `cp dot-git-pointer.bak .git` 回切。
+> 原因有两条：
+> 1. 旧 gitdir 在 exFAT 上、带 527 个 AppleDouble，不符合迁移约束；
+> 2. 旧指针指向的 HEAD 是 `65c16f0`（迁移前时点），**不含本轮后续提交**
+>    （`e6d12ca` 原生测试、`825624a` 收尾报告、`621bb25` 忽略规则）。
+> 回切会丢掉这些提交并退回不合规的元数据位置。
+>
+> 旧指针 `dot-git-pointer.bak` 与旧 `.git-motion/` 的定位是
+> **取证与恢复源**，不是可执行的回滚开关。
+
+**正确的恢复流程（全程只在 APFS 上建新活动 gitdir）：**
+
+1. **先保存当前状态**（在任何操作之前）
+   ```bash
+   cd "<项目根>"
+   git rev-parse HEAD
+   git for-each-ref --format='%(refname) %(objectname)' > /tmp/refs-current.txt
+   git status --porcelain > /tmp/worktree-current.txt   # 含未推送改动
+   ```
+2. **把已验证归档解到新的 APFS 隔离目录**（不要解到项目内、不要覆盖现有）
+   ```bash
+   RESTORE="/Users/linyu/.local/share/agent-project-git/_restore-check-$(date +%Y%m%d-%H%M%S)"
+   [ -e "$RESTORE" ] && { echo "已存在，拒绝覆盖"; exit 1; }
+   mkdir -p "$RESTORE"
+   python3 - "$RESTORE" <<'PY'
+   import sys, tarfile
+   dest = sys.argv[1]
+   with tarfile.open("_archive/gitdir-migration-20261022/git-motion-full-863.tar.gz", "r:gz") as t:
+       t.extractall(dest)   # 解出后再在副本里过滤 metadata
+   PY
+   ```
+3. **在副本内过滤 AppleDouble、跑 fsck、核对历史**
+   ```bash
+   find "$RESTORE" -type f -name '._*' -delete
+   git --git-dir="$RESTORE/.git-motion" fsck --full --strict
+   git --git-dir="$RESTORE/.git-motion" log --oneline | head
+   ```
+4. **从健康远端与保留的本地 refs 补全后续提交**，并证明无丢失
+   ```bash
+   git --git-dir="$RESTORE/.git-motion" fetch origin
+   # 比对：远端 main、本地 master、/tmp/refs-current.txt 三者关系
+   ```
+5. **只有确认无丢失后**，才原子指向另一个**干净的 APFS** gitdir
+   ```bash
+   printf 'gitdir: %s\n' "<新的 APFS gitdir>" > .git.new && mv .git.new .git
+   git rev-parse --absolute-git-dir && git fsck --full --strict && git status
+   ```
+
+**约束**：任何情况下都不把活动 Git 元数据退回 exFAT；旧 `.git-motion/` 与
+`dot-git-pointer.bak` 仅作取证与恢复源保留，不删除。
 
 ---
 

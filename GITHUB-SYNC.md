@@ -1,7 +1,13 @@
 # MOTION → GitHub 私有仓库同步记录
 
-时间：2026-10-22 19:40 CST
-状态：**已提交并推送，验证通过。** 本文件不含任何秘密或个人数据。
+时间：2026-10-22 19:40 CST（**首次同步时点记录**）
+状态：已提交并推送，验证通过。本文件不含任何秘密或个人数据。
+
+> 📌 **本文件是历史时点快照，其中的 SHA / 提交数 / 文件数是首次同步当时的数值。**
+> 后续变更（原生测试补齐、Git 元数据迁移至 APFS、忽略规则精确化）见
+> [`GITHUB-SYNC-FOLLOWUP.md`](./GITHUB-SYNC-FOLLOWUP.md)。
+> **当前最新提交与状态以 followup 为准**，本文件不再递归刷新。
+> （第 3 节的 gitdir 位置已就地更新为迁移后事实，因为那属于位置描述而非时点数据。）
 
 ---
 
@@ -19,9 +25,11 @@
 
 ---
 
-## 2. 提交与远端一致性
+## 2. 提交与远端一致性（首次同步时点 · 历史值）
 
-| 项 | 值 |
+> 下表是 2026-10-22 19:40 首次同步时的状态。**当前值见 followup。**
+
+| 项 | 值（历史时点） |
 |---|---|
 | 本地 HEAD | `b4e39a562191194b1e9f93b2c9377559889cabde` |
 | 远端 `main` | `b4e39a562191194b1e9f93b2c9377559889cabde` |
@@ -57,23 +65,35 @@ f0747e7  MOTION 0.1.2：源码、测试与已验收 APK 首次入库
 `<项目根>/.git-motion`（exFAT）。该状态**不满足迁移约束**（非「理想方案未实现」，
 而是明确约束未满足），因此本轮在获得合法写入权限后完成迁移。
 
-### 回滚来源（保留，不删除）
+### 取证与恢复源（保留，不删除；**不是可执行的回滚开关**）
 ```
 _archive/gitdir-migration-20261022/
   dot-git-pointer.bak                    旧 .git 指针原件（133 B）
-  git-motion-full-863.tar.gz             完整归档：863 文件（含 527 AppleDouble）
+                                         ⚠ 指向旧 exFAT gitdir，HEAD 为迁移前时点 65c16f0
+  git-motion-full-863.tar.gz             唯一合格完整归档：863 文件（含 527 AppleDouble）
   git-motion-full-863.tar.gz.sha256      归档 SHA256
   git-motion-full-863-manifest.txt       逐成员 size/sha256/path 清单
   protected-baseline-before.txt          迁移前 240 行保护基线
   dist-rollback-hashes.txt               dist/rollback 哈希
-  git-motion/                            ⚠ 仅 336 真实 Git 文件的副本，
-                                         缺 527 个 AppleDouble，**不适合作回滚**
+  git-motion/                            ⚠ 不合格副本：862 文件
+                                         （525 AppleDouble + 337 真实文件），
+                                         较原件仅缺 3 个成员
+                                         （objects/._info、objects/._pack、refs/._tags）
+                                         仍不满足「完整保真」，不可作回滚依据
                                          （目录内有 INVALID-DO-NOT-USE-FOR-ROLLBACK.txt 标记）
   git-motion-member-manifest.txt         迁移前 .git-motion 成员清单
   git-motion-dirs.txt                    迁移前目录结构
-  APFS-PERMISSION-BLOCKER.md             迁移前的权限阻碍记录（历史）
+  APFS-PERMISSION-BLOCKER.md             迁移前的权限阻碍记录（历史，已解除）
 ```
-旧 `<项目根>/.git-motion/` **仍完整保留在原位**（863 文件未变），作为回滚来源，已加入 `.gitignore`。
+旧 `<项目根>/.git-motion/` **仍完整保留在原位**（863 文件未变），已加入 `.gitignore`，
+仅作**取证与恢复源**保留，不删除。
+
+> ⚠️ **不要**用 `cp dot-git-pointer.bak .git` 把活动元数据退回 exFAT。
+> 那会退回带 527 个 AppleDouble 的不合规位置，且旧指针 HEAD 是迁移前时点
+> `65c16f0`，不含后续提交。
+> 正确恢复流程见 `GITHUB-SYNC-FOLLOWUP.md` §3「恢复方法」：
+> 先把归档解到**新的 APFS 隔离目录** → 副本内过滤 metadata、`fsck`、核对历史 →
+> 从健康远端与保留的本地 refs 补全后续提交、证明无丢失 → 才原子指向另一个干净 APFS gitdir。
 
 ### 迁移步骤摘要（已完成）
 1. 记录保护基线（源码/测试/配置/脚本/public/APK/dist/rollback 哈希）
