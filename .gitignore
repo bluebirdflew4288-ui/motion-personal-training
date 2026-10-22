@@ -78,16 +78,47 @@ coverage/
 # ── 例外：历史迁移测试的真实依赖（必须入库，否则克隆后断链）──
 # app/test/v4-backup.test.ts 与 v5-migrate-delete.test.ts 会动态 import
 #   ../../_rollback/v2-snapshot-20261021b/src/domain/
-# 只放行这一棵子树，其它快照（v1/v3…v8、dist-android 备份等）仍整体忽略。
-# 逐级取消忽略是 Git 的要求：父目录必须先放行，子项才能被重新包含。
+# 只放行 src 这一棵子树，其它快照（v1/v3…v8、dist-android 备份等）仍整体忽略。
+#
+# 规则顺序（Git 后者优先）：
+#   ① 放行父目录，否则下面的子项规则无法生效
+#   ② 先忽略父目录下的**所有直接子项**（index.html / package.json / tsconfig.json /
+#      vite.config.ts / vitest.config.ts / test/ / dist*/ 等）
+#   ③ 再单独放行 src/ 子树
+# 这样 v2 根目录那 5 个配置文件与 test/dist 都不会误入库，只有 src 进来。
 !_rollback/v2-snapshot-20261021b/
+_rollback/v2-snapshot-20261021b/*
 !_rollback/v2-snapshot-20261021b/src/
 !_rollback/v2-snapshot-20261021b/src/**
-_rollback/v2-snapshot-20261021b/test/
-_rollback/v2-snapshot-20261021b/dist*/
 
 # ── 本项目 git 元数据目录（gitdir，自身不能入库）──
 .git-motion/
+
+# ── 仅本地保留：历史 APK 旧版本（0.1.2 是当前唯一推荐包，已入库）──
+# 不写 *.apk 通配，避免把未来新版本包一起忽略。
+/apk/MOTION-0.1.0-debug.apk
+/apk/MOTION-0.1.0-release.apk
+/apk/MOTION-0.1.1-release.apk
+
+# ── 仅本地保留：历史验收/返工报告（按文件名精确列出，不用 *.md 通配）──
+/Android交付报告.md
+/Android真机测试清单.md
+/HANDOFF-android.md
+/HANDOFF-v8.md
+/返工报告.md
+/返工报告-v3.md
+/返工报告-v4.md
+/返工报告-v5.md
+/返工报告-v6.md
+/返工报告-v7.md
+/返工报告-v8.md
+/手机测试清单.md
+/手机复测清单-v2.md
+/手机复测清单-v3.md
+/手机复测清单-v4.md
+/手机复测清单-v5.md
+/手机复测清单-v6.md
+/手机复测清单-v7.md
 
 # ── 最高优先级排除（放在最后以确保覆盖上面的白名单例外）──
 # AppleDouble / exFAT 元数据即使落在白名单子树内也必须排除
