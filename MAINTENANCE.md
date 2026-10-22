@@ -54,6 +54,20 @@
 | `cd app && npm test` | 全量单测（vitest） |
 | `cd app && npx tsc --noEmit -p tsconfig.json` | 类型检查 |
 | `cd app && node scripts/test-native.mjs` | 原生 Java I/O 纯 JVM 测试（自建 `android/native-test/out`，无需 SDK） |
+
+### 原生 JVM 测试（4 个测试类，共 107 项）
+```
+app/android/native-test/BackupIoTest.java                 24 项
+app/android/native-test/ExportSpoolTest.java              58 项
+app/android/native-test/ExportPhaseTest.java              13 项
+app/android/native-test/ExportOriginalBindingTest.java    12 项
+```
+运行 `node scripts/test-native.mjs` 会先 `javac` 编译源码与这 4 个测试类到
+`android/native-test/out/`（该目录是**构建产物**，已忽略、不入库，每次自动重建），
+再依次运行，全部通过时输出 `✔ 全部原生 I/O 测试通过`。
+
+> 克隆仓库后若直接跑 `test-native.mjs` 报「找不到 BackupIoTest.java」，
+> 说明这 4 个测试类缺失——它们必须随仓库提交，否则原生测试无法运行。
 | **Web 构建（不覆盖历史）** | `cd app && MOTION_OUT_DIR=dist-web-next npm run build` |
 | **Android 目标构建** | `cd app && npm run build:android`（输出 `dist-android`，无 SW） |
 | **完整 Android 打包** | 见下方「发新版的完整顺序（仅模板，不要原样执行）」 |
@@ -172,6 +186,15 @@ shasum -a 256 "$DST_APK"
 | `_rollback/` | 全部历史快照（**含测试依赖**） | ❌ |
 | `verify/`、`verify-v4`…`verify-v8`、`verify-android`、`verify-android-011`、`verify-plan-011`、`verify-zero-byte` | 验收报告/截图/JSON 证据 | ❌ |
 | `_archive/maintenance-20261022/` | 本次整理的临时补丁/探针归档 | ⚠️ 见下 |
+
+### Git 元数据位置（2026-10-22 迁移后）
+活动 gitdir 在内置 APFS：
+```
+/Users/linyu/.local/share/agent-project-git/motion-personal-training.git
+```
+工作树仍在原 exFAT 项目目录；`.git` 是指向上述路径的指针文件。
+旧的 `<项目根>/.git-motion/` 完整保留作为回滚来源（已忽略，勿删）。
+迁移与回滚细节见 `GITHUB-SYNC.md` 第 3 节、`_archive/gitdir-migration-20261022/`。
 
 ### 本次归档的临时工作目录
 原位于 `app/` 下的可重建临时物已归档（**未删除**）：

@@ -38,25 +38,55 @@ f0747e7  MOTION 0.1.2：源码、测试与已验收 APK 首次入库
 
 ---
 
-## 3. Git 元数据位置（重要）
+## 3. Git 元数据位置（已于 2026-10-22 迁移至内置 APFS）
 
-本机 `~/.local/share` 在沙箱外不可写，因此**无法**按理想方案把 gitdir 放到内置 APFS。
-实际采用项目内专用目录：
-
+### 当前状态（迁移后，生效中）
 ```
 工作树：/Volumes/阿钰的移动硬盘/AI通用工作区/DeepSeek Harness Workspace/tasks/2026-10-20_motion-training-app
-gitdir：<项目根>/.git-motion      ← exFAT 上，已加入 .gitignore
-.git  ：指向 .git-motion 的指针文件
+活动 gitdir：/Users/linyu/.local/share/agent-project-git/motion-personal-training.git   ← 内置 APFS
+.git ：指针文件，内容为上面这行 gitdir
 ```
 
-- 未使用 Workspace 顶层仓库（该仓库管理共享治理，**不在本次上传范围**）。
-- 未迁移、未修复任何现存 gitdir。
-- 未使用 `git clean` / `git reset` / `force push`，未重写历史。
-- 提交身份为**仓库级**配置（未改全局）：`bluebirdflew4288-ui` +
-  GitHub noreply 邮箱。
+- `core.worktree` 指向原工作树，`core.filemode=false`（exFAT 不保留执行位），
+  `app/android/gradlew` 索引 mode 显式标记 `100755`。
+- 活动 gitdir **无 AppleDouble**（迁移时已过滤）。
+- 提交身份为**仓库级**配置（未改全局）：`bluebirdflew4288-ui` + GitHub noreply 邮箱。
 
-> exFAT 不保存 Unix 执行位，因此显式把 `app/android/gradlew` 标记为 `100755`，
-> 保证克隆后可直接执行。
+### 历史（迁移前）
+初次同步时 `~/.local/share` 处于沙箱外不可写，gitdir 只能落在项目内
+`<项目根>/.git-motion`（exFAT）。该状态**不满足迁移约束**（非「理想方案未实现」，
+而是明确约束未满足），因此本轮在获得合法写入权限后完成迁移。
+
+### 回滚来源（保留，不删除）
+```
+_archive/gitdir-migration-20261022/
+  dot-git-pointer.bak                    旧 .git 指针原件（133 B）
+  git-motion-full-863.tar.gz             完整归档：863 文件（含 527 AppleDouble）
+  git-motion-full-863.tar.gz.sha256      归档 SHA256
+  git-motion-full-863-manifest.txt       逐成员 size/sha256/path 清单
+  protected-baseline-before.txt          迁移前 240 行保护基线
+  dist-rollback-hashes.txt               dist/rollback 哈希
+  git-motion/                            ⚠ 仅 336 真实 Git 文件的副本，
+                                         缺 527 个 AppleDouble，**不适合作回滚**
+                                         （目录内有 INVALID-DO-NOT-USE-FOR-ROLLBACK.txt 标记）
+  git-motion-member-manifest.txt         迁移前 .git-motion 成员清单
+  git-motion-dirs.txt                    迁移前目录结构
+  APFS-PERMISSION-BLOCKER.md             迁移前的权限阻碍记录（历史）
+```
+旧 `<项目根>/.git-motion/` **仍完整保留在原位**（863 文件未变），作为回滚来源，已加入 `.gitignore`。
+
+### 迁移步骤摘要（已完成）
+1. 记录保护基线（源码/测试/配置/脚本/public/APK/dist/rollback 哈希）
+2. 备份旧 `.git` 指针与整个 `.git-motion`（Python tarfile 手工逐成员，863/863 校验通过）
+3. 在 APFS 建 bare 副本（`git clone --no-hardlinks`）
+4. 补齐 `refs/remotes/origin/main`、复制 `config` 与 `index`、设置 `core.worktree`
+5. 过滤副本 AppleDouble → `fsck --full --strict` 健康
+6. 演练只读连接原工作树：HEAD/branch 一致、工作树干净、`gradlew` 100755
+7. 原子切换 `.git` 指针（写临时文件后 `mv`）
+8. 切换后验证：`rev-parse --absolute-git-dir`、`fsck`、refs 与切换前逐条一致、
+   `status` 干净、活动 gitdir 无 AppleDouble
+
+> 未使用 `git clean` / `git reset` / `force push`，未重写历史。
 
 ---
 
