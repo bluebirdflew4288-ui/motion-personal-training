@@ -198,10 +198,12 @@ _archive/maintenance-20261022/temp-workdirs-20261022.tar.gz   # 二选一，建�
 
 ---
 
-## 9. 2026-10-27 GitHub 同步准备（仅记录与精确暂存）
+## 9. 2026-10-27 GitHub 同步与本轮可恢复归档
 
-本轮为用户确认 0.1.7 当前测试包后的私有 GitHub 同步准备。Root 授权只覆盖审定源码闭包、必要维护文档/配置、四个带环境路径覆盖的 UI 自查脚本、fixtures/templates 与已验收 0.1.7 APK。0.1.2 APK、旧 v2 测试依赖、0.1.3–0.1.6 APK、其余 rollback、dist 和验收材料按各自用途保留。
+MOTION 0.1.7 主体已推送到仍为 **PRIVATE** 的 `bluebirdflew4288-ui/motion-personal-training` 仓库 `main`：commit `71a6aa911b985cab14b0d8f91badf81f543a704c`，tree `c97ad0310e3de986ef13372bae3dcd3634e9165c`。Root 的 APFS 独立克隆检查中，`npm ci --no-audit --no-fund`、类型检查、Vitest 67 文件 / 955 项、原生 JVM 22 类和 4 个 UI 脚本语法检查均 exit 0；typecheck 未在 `app/src` 生成 JS。Root 从 GitHub 新克隆复核主体 324 文件逐字节匹配、克隆 clean，0.1.7 APK SHA256 为 `675bf332266671cf8a4c4821442f076c81d272f24fc1bd71169327af015717d8`。仓库保持私有，本次未创建 Release/Tag/PR。
 
-本轮不删除、不移动任何项目资产，不清理 AppleDouble。Root 对指定保护目录（APK、rollback/archive、各 verify 与历史 dist）保存的快照包含 10,802 个实文件、506,921,354 字节；这是所选保护目录的清单，不代表全树，也不含一般依赖目录。整个 Project 的物理元数据计数为 20,067 个 `._*`/`.DS_Store` 项（计数含依赖与旧 gitdir）。这些都是保护/盘面统计，不是待清理目标。生成的 Android `assets/public`、Capacitor 配置/插件清单遵循原有 `.gitignore`，保持本机。
+本轮只移动 Root 核准的 16 个本机 `.fix/.patch` 临时脚本：从 Android 插件源码目录移至 `_archive/maintenance-20261027/native-patch-scripts/`，同 basename、原字节保留；16/16 对照 0.1.7 源清单 SHA256 一致，正式源码/测试/构建入口无引用。16 个源路径旁没有 AppleDouble 文件。该可恢复映射、大小、哈希与恢复方法见归档目录 `RESTORE-MANIFEST.json`（Task 证据副本：`tasks/2026-10-27_motion-017-github-sync-hygiene/luna-audit/RESTORE-MANIFEST.json`）。没有删除临时脚本或修改正式 Java/TS 源码、测试、APK、设备/验收证据。
 
-当前阶段仅准备精确暂存供 Root 审查，尚未提交或推送。Root 后续计划在 APFS 独立新克隆验证；本记录不预先宣称其结果。细节见 `GITHUB-SYNC-017.md` 和 Codex Task `tasks/2026-10-27_motion-017-github-sync-hygiene/luna-audit/`。
+Root 的保护目录清单仍为 10,802 个文件 / 506,921,354 字节，已复核这些文件全部原字节未变。该统计限于选定的 APK、rollback/archive、verify 与历史 dist，不是全树且不含一般依赖。本轮归档前的实体清点为 20,067 个 `._*`/`.DS_Store` 项，计数含依赖和旧 gitdir；本轮未清理 AppleDouble 或其他历史文件。生成的 Android `assets/public` 与 Capacitor 生成文件仍按 `.gitignore` 保持本机。
+
+本记录保存主体同步后的独立验收与可恢复卫生结果；文档修订及远端分支的最终状态以 Git 记录和实时核验为准。
