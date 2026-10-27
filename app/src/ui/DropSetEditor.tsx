@@ -2,7 +2,7 @@
    计划编辑与训练中临时调整共用同一个组件，避免两套规则漂移。
    移动端默认简洁：只在选择「递减组」时展开细项，保存前有可读预览。 */
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { DropSetDraft } from '../domain/dropSet';
 import {
   MAX_ROUNDS,
@@ -29,6 +29,26 @@ interface Props {
   form?: DraftFormApi;
   /** 字段 id 前缀（同一页面有多个编辑器时必须唯一） */
   fieldPrefix?: string;
+  /**
+   * B4/G5-R5：把**内部 raw 状态**上报给离页门禁。
+   *
+   * <p>关键：外层 `draft` 是结构化对象，用户把某个阶段轮数**清空**时
+   * 外层 draft 可能仍是旧值（3），但内部数字框已有"空/未完/错误"的 raw 草稿。
+   * 真实失败：清空轮数并 blur 报"不能为空"，仍显示"没有改动"，点返回直接丢失。
+   *
+   * <p>因此本组件必须把 raw 层状态（flush 是否通过、是否有错误、是否聚焦）
+   * 独立上报，不能只依赖父层比较 JSON。
+   */
+  onDirtyChange?: (dirty: boolean) => void;
+  /**
+   * B4-R1：**外层结构化草稿**是否脏（由父层计算后传入）。
+   *
+   * <p>关键：结构化 draft 与内部 raw 曾经**各自往同一个 owner 写**
+   * （外层报 `structuredDirty||saving`、内层报 `invalid`），
+   * 内层的 false 会清掉外层仍脏的合法改动。
+   * 现在两者在本组件内**合并后只上报一次**。
+   */
+  structuredDirty?: boolean;
 }
 
 /**
@@ -53,7 +73,85 @@ export function stageFieldIds(
   };
 }
 
-export function DropSetEditor({ draft, onChange, scopeNote, form, fieldPrefix = 'drop' }: Props) {
+export function DropSetEditor({
+  draft,
+  onChange,
+  scopeNote,
+  form,
+  fieldPrefix = 'drop',
+  onDirtyChange,
+  structuredDirty = false,
+}: Props) {
+  /**
+   * B4/G5-R5：**内部 raw 脏状态**。
+   *
+   * 判定来源：
+   *   · 结构 draft 与外部不一致（原有）；
+   *   · **或** 父表单 flush 不通过（存在空/未完/非法/IME 的 raw 草稿）。
+   *
+   * 用 state 而非 ref，保证父级 effect 能观察到 true→false 变化。
+   */
+  const [rawInvalid, setRawInvalid] = useState(false);
+  /**
+   * B4-R2（G5 实证缺口 1 的修复核心）：**订阅字段被动变化**。
+   *
+   * <p>B4-R1 用 `probeRawValid()` 消除了自激循环，但它只是"读一次快照"：
+   * 子字段清空/报错/IME 只改自己的本地 state，父层 `draft` 与 `form` 身份都不变，
+   * 依赖 `[draft, form]` 的 effect **永远不会重跑** → rawInvalid 一直 false
+   * → 离页门禁放行 → 草稿丢失（Codex 真实 001 实证）。
+   *
+   * <p>现在：字段在不可卸载状态真实变化时通过 `form._reportUnsafe` 主动通知，
+   * 本组件订阅该通知并重算聚合。**不再依赖 draft/form 身份变化**。
+   */
+  useEffect(() => {
+    if (!form) return undefined;
+    /**
+     * 重算聚合：任一字段不可安全卸载即视为 raw 层不干净。
+     *
+     * 用 `hasUnsafeField()`（含合法未提交/空/`7.`/IME/错误），
+     * 不是只看 invalid —— 合法但未 blur 的草稿同样不能被静默卸载。
+     */
+    const recompute = () => {
+      let unsafe = false;
+      try {
+        unsafe = form.hasUnsafeField();
+      } catch {
+        unsafe = true; // 探测失败按脏处理（保守）
+      }
+      setRawInvalid(unsafe);
+    };
+    recompute(); // 首次同步一次（覆盖已挂载字段的当前状态）
+    return form.subscribe(recompute);
+  }, [form]);
+
+  /**
+   * 结构化草稿与内部 raw **合并后只上报一次**（B4-R1）。
+   * 取 OR：任一为真即脏，避免内层 false 清掉外层仍脏的合法改动。
+   *
+   * B4-R2：`draft` 变化时也重算一次（结构化改动本身可能改变字段基线）。
+   */
+  useEffect(() => {
+    if (!onDirtyChange) return;
+    onDirtyChange(structuredDirty || rawInvalid);
+  }, [structuredDirty, rawInvalid, onDirtyChange]);
+
+  /**
+   * B4-R2：**真正卸载时注销自己的 owner**（G5 实证缺口 2：取消幽灵 dirty）。
+   *
+   * <p>真实失败：合法 3→4 真实 blur → 取消恢复 3 → 点 ‹计划 无反应。
+   * 根因：配置 owner 由**会卸载的内层**独占，内层卸载后没有人清 false，
+   * 外层 PlanDayEditor 的 owner Map 永久为 true。
+   *
+   * <p>这里在 cleanup 里显式上报 false（本次编辑不再持有任何脏状态），
+   * 让门禁随组件消失而释放。**只清自己的键**，不动其它存活字段。
+   */
+  useEffect(() => {
+    if (!onDirtyChange) return undefined;
+    return () => {
+      onDirtyChange(false);
+    };
+  }, [onDirtyChange]);
+
   /**
    * L03：删除递减阶段前必须确认（严格「是 / 否」）。
    *

@@ -25,6 +25,10 @@ import {
 } from './locks';
 import { pushCycle } from '../domain/cycle';
 import type { Plan, Session } from '../domain/types';
+import { localDateKey } from '../domain/localDate';
+import { finalizeCardioForFinish } from '../domain/cardio';
+import { hasAnyRealContent } from '../domain/sessionContent';
+import { MAX_CARDIO_ENTRIES, MAX_PLANS } from '../domain/limits';
 
 export type WriteFailureReason =
   | 'lock-lost'
@@ -60,12 +64,23 @@ export type WriteIntent =
   | { kind: 'create' }
   /** 训练进行中的普通保存：当前必须是 active */
   | { kind: 'active-save' }
-  /** 结束训练：当前必须是 active；已终态则幂等返回既有结果且不推进 */
+  /**
+   * 结束训练：当前必须是 active；已终态则幂等返回既有结果且不推进。
+   *
+   * **有氧封口是无条件的**（G5）：只要库内 current 有 running 的有氧，
+   * 就在本事务内以 current + 捕获的完成时刻结算最后一段。
+   * 旧实现用可选 `finalizeCardio` flag，任何漏传的 UI 入口都会留下
+   * "终态但仍有 running/未封口段"的损坏记录 —— 因此不再提供关闭开关。
+   */
   | { kind: 'finish'; advanceCycle: boolean }
   /** 放弃训练：当前必须是 active；已终态则幂等返回 */
   | { kind: 'discard' }
   /** 历史纠错：当前必须是终态记录；只改当下合法版本 */
-  | { kind: 'history-edit' };
+  | { kind: 'history-edit' }
+  /** 记录完全休息：同事务内做同日去重/冲突核验，并按需推进一次循环 */
+  | { kind: 'create-rest'; restDate: string; advanceCycle: boolean }
+  /** 撤销完全休息：只删该 rest 记录，不碰真实训练、不回退 cursor */
+  | { kind: 'delete-rest'; restDate: string };
 
 export interface WriteOptions {
   intent: WriteIntent;
@@ -81,6 +96,43 @@ export interface WriteOptions {
   ttlMs?: number;
 }
 
+/**
+ * 读取出口的**纯内存缺省**（G6）。
+ *
+ * 与 `repo.normalizeSession` 同一套语义，但 tx 不 import repo（避免循环依赖），
+ * 因此在这里保留一份等价实现。**只补缺省，不回写库、不重建 groups/目标分母。**
+ */
+function withDefaults(s: Session | undefined): Session | undefined {
+  if (!s) return undefined;
+  return {
+    ...s,
+    kind: s.kind ?? 'strength',
+    origin: s.origin ?? 'plan',
+    cardio: s.cardio ?? [],
+    cardioPausedBySession: s.cardioPausedBySession ?? [],
+  };
+}
+
+/**
+ * 会话级有氧不变量的**写入边界核验**（G3）。
+ *
+ * 旧实现只在渲染时 disabled，于是快速输入仍能把**两个 running**
+ * 或**超过 8 项**的有氧写进库 —— 结果应用自产的备份被自己的校验拒绝、无法恢复。
+ * 因此在真正写入前统一核验；非法一律拒绝并给明确原因，
+ * 不关闭校验、也不静默暂停另一项来"求绿"。
+ */
+function cardioWriteViolation(next: Session): string | null {
+  const list = next.cardio ?? [];
+  if (list.length > MAX_CARDIO_ENTRIES) {
+    return `一次训练最多 ${MAX_CARDIO_ENTRIES} 个有氧项目`;
+  }
+  const running = list.filter((c) => c.status === 'running').length;
+  if (running > 1) {
+    return '一次训练只能有一个正在计时的有氧项目，请先暂停或完成当前项目';
+  }
+  return null;
+}
+
 /** 记录当前 revision（旧数据视为 0） */
 export function revisionOf(s: Session | undefined): number {
   return typeof s?.revision === 'number' && Number.isFinite(s.revision) ? s.revision : 0;
@@ -91,7 +143,8 @@ function fail(
   message: string,
   current?: Session,
 ): { ok: false; reason: WriteFailureReason; message: string; current?: Session } {
-  return { ok: false, reason, message, ...(current ? { current } : {}) };
+  const cur = withDefaults(current);
+  return { ok: false, reason, message, ...(cur ? { current: cur } : {}) };
 }
 
 /**
@@ -100,8 +153,18 @@ function fail(
  */
 export function atomicWriteSession(opts: WriteOptions): Promise<WriteResult> {
   const { intent, session, editorId, expectedRevision, lockPolicy = 'required', ttlMs = DEFAULT_LOCK_TTL_MS } = opts;
-  const needsPlans = intent.kind === 'finish';
+  const needsPlans = intent.kind === 'finish' || intent.kind === 'create-rest';
   const stores = needsPlans ? ['sessions', 'meta', 'plans'] : ['sessions', 'meta'];
+  /**
+   * 需要读全部 sessions 做**同日互斥**核验的意图：
+   * · create      普通开练（力量/有氧）—— 同日已有 rest 时必须拒绝（G1 反向互斥）
+   * · create-rest 记录休息 —— 同日已有实际训练/active 时必须拒绝
+   * · delete-rest 撤销休息 —— 需要按稳定身份核验
+   */
+  const needsAllSessions =
+    intent.kind === 'create' ||
+    intent.kind === 'create-rest' ||
+    intent.kind === 'delete-rest';
 
   return openDb().then(
     (db) =>
@@ -170,10 +233,20 @@ export function atomicWriteSession(opts: WriteOptions): Promise<WriteResult> {
 
         const lockReq = meta.get(lockKey(session.id));
         const curReq = sessions.get(session.id);
+        /** rest 相关：需要全部 sessions 做同日去重/冲突核验（同一事务内决定） */
+        const allReq = needsAllSessions ? sessions.getAll() : null;
 
         let lockRaw: unknown;
         let current: Session | undefined;
-        let pending = 2;
+        let allSessions: Session[] | undefined;
+        let pending = needsAllSessions ? 3 : 2;
+
+        if (allReq) {
+          allReq.onsuccess = () => {
+            allSessions = allReq.result as Session[];
+            step();
+          };
+        }
 
         const step = () => {
           pending--;
@@ -226,7 +299,13 @@ export function atomicWriteSession(opts: WriteOptions): Promise<WriteResult> {
               return;
             }
           }
-          if (lockPolicy === 'required' && !terminalNoop) {
+          /**
+           * rest 相关意图不针对"正在编辑的训练"，因此不走训练编辑锁校验；
+           * 它们的并发安全由**同一事务内的同日去重/冲突核验**保证
+           * （两页同时 create-rest 时，后一个会读到前一个已写入的 rest 并拒绝）。
+           */
+          const skipTrainingLock = intent.kind === 'create-rest' || intent.kind === 'delete-rest';
+          if (lockPolicy === 'required' && !terminalNoop && !skipTrainingLock) {
             const st = interpretLock(lockRaw, now, ttlMs);
             if (st.kind === 'corrupt') {
               abort(fail('corrupt-lock', '编辑锁记录已损坏，请刷新页面重新取得控制', current));
@@ -255,11 +334,163 @@ export function atomicWriteSession(opts: WriteOptions): Promise<WriteResult> {
           const curRev = revisionOf(current);
 
           switch (intent.kind) {
+            /**
+             * 记录完全休息（第2阶段）。
+             *
+             * 在**同一事务**内完成：同日去重（跨计划）→ 与 active/实际训练互斥核验
+             * → 读最新 plan → 按 advanceCycle 推进一次 → 写入 rest 记录。
+             * 因为 rest 创建即 completed，后续 finish 必 no-op，
+             * 所以推进必须在这里完成。
+             */
+            case 'create-rest': {
+              const list = allSessions ?? [];
+              const restDate = intent.restDate;
+              // ① 同日已有 rest → 幂等拒绝（跨计划去重）
+              const sameRest = list.find(
+                (x) => x.status !== 'discarded' && (x.kind ?? 'strength') === 'rest' && x.restDate === restDate,
+              );
+              if (sameRest) {
+                abort(fail('state-conflict', '今天已经记录过完全休息了', sameRest));
+                return;
+              }
+              // ② 存在未结束训练 → 必须先处理其锁/草稿
+              const active = list.find((x) => x.status === 'active');
+              if (active) {
+                abort(fail('state-conflict', '还有一次训练没有结束，请先结束或放弃它，再记录完全休息', active));
+                return;
+              }
+              /**
+               * ③ 同日有**真实内容**的记录 → 强互斥。
+               *
+               * G1：旧实现用 `status === 'discarded'` 直接跳过，
+               * 于是"已放弃但仍有 8 次 × 20kg 递减阶段"的记录会被当成没练，
+               * 让同一天既能记休息又有真实运动数据。
+               * 现在用 `hasAnyRealContent`（含 partial / 只填重量 / 真实 0 /
+               * 备注 / 热身 / 有氧）判断，**不看 status 标签**。
+               */
+              const sameDayReal = list.find((x) => {
+                if ((x.kind ?? 'strength') === 'rest') return false;
+                const ts = x.endedAt ?? x.startedAt;
+                const sameDay =
+                  localDateKey(x.startedAt) === restDate || localDateKey(ts) === restDate;
+                if (!sameDay) return false;
+                return hasAnyRealContent(x);
+              });
+              if (sameDayReal) {
+                abort(
+                  fail('state-conflict', '今天已有实际训练记录，不能同时标记为完全休息', sameDayReal),
+                );
+                return;
+              }
+              // ④ 读最新 plan → 按明确意图推进一次
+              const planId = session.planId;
+              const planReq = plans!.get(planId);
+              planReq.onsuccess = () => {
+                const curPlan = planReq.result as Plan | undefined;
+                const shouldAdvance = intent.advanceCycle && !!curPlan && curPlan.days.length > 0;
+                const movedPlan = shouldAdvance && curPlan ? pushCycle(curPlan) : undefined;
+                const next: Session = {
+                  ...session,
+                  status: 'completed',
+                  endedAt: session.endedAt ?? now,
+                  advancedCycle: Boolean(shouldAdvance),
+                  cycleIndexAfter: movedPlan ? movedPlan.cursor : (curPlan?.cursor ?? session.cycleIndexAtStart),
+                  revision: 1,
+                };
+                try {
+                  sessions.put(next);
+                  if (movedPlan && curPlan) plans!.put({ ...curPlan, ...movedPlan });
+                } catch (err) {
+                  abort(fail('storage', err instanceof Error ? err.message : '写入失败', current));
+                  return;
+                }
+                finishWrite({ ok: true, revision: 1, session: next });
+              };
+              return;
+            }
+            /**
+             * 撤销完全休息：只删该 rest 记录。
+             * **不碰真实训练、不回退 cursor**（文案说明即可）。
+             */
+            case 'delete-rest': {
+              /**
+               * 撤销完全休息 —— **稳定身份核验**（G2）。
+               *
+               * 旧实现只按 restDate 找第一条，于是：
+               *   A 页持有 old → B 页删了 old 又建了同日的 new →
+               *   A 用旧快照撤销时会**成功删掉 new**（误删别页刚建的记录）。
+               * 现在按 `session.id + kind + 固定 restDate` 三者核验，
+               * 缺失或被替代一律返回冲突，**绝不按日期自动换一个对象删**。
+               * 正常撤销只删该 rest，不碰真实训练、不回退 cursor。
+               */
+              const list = allSessions ?? [];
+              const target = list.find((x) => x.id === session.id);
+              if (
+                !target ||
+                (target.kind ?? 'strength') !== 'rest' ||
+                target.restDate === undefined ||
+                target.restDate !== intent.restDate
+              ) {
+                abort(
+                  fail(
+                    'state-conflict',
+                    '这条完全休息记录已经被改动或撤销过了（可能另一个页面操作过），本页没有删除其它记录。',
+                    target ?? current,
+                  ),
+                );
+                return;
+              }
+              try {
+                sessions.delete(target.id);
+              } catch (err) {
+                abort(fail('storage', err instanceof Error ? err.message : '删除失败', current));
+                return;
+              }
+              finishWrite({ ok: true, revision: 0, session: target });
+              return;
+            }
             case 'create': {
               if (current) {
                 abort(fail('state-conflict', '这条训练记录已存在，不能重复新建', current));
                 return;
               }
+              /**
+               * G1：普通开练的**反向互斥**。
+               *
+               * 旧实现只查当前 ID，于是「先记录完全休息，再开始力量/有氧」会同时成功
+               * （真实 IDB 与双页竞争均已复现），造成同一天既"完全休息"又"练了"。
+               * 现在在同一事务内读全部 sessions：
+               * · 同日已有 rest → 必须先明确撤销休息才能训练；
+               * · 同一时刻只能有一条 active（双页竞争也在此拦住）。
+               */
+              const list = allSessions ?? [];
+              const dayKeys = new Set<string>([
+                localDateKey(session.startedAt),
+                ...(session.endedAt ? [localDateKey(session.endedAt)] : []),
+              ]);
+              const sameDayRest = list.find(
+                (x) =>
+                  x.status !== 'discarded' &&
+                  (x.kind ?? 'strength') === 'rest' &&
+                  x.restDate !== undefined &&
+                  dayKeys.has(x.restDate),
+              );
+              if (sameDayRest) {
+                abort(
+                  fail(
+                    'state-conflict',
+                    '今天已记录为完全休息。请先在历史里撤销这条休息记录，再开始训练。',
+                    sameDayRest,
+                  ),
+                );
+                return;
+              }
+              /*
+                注意：这里**不**新增「同一时刻只能一条 active」的硬门禁。
+                旧库可能残留多条未结束训练，首页会逐条列出让用户处理（既有设计）；
+                G1 要的是「同日休息 ↔ 训练」的双向互斥，active 保护由 create-rest
+                分支与首页引导负责。加硬门禁会破坏既有的孤儿处理路径。
+              */
               writeNext({ ...session, revision: 1 });
               return;
             }
@@ -295,7 +526,12 @@ export function atomicWriteSession(opts: WriteOptions): Promise<WriteResult> {
               if (curStatus !== 'active') {
                 // ④ 无条件幂等：**不写库**，因此不需要等提交，可以立即返回既有结果。
                 // 注意这不会影响真实写分支的提交确认（那条路径走 finishWrite → oncomplete）。
-                immediateSuccess = { ok: true, revision: curRev, session: current, alreadyTerminal: true };
+                immediateSuccess = {
+                  ok: true,
+                  revision: curRev,
+                  session: withDefaults(current)!,
+                  alreadyTerminal: true,
+                };
                 // 没有排入任何写入，可以立即返回（不受提交结果影响）
                 done(immediateSuccess);
                 return;
@@ -303,8 +539,25 @@ export function atomicWriteSession(opts: WriteOptions): Promise<WriteResult> {
               // 结束/放弃都以**事务内最新记录**为数据底，只应用终态字段，
               // 避免「首页旧快照」把别页刚保存的次数覆盖回去（审查 D19）。
               const base: Session = { ...current };
+              /**
+               * REVIEW-2 #2：**discard 与 finish 共用同一个封口逻辑**。
+               * 放弃 ≠ 清空真实内容：已做的有效有氧量与实际参数分段必须保留，
+               * 只把仍在 running 的 entry 用**库内锚点 + 同一个捕获结束时刻**封口，
+               * 终态后计时不再增长；也不接受调用方传入的旧候选段冒充已保存事实。
+               * 终态幂等、锁、循环不推进、失败原子性都保持不变。
+               */
+              const terminalAt = session.endedAt ?? now;
+              const sealedCardio = Array.isArray(base.cardio)
+                ? base.cardio.map((c) => finalizeCardioForFinish(c, terminalAt))
+                : base.cardio;
               if (intent.kind === 'discard') {
-                const next: Session = { ...base, status: 'discarded', endedAt: session.endedAt ?? now, revision: curRev + 1 };
+                const next: Session = {
+                  ...base,
+                  ...(sealedCardio ? { cardio: sealedCardio } : {}),
+                  status: 'discarded',
+                  endedAt: terminalAt,
+                  revision: curRev + 1,
+                };
                 writeNext(next);
                 return;
               }
@@ -316,10 +569,21 @@ export function atomicWriteSession(opts: WriteOptions): Promise<WriteResult> {
                 const shouldAdvance =
                   intent.advanceCycle && !base.advancedCycle && !!curPlan && curPlan.days.length > 0;
                 const movedPlan = shouldAdvance && curPlan ? pushCycle(curPlan) : undefined;
+                /**
+                 * 第2阶段：以**库内 current 的锚点与参数**结算有氧
+                 * （不接受调用方传入的 endedAtMs/segments 作为已保存事实）。
+                 * · running → 结算最后段并封口
+                 * · paused  → 保留已有有效量并终结
+                 * · pending → 不伪造时长
+                 * 完成时刻用同一个 `session.endedAt ?? now`。
+                 */
+                // 与 discard 同一个捕获时刻与同一封口逻辑（见上），不重复合成
+                const finalizedCardio = sealedCardio;
                 const next: Session = {
                   ...base,
+                  ...(finalizedCardio ? { cardio: finalizedCardio } : {}),
                   status: 'completed',
-                  endedAt: session.endedAt ?? now,
+                  endedAt: terminalAt,
                   advancedCycle: Boolean(shouldAdvance),
                   // 从**事务内最新计划**读游标：不信任 UI 预先算好的 cycleIndexAfter
                   cycleIndexAfter: movedPlan ? movedPlan.cursor : (curPlan?.cursor ?? base.cycleIndexAtStart),
@@ -379,6 +643,14 @@ export function atomicWriteSession(opts: WriteOptions): Promise<WriteResult> {
          * 锁续租 / 结束后的锁清理都与终态写在同一个事务里，一起成功或一起回滚。
          */
         const writeNext = (next: Session) => {
+          // G3：写入边界统一核验有氧会话不变量（非法一律拒绝，不产生无法恢复的自产备份）
+          if (next.status === 'active') {
+            const violation = cardioWriteViolation(next);
+            if (violation) {
+              abort(fail('state-conflict', violation, current));
+              return;
+            }
+          }
           try {
             sessions.put(next);
           } catch (err) {
@@ -400,7 +672,11 @@ export function atomicWriteSession(opts: WriteOptions): Promise<WriteResult> {
           if (intent.kind === 'finish' || intent.kind === 'discard') {
             meta.put({ key: lockKey(session.id), sessionId: session.id, editorId: '', at: 0 });
           }
-          pendingSuccess = result;
+          // G6：所有成功出口的 session 也补内存缺省（读时归一，不写库）
+          pendingSuccess =
+            'session' in result && result.session
+              ? { ...result, session: withDefaults(result.session)! }
+              : result;
         };
 
         lockReq.onsuccess = () => {
@@ -531,3 +807,150 @@ export async function acquireLockDetailed(
 }
 
 export { StorageError };
+
+
+/* ── 第2阶段：有氧 / 完全休息的受约束入口 ─────────── */
+
+/**
+ * 记录完全休息（原子）。
+ *
+ * 在**同一事务**内完成：同日去重（跨计划）→ 与 active/实际训练互斥 →
+ * 读最新 plan → 按 `advanceCycle` 推进一次 → 写入 rest（创建即 completed）。
+ */
+export function atomicCreateRest(args: {
+  session: Session;
+  restDate: string;
+  advanceCycle: boolean;
+  guard?: { editorId?: string; ttlMs?: number };
+}): Promise<WriteResult> {
+  return atomicWriteSession({
+    intent: { kind: 'create-rest', restDate: args.restDate, advanceCycle: args.advanceCycle },
+    session: args.session,
+    editorId: args.guard?.editorId,
+    ttlMs: args.guard?.ttlMs,
+    lockPolicy: 'optional',
+  });
+}
+
+/** 撤销完全休息（只删该 rest 记录，不碰真实训练、不回退 cursor） */
+export function atomicDeleteRest(args: {
+  session: Session;
+  restDate: string;
+  guard?: { editorId?: string; ttlMs?: number };
+}): Promise<WriteResult> {
+  return atomicWriteSession({
+    intent: { kind: 'delete-rest', restDate: args.restDate },
+    session: args.session,
+    editorId: args.guard?.editorId,
+    ttlMs: args.guard?.ttlMs,
+    lockPolicy: 'optional',
+  });
+}
+
+/* ── 第3阶段：计划模板导入的受约束入口 ─────────── */
+
+/**
+ * **insert-only** 新增计划（模板导入唯一写入路径）。
+ *
+ * 为什么不能走 savePlan/upsertPlan：`idbPut` 对已存在 id 会**整份覆盖**。
+ * 模板导入承诺"只新增、绝不覆盖旧数据"，所以必须：
+ * · 同一事务内读 plans 全集；
+ * · id 已存在 → 拒绝（不覆盖，哪怕调用方声称是新计划）；
+ * · 数量达 MAX_PLANS → 拒绝（与编辑器同一条容量真源）；
+ * · 名称与已有计划相同 → 默认拒绝并给出可明确改写的开关（重复确认门禁），
+ *   仍只新增独立记录，**不按名称合并/替换**；
+ * · 通过核验才 `add`（不是 put）：IDB add 对已有 key 会抛 ConstraintError，
+ *   是整个事务的兜底防线；
+ * · 事务 abort / 任一路径失败 → 整体回滚，不留半份。
+ * 不触碰 active session、历史、设置。
+ */
+export type InsertPlanResult =
+  | { ok: true; plan: Plan }
+  | { ok: false; reason: 'duplicate-name' | 'duplicate-id' | 'capacity' | 'storage'; message: string };
+
+export function atomicInsertPlan(plan: Plan, opts: { allowDuplicateName?: boolean } = {}): Promise<InsertPlanResult> {
+  return openDb().then(
+    (db) =>
+      new Promise<InsertPlanResult>((resolve) => {
+        let settled = false;
+        const done = (r: InsertPlanResult) => {
+          if (!settled) {
+            settled = true;
+            resolve(r);
+          }
+        };
+        let t: IDBTransaction;
+        try {
+          t = db.transaction(['plans'], 'readwrite');
+        } catch (err) {
+          done({ ok: false, reason: 'storage', message: err instanceof Error ? err.message : '事务开启失败' });
+          return;
+        }
+        const store = t.objectStore('plans');
+        let pending: Plan | null = null;
+
+        const allReq = store.getAll();
+        allReq.onerror = () => {
+          done({ ok: false, reason: 'storage', message: allReq.error?.message ?? '读取计划列表失败' });
+        };
+        allReq.onsuccess = () => {
+          const existing = (allReq.result ?? []) as Plan[];
+          // id 冲突 → 拒绝（绝不覆盖）
+          if (existing.some((p) => p.id === plan.id)) {
+            t.abort();
+            done({
+              ok: false,
+              reason: 'duplicate-id',
+              message: '这条计划的内部 ID 与已有计划撞上了，已停止导入（不会覆盖任何旧计划）。请重新发起一次导入。',
+            });
+            return;
+          }
+          // 容量：与编辑器/备份校验同一真源，同事务核验（并发下由 add 兜底）
+          if (existing.length >= MAX_PLANS) {
+            t.abort();
+            done({
+              ok: false,
+              reason: 'capacity',
+              message: `最多保留 ${MAX_PLANS} 个计划，当前已有 ${existing.length} 个。请先删除不用的计划再导入。`,
+            });
+            return;
+          }
+          // 同名默认拒绝（重复确认门禁：用户明确确认后才允许同名并存）
+          const name = plan.name.trim();
+          const sameName = existing.filter((p) => p.name.trim() === name);
+          if (sameName.length > 0 && !opts.allowDuplicateName) {
+            t.abort();
+            done({
+              ok: false,
+              reason: 'duplicate-name',
+              message: `已经有一个同名计划「${name}」。导入不会合并或覆盖它；如果确定要再来一份，请勾选「确认新增同名计划」再提交。`,
+            });
+            return;
+          }
+          try {
+            // add（不是 put）：对已有 key 抛 ConstraintError → 事务失败，双保险
+            store.add(plan);
+            pending = plan;
+          } catch (err) {
+            t.abort();
+            done({ ok: false, reason: 'storage', message: err instanceof Error ? err.message : '写入失败' });
+          }
+        };
+
+        t.oncomplete = () => {
+          if (pending) done({ ok: true, plan: pending });
+          else done({ ok: false, reason: 'storage', message: '事务完成但没有写入，已按失败处理' });
+        };
+        t.onabort = () => {
+          done({
+            ok: false,
+            reason: 'storage',
+            message: t.error?.message ?? '导入被中止，未写入任何内容（既有计划与历史都不受影响）',
+          });
+        };
+        t.onerror = () => {
+          done({ ok: false, reason: 'storage', message: t.error?.message ?? '写入失败' });
+        };
+      }),
+  );
+}

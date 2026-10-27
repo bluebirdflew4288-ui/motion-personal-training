@@ -69,7 +69,8 @@ interface StoreValue {
   dismissToast: (id: string) => void;
   setTheme: (theme: AppSettings['theme']) => Promise<void>;
   patchSettings: (patch: Partial<AppSettings>) => Promise<void>;
-  setCurrentPlan: (planId: string | null) => Promise<void>;
+  /** B2/G5-R6：返回**真实**成功/失败，调用方据此准确提示，不能假报回退成功 */
+  setCurrentPlan: (planId: string | null) => Promise<boolean>;
   refreshSettings: () => Promise<void>;
   refreshPlans: () => Promise<void>;
   refreshSessions: () => Promise<void>;
@@ -235,13 +236,33 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     }
   }, [pushToast]);
 
+  /**
+   * 切换训练用计划。
+   *
+   * ── B2/G5-R6 修复 ────────────────────────────────────────────
+   * 旧实现 catch 后只弹 toast、**既不抛错也不返回失败**，于是调用方
+   * `await setCurrentPlan(...)` 之后无法判断结果。真实后果：
+   * 删除当前计划后 settings 持久化失败，计划已删、DB 仍留旧 current 悬空引用，
+   * 但外层照常弹"已回退"——**假报成功**。
+   *
+   * 现在：返回 `true/false` 真实结果，失败时同时**回滚内存**到原值，
+   * 让调用方能给出准确提示或恢复语义。
+   */
   const setCurrentPlan = useCallback(
-    async (planId: string | null) => {
-      setSettings((s) => ({ ...s, currentPlanId: planId }));
+    async (planId: string | null): Promise<boolean> => {
+      let previous: string | null = null;
+      setSettings((s) => {
+        previous = s.currentPlanId ?? null;
+        return { ...s, currentPlanId: planId };
+      });
       try {
         await persistSettings({ currentPlanId: planId });
+        return true;
       } catch (err) {
+        // 持久化失败：回滚内存，避免内存与 DB 不一致
+        setSettings((s) => ({ ...s, currentPlanId: previous }));
         pushToast(err instanceof Error ? `计划选择未保存：${err.message}` : '计划选择未保存', 'error');
+        return false;
       }
     },
     [pushToast],

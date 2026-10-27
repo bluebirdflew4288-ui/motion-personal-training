@@ -47,6 +47,25 @@ interface Props {
   id?: string;
   /** 失焦后是否把非法草稿回滚成外部值（默认 false：保留草稿让用户改） */
   revertOnInvalidBlur?: boolean;
+  /**
+   * G5：把"当前是否**不可安全卸载**"上报给父级（切换管理计划时的草稿门禁）。
+   *
+   * 不可安全卸载 = 有在途提交（saving）／有未保存草稿（dirty）／有错误待重试。
+   * 组件本身不决定是否卸载，只如实上报；卸载决策由父级门禁负责。
+   */
+  onDirtyChange?: (dirty: boolean) => void;
+  /**
+   * B2/G5-R2：**明确放弃**信号。数值变化即把草稿重置回外部值并清错误。
+   *
+   * 旧实现"放弃修改并切换"只清了一个 ref，字段草稿根本没被取消，
+   * 于是点了放弃草稿还在、也没切目标。
+   */
+  discardEpoch?: number;
+  /**
+   * B4/G5-R3：**保存在途**单独上报（与 dirty 区分）。
+   * 合法保存在途时切换应"等结果后自动续"，而不是要求用户放弃。
+   */
+  onSavingChange?: (saving: boolean) => void;
 }
 
 export function DraftTextField({
@@ -62,6 +81,9 @@ export function DraftTextField({
   placeholder,
   id,
   revertOnInvalidBlur = false,
+  onDirtyChange,
+  discardEpoch,
+  onSavingChange,
 }: Props) {
   const [draft, setDraft] = useState(value);
   const [error, setError] = useState<string | null>(null);
@@ -107,6 +129,41 @@ export function DraftTextField({
     setDraft(value);
     lastCommitted.current = value;
   }, [value, focused, saving, draft, error]);
+
+  /**
+   * G5：把不可卸载状态上报给父级。
+   *
+   * 三种情况都算"不可安全卸载"：有在途提交、草稿与已提交基线不一致、有错误待重试。
+   * 用 effect 而不是在每次 setState 处手写，避免漏掉分支。
+   */
+  useEffect(() => {
+    if (!onDirtyChange) return;
+    /**
+     * B2/G5-R5：dirty 必须**包含 IME 组合态**。
+     * 旧实现只报 saving/draft 差异/error，composition 期间草稿可能与已提交值相同，
+     * 门禁就看不到"用户正在输入"这个事实。
+     */
+    const dirty = saving || draft !== lastCommitted.current || !!error || composing.current;
+    onDirtyChange(dirty);
+  }, [saving, draft, error, onDirtyChange]);
+
+  /** B4/G5-R3：把 saving 单独上报（state 驱动，父级可观察到 true→false） */
+  useEffect(() => {
+    onSavingChange?.(saving);
+  }, [saving, onSavingChange]);
+
+  /** B2/G5-R2：收到放弃信号 → 真正取消草稿 */
+  useEffect(() => {
+    if (discardEpoch === undefined) return;
+    composing.current = false;
+    pendingBlurCommit.current = false;
+    setDraft(value);
+    draftRef.current = value;
+    lastCommitted.current = value;
+    setError(null);
+    // 只在 epoch 变化时执行；首次挂载不误伤
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [discardEpoch]);
 
   const commit = async (raw: string): Promise<void> => {
     if (inFlight.current) return;
@@ -169,6 +226,8 @@ export function DraftTextField({
         }}
         onCompositionStart={() => {
           composing.current = true;
+          // B2/G5-R5：组合开始即视为不可卸载，立刻上报
+          onDirtyChange?.(true);
         }}
         onCompositionEnd={(e) => {
           composing.current = false;

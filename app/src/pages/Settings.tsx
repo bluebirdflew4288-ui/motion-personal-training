@@ -1,13 +1,14 @@
 /* 设置：主题、备份导出/导入、数据说明。
    恢复是「完整覆盖」，导入前必须先预览并显式确认，且保留恢复前快照。 */
 
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useStore } from '../store';
 import { navigate } from '../lib/router';
 import { Sheet } from '../ui/Sheet';
 import { Confirm } from '../ui/Confirm';
 import {
   BACKUP_VERSION,
+  CURRENT_APP_VERSION,
   buildBackup,
   getPreRestoreSnapshot,
   restoreBackup,
@@ -31,13 +32,333 @@ import {
   type RestoredExportResult,
 } from '../lib/exportRestore';
 import { isNativeBuild } from '../lib/platform';
+import { AppLifecycleCoordinator } from '../lib/appLifecycle';
+import { sessionKindOf } from '../domain/sessionKind';
+import {
+  hasRestReminder,
+  openRestReminderSettings,
+  setRestReminderEnabled,
+  requestRestNotificationPermission,
+  restReminderCapability,
+  type RestReminderStatus,
+  type SettingsTarget,
+} from '../lib/restReminder';
 
-const APP_VERSION = '1.0.0';
+/* 复用 repo 的单一真源（第4阶段对齐候选 0.1.3；不再各写一份） */
+const APP_VERSION = CURRENT_APP_VERSION;
+
+/**
+ * 把原生的有界诊断行（`<atMs>|<kind>|<detail>`）翻译成一句人话。
+ *
+ * 只做展示：不改变、不推断、不美化。看不懂的行原样显示，
+ * 免得把"没记录"误读成"没问题"。
+ */
+function diagLabel(line: string): string {
+  const parts = line.split('|');
+  const at = Number(parts[0]);
+  const kind = parts[1] ?? '';
+  const detail = parts[2] ?? '';
+  const when = Number.isFinite(at) && at > 0 ? fmtTime(at) : '—';
+  /**
+   * A2 缺口 #4：`cancel` 事件带 `rejected` 时**绝不能**显示成"已取消"。
+   * 旧实现无脑套 `已取消（${detail}）`，于是 cancelled=false 被读成"已取消（rejected）"，
+   * 与实际相反。这里按真实结果分支，只有真取消才用"已取消"。
+   */
+  const text: Record<string, string> = {
+    schedule: `已排程（${detail}）`,
+    'schedule-failed': `排程失败（${detail}）`,
+    fire: '到点广播已到达，已记录',
+    'fire-rejected': `广播未处理（${detail}）`,
+    'notify-ok': '已调用系统通知接口（不代表已展示或已震动）',
+    'notify-blocked': `未调用通知（${detail}）`,
+    'notify-error': `通知调用出错（${detail}）`,
+  };
+  if (kind === 'cancel') {
+    return `${when} ${detail === 'rejected' ? '取消被拒绝（未取消）' : `已取消（${detail}）`}`.trim();
+  }
+  return `${when} ${text[kind] ?? `${kind} ${detail}`}`.trim();
+}
+
+/**
+ * 休息提醒状态行（B3）。
+ *
+ * 未允许项右侧给**就近短按钮**；已开启项不显示"去开启"（避免重复引导）。
+ * `opened` 只代表系统接受打开请求，不代表已授权 —— 本组件不写任何权限状态。
+ */
+function RestStatusRow({
+  label,
+  value,
+  ok,
+  action,
+  busy,
+  onOpen,
+}: {
+  label: string;
+  value: string;
+  ok: boolean;
+  action: { text: string; target: SettingsTarget } | null;
+  busy: SettingsTarget | null;
+  onOpen: (t: SettingsTarget) => void;
+}) {
+  return (
+    <div
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        gap: 8,
+        fontSize: 14,
+        marginTop: 4,
+        flexWrap: 'wrap',
+      }}
+    >
+      <span style={{ color: 'var(--ink-3)' }}>{label}</span>
+      <span style={{ display: 'flex', alignItems: 'center', gap: 8, marginLeft: 'auto' }}>
+        <span style={{ color: ok ? undefined : 'var(--brick)' }}>{value}</span>
+        {action ? (
+          <button
+            className="btn btn-ghost btn-sm"
+            style={{ minHeight: 32, fontSize: 12, padding: '0 8px' }}
+            disabled={busy !== null}
+            onClick={() => onOpen(action.target)}
+            aria-label={`${label}：${action.text}（打开系统设置）`}
+          >
+            {busy === action.target ? '打开中…' : action.text}
+          </button>
+        ) : null}
+      </span>
+    </div>
+  );
+}
 
 export function SettingsPage() {
   const { settings, setTheme, patchSettings, refreshSettings, pushToast, sessions, plans, refreshPlans, refreshSessions } =
     useStore();
   const fileRef = useRef<HTMLInputElement>(null);
+  /** 需求 2：休息提醒的真实授权/渠道状态（不可用时如实显示，不假装已开启） */
+  const [restCap, setRestCap] = useState<RestReminderStatus | null>(null);
+  const [restAsking, setRestAsking] = useState(false);
+  /**
+   * B3：系统设置跳转的真实状态。
+   *
+   * `opened` **只表示系统接受打开请求**，绝不据此把权限置 true。
+   * busy 防重入并 finally 释放；打开/返回/刷新均不触碰提醒状态。
+   */
+  const [settingsBusy, setSettingsBusy] = useState<SettingsTarget | null>(null);
+  const [settingsMsg, setSettingsMsg] = useState<string | null>(null);
+
+  /**
+   * 打开系统设置页并给出**如实**提示。
+   *
+   * 关键：`opened` 不代表已授权；返回前台后由既有 visibility/focus 刷新真实 getStatus。
+   */
+  const openSettings = useCallback(
+    async (target: SettingsTarget) => {
+      if (settingsBusy) return; // 防重入
+      setSettingsBusy(target);
+      setSettingsMsg(null);
+      try {
+        const r = await openRestReminderSettings(target);
+        if (!r.opened) {
+          setSettingsMsg(
+            r.reason === 'activity-not-visible'
+              ? '请保持 App 在前台再点一次。'
+              : r.reason === 'not-native' || r.reason === 'not-implemented'
+                ? '当前版本不支持直接跳转，请手动到系统设置中调整。'
+                : '没能打开系统设置页，请手动到系统设置中调整。',
+          );
+          return;
+        }
+        // 实际目标与请求不同 → 如实说明去了哪
+        if (r.actualTarget && r.actualTarget !== r.requestedTarget) {
+          setSettingsMsg(
+            r.actualTarget === 'app-details'
+              ? '已打开本应用详情页（该目标在当前系统不可直达），请在其中的通知/权限里调整。'
+              : '已打开本应用的通知设置页，请在其中的对应项目里调整。',
+          );
+        } else {
+          setSettingsMsg('已打开系统设置页；返回本页后会自动重新读取真实状态。');
+        }
+      } finally {
+        setSettingsBusy(null);
+      }
+    },
+    [settingsBusy],
+  );
+
+  /**
+   * 读取真实能力状态。
+   *
+   * REVIEW-1 #4：用户可能去系统设置关掉通知渠道再回到本页（页面并未卸载），
+   * 只在挂载时读一次会显示过期状态。这里：
+   *   · 挂载时读一次；
+   *   · 每次回到前台（visibilitychange → visible）重新读；
+   *   · 用**请求序号**防止旧的异步结果覆盖最新查询（乱序响应）。
+   */
+  const capReqSeq = useRef(0);
+  /**
+   * B4-R2：本页实例**是否仍然活着**（真正卸载即 false）。
+   *
+   * <p>为什么需要（真实失败 005）：受控 Capacitor + 真实 Settings React，
+   * nativeShow 之后**同一个 tick** 真正 Root.unmount，listener 已 remove、DOM 已空，
+   * 但仍发出了一次 `getStatus`（seq 20）。
+   *
+   * <p>根因：`onShow(isStale)` 里的 `isStale` 来自 **LifecycleQueue 自己的代次**，
+   * 而 `coordinator.stop()` 推进的是 **coordinator 的另一个代次**，不推进队列、
+   * 也不撤销已排队的闭包 —— 于是"已排队 onShow + 同 tick 卸载"时 isStale 仍为 false。
+   *
+   * <p>最小修法（合同允许的最小范围）：本 effect 自持 alive 守卫，
+   * cleanup 先标记失效；`onShow` 与 `refreshRestCap` 都检查它。
+   * **不改共享 LifecycleQueue 的排队语义**（Session 隐藏动作必须先排空保存）。
+   */
+  const aliveRef = useRef(true);
+  const refreshRestCap = useCallback(async (): Promise<RestReminderStatus> => {
+    const mySeq = ++capReqSeq.current;
+    const cap = await restReminderCapability();
+    // 只有最新一次请求的结果才能落到 state（旧响应不覆盖新查询）
+    if (mySeq === capReqSeq.current && aliveRef.current) setRestCap(cap);
+    return cap;
+  }, []);
+
+  /**
+   * B4-R2：提醒总开关（用户意图）与"系统是否就绪"分开维护。
+   *
+   * `restCap.reminderEnabled` 是原生真源读回的意图；
+   * `toggleBusy` 防重入；失败时**回读真实值**，绝不假报成功。
+   */
+  const [toggleBusy, setToggleBusy] = useState(false);
+
+  /**
+   * 用户切换提醒总开关。
+   *
+   * 语义（与原生/合同一致）：
+   *  · 只写用户意图，**不**在这里申请权限；
+   *  · 关闭：原生 durable 取消当前提醒 + 停静默服务 → 旧到达无声无震；计时不受影响；
+   *  · 打开：先读真实系统状态；需要 POST_NOTIFICATIONS 就调用既有 runtime 请求；
+   *    若 App 通知总开关/渠道关闭则**只打开一个**对应系统页（不连环弹）；
+   *  · 持久化失败 → 回读真实值并明确提示失败，不显示成"已关闭"。
+   */
+  const onToggleReminder = useCallback(
+    async (next: boolean) => {
+      if (toggleBusy) return;
+      setToggleBusy(true);
+      setSettingsMsg(null);
+      try {
+        const r = await setRestReminderEnabled(next);
+        if (!r.ok) {
+          pushToast(
+            r.reason === 'not-native' || r.reason === 'not-implemented'
+              ? '当前版本不支持这个开关。'
+              : '提醒设置没有保存成功，请重试。',
+            'error',
+          );
+          await refreshRestCap();
+          return;
+        }
+        if (!next) {
+          // 关闭成功：不弹权限，不改计时；只刷新真实状态
+          pushToast('已关闭休息提醒（倒计时仍会照常走）。', 'ok');
+          await refreshRestCap();
+          return;
+        }
+        /**
+         * 打开是**明确用户动作**：按真实状态分流，最多打开一个系统页。
+         *
+         * 顺序固定：先 runtime 权限（可弹系统授权框）→ 再总开关 → 再渠道。
+         * 不绕过用户已关掉的渠道/勿扰，不删渠道、不换 ID 强开。
+         */
+        let cap = await refreshRestCap();
+        if (!cap.notificationsGranted) {
+          const granted = await requestRestNotificationPermission();
+          cap = await refreshRestCap();
+          if (!granted) {
+            setSettingsMsg(
+              '已打开提醒，但系统还没允许通知。请点下面的「去允许」，或到系统设置里允许后再回到本页。',
+            );
+            return;
+          }
+        }
+        if (!cap.appNotificationsEnabled) {
+          setSettingsMsg('已打开提醒，但系统里本应用的通知总开关是关闭的，正在为你打开系统设置。');
+          await openSettings('app-notifications');
+          return;
+        }
+        if (!cap.channelEnabled) {
+          setSettingsMsg('已打开提醒，但「组间休息」渠道被关闭了，正在为你打开该渠道设置。');
+          await openSettings('rest-channel');
+          return;
+        }
+        if (!cap.channelSound || !cap.channelVibrates) {
+          // 渠道已开但声音/震动被单独关掉：只提示 + 就近入口，不冒充已就绪
+          setSettingsMsg(
+            !cap.channelSound && !cap.channelVibrates
+              ? '渠道已开启，但声音和震动都在系统里被关掉了。可在「组间休息」渠道里重新开启。'
+              : !cap.channelSound
+                ? '渠道已开启，但声音在系统里被关掉了。可在「组间休息」渠道里重新开启。'
+                : '渠道已开启，但震动在系统里被关掉了。可在「组间休息」渠道里重新开启。',
+          );
+          return;
+        }
+        pushToast('休息提醒已开启：声音＋震动（系统省电策略仍可能延迟）。', 'ok');
+      } finally {
+        setToggleBusy(false);
+      }
+    },
+    [toggleBusy, refreshRestCap, openSettings, pushToast],
+  );
+
+  useEffect(() => {
+    void refreshRestCap();
+    /**
+     * B4-R1：**删除 DOM 直连刷新旁路**。
+     *
+     * 旧实现同时有 DOM `visibilitychange/focus` 直连 `refreshRestCap`
+     * 和 coordinator 的 `onShow` 刷新 —— 两条路各刷一次，绕过 coordinator 的去重，
+     * 造成重复 getStatus（Codex 静态审查指出）。
+     *
+     * 现在只保留 coordinator 一条路径：它内部把 DOM 与 native 信号归一，
+     * 重复事件由串行队列去重。
+     */
+    /**
+     * B4/G5-R6：**必须同时接原生 resume**。
+     *
+     * 真实失败：点"去系统设置"后把边界状态改全允许，仅发 native pause/resume
+     * 与 appStateChange 时 `getStatus` 不增、UI 仍全拒；只有 DOM focus 才刷新。
+     * 根因是本页只监听 DOM 事件，没有接 Capacitor 原生生命周期。
+     *
+     * 复用既有 `AppLifecycleCoordinator`（不新增依赖、不加轮询）：
+     * 它把 DOM 与 native 信号归一到"前台"，重复事件由内部串行队列去重。
+     */
+    aliveRef.current = true;
+    const coordinator = new AppLifecycleCoordinator();
+    const stopLifecycle = coordinator.start({
+      onShow: (isStale) => {
+        /**
+         * B4-R1：检查队列自身的 isStale（被更新的前台边沿取代）。
+         *
+         * B4-R2：**再检查本 effect 的 alive 守卫**。
+         * `isStale` 只反映 LifecycleQueue 的代次，不覆盖 coordinator.stop；
+         * 同 tick 卸载时它仍可能为 false，必须在发请求前拦住。
+         */
+        if (isStale()) return;
+        if (!aliveRef.current) return;
+        void refreshRestCap();
+      },
+      onHide: () => {
+        // 进入后台：什么都不做（不清状态、不猜权限）
+      },
+    });
+    return () => {
+      /**
+       * 顺序固定：**先**标记失效（让已排队的 onShow/在途响应立即作废），
+       * **再**停 coordinator、推进请求序号。
+       */
+      aliveRef.current = false;
+      stopLifecycle();
+      // 卸载时让在途请求的结果失效
+      capReqSeq.current += 1;
+    };
+  }, [refreshRestCap]);
   const [preview, setPreview] = useState<{ payload: BackupPayload; preview: RestorePreview; warnings: string[]; size: number } | null>(null);
   const [badFile, setBadFile] = useState<string | null>(null);
   const [snapOpen, setSnapOpen] = useState(false);
@@ -122,7 +443,14 @@ export function SettingsPage() {
     };
   }, [patchSettings, pushToast]);
 
-  const completed = sessions.filter((s) => s.status === 'completed').length;
+  // 训练次数排除完全休息（第2阶段统计口径）
+  const completed = sessions.filter(
+    (s) => s.status === 'completed' && sessionKindOf(s) !== 'rest',
+  ).length;
+  /** 完全休息记录数（单独展示，不混入训练次数） */
+  const restCount = sessions.filter(
+    (s) => s.status === 'completed' && sessionKindOf(s) === 'rest',
+  ).length;
   const active = sessions.filter((s) => s.status === 'active').length;
 
   /**
@@ -288,7 +616,8 @@ export function SettingsPage() {
           <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 14 }}>
             <span style={{ color: 'var(--ink-3)' }}>本地数据</span>
             <span>
-              {plans.length} 个计划 · {completed} 次完成 · {active} 个进行中
+              {plans.length} 个计划 · {completed} 次完成
+              {restCount ? ` · ${restCount} 天完全休息` : ''} · {active} 个进行中
             </span>
           </div>
           <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 14, marginTop: 4 }}>
@@ -343,6 +672,307 @@ export function SettingsPage() {
             备份包含计划、训练历史、未结束的训练与设置。恢复是<strong>完整覆盖</strong>，不做合并。
             浏览器本地数据不是永久存储：换设备、清理站点数据或卸载浏览器都可能丢失，请定期导出。
           </p>
+        </div>
+      </section>
+
+      {/* 需求 2：组间休息提醒的真实状态 */}
+      <section style={{ marginTop: 22 }}>
+        <h2 className="h-section">组间休息提醒</h2>
+        <div className="slip" style={{ marginTop: 8, padding: 14 }}>
+          {!hasRestReminder() ? (
+            <p style={{ fontSize: 13, color: 'var(--ink-3)', lineHeight: 1.7, margin: 0 }}>
+              当前是网页版，组间休息到时提醒不可用。安装 Android 版本后，休息结束会在后台/锁屏时提醒。
+            </p>
+          ) : !restCap ? (
+            <p style={{ fontSize: 13, color: 'var(--ink-3)', margin: 0 }}>正在读取系统状态…</p>
+          ) : !restCap.available ? (
+            /**
+             * B4/G5-R7：**读取失败 ≠ 全部拒绝**。
+             *
+             * 真实失败：status API 真实 throw 时，UI 把五项全判"未允许"并给五个"去允许"，
+             * 把"读不到"当成了"确实被拒"。现在必须显示未知/失败并给重试。
+             */
+            <div>
+              <p
+                role="alert"
+                style={{ fontSize: 13, color: 'var(--brick)', lineHeight: 1.7, margin: 0 }}
+              >
+                没能读取系统通知状态（可能是系统繁忙或权限查询受限）。
+                这不代表权限被拒绝 —— 请稍后重试，或手动到系统设置查看。
+              </p>
+              <button
+                className="btn btn-ghost btn-sm"
+                style={{ marginTop: 10 }}
+                onClick={() => void refreshRestCap()}
+              >
+                重试读取
+              </button>
+            </div>
+          ) : (
+            <>
+              {/*
+                B4-R2：**提醒总开关**（用户意图）与"系统是否就绪"分开呈现。
+                checked 只代表用户想被提醒，绝不代表系统已允许；
+                系统就绪状态仍由下面逐项真实值展示。
+              */}
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  gap: 12,
+                  paddingBottom: 10,
+                  marginBottom: 6,
+                  borderBottom: '1px solid var(--rule)',
+                }}
+              >
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontSize: 14.5, fontWeight: 600 }}>休息结束提醒</div>
+                  <div style={{ fontSize: 12, color: 'var(--ink-3)', lineHeight: 1.5, marginTop: 2 }}>
+                    声音＋震动。关闭后不再提醒（倒计时仍照常走）。
+                  </div>
+                </div>
+                <button
+                  className="btn btn-sm"
+                  role="switch"
+                  aria-checked={restCap.reminderEnabled}
+                  aria-label="休息结束提醒开关"
+                  disabled={toggleBusy}
+                  style={{
+                    minWidth: 64,
+                    minHeight: 34,
+                    flex: 'none',
+                    background: restCap.reminderEnabled ? 'var(--brick)' : 'var(--paper-3)',
+                    color: restCap.reminderEnabled ? 'var(--paper)' : 'var(--ink-3)',
+                    border: '1px solid var(--rule-strong)',
+                    fontVariantNumeric: 'tabular-nums',
+                  }}
+                  onClick={() => void onToggleReminder(!restCap.reminderEnabled)}
+                >
+                  {toggleBusy ? '…' : restCap.reminderEnabled ? '已开启' : '已关闭'}
+                </button>
+              </div>
+              {/*
+                意图已开但系统没就绪 → 明确区分两个事实，不把 checked 当已授权。
+              */}
+              {restCap.reminderEnabled && !restCap.canAlert ? (
+                <p
+                  role="status"
+                  style={{
+                    fontSize: 12.5,
+                    color: 'var(--ink-2)',
+                    lineHeight: 1.6,
+                    margin: '0 0 8px',
+                  }}
+                >
+                  开关已打开，但系统侧还没就绪（见下方逐项）。到点暂时不会提醒。
+                </p>
+              ) : null}
+              {/*
+                逐项展示真实状态，避免"权限已允许"被误读成"提醒已就绪"。
+                B3：**未允许项就近给短按钮**跳系统设置；已开启项不显示"去开启"。
+              */}
+              <RestStatusRow
+                label="通知权限"
+                value={restCap.notificationsGranted ? '已允许' : '未允许'}
+                ok={restCap.notificationsGranted}
+                action={
+                  restCap.notificationsGranted
+                    ? null
+                    : { text: '去允许', target: 'app-notifications' }
+                }
+                busy={settingsBusy}
+                onOpen={openSettings}
+              />
+              <RestStatusRow
+                label="App 通知总开关"
+                value={restCap.appNotificationsEnabled ? '已开启' : '已关闭'}
+                ok={restCap.appNotificationsEnabled}
+                action={
+                  restCap.appNotificationsEnabled
+                    ? null
+                    : { text: '去开启', target: 'app-notifications' }
+                }
+                busy={settingsBusy}
+                onOpen={openSettings}
+              />
+              <RestStatusRow
+                label="休息提醒渠道"
+                value={restCap.channelEnabled ? '已开启' : '已关闭'}
+                ok={restCap.channelEnabled}
+                action={
+                  restCap.channelEnabled ? null : { text: '去开启', target: 'rest-channel' }
+                }
+                busy={settingsBusy}
+                onOpen={openSettings}
+              />
+              <RestStatusRow
+                label="震动"
+                value={restCap.channelVibrates ? '已开启' : '已关闭'}
+                ok={restCap.channelVibrates}
+                action={
+                  restCap.channelVibrates ? null : { text: '去设置', target: 'rest-channel' }
+                }
+                busy={settingsBusy}
+                onOpen={openSettings}
+              />
+              <RestStatusRow
+                label="精确调度"
+                value={restCap.exactAlarmsGranted ? '已允许' : '未允许（到时会不精确）'}
+                ok={restCap.exactAlarmsGranted}
+                action={
+                  restCap.exactAlarmsGranted ? null : { text: '去设置', target: 'exact-alarm' }
+                }
+                busy={settingsBusy}
+                onOpen={openSettings}
+              />
+              <RestStatusRow
+                label="声音"
+                value={restCap.channelSound ? '已开启' : '已关闭'}
+                ok={restCap.channelSound}
+                action={
+                  restCap.channelSound ? null : { text: '去设置', target: 'rest-channel' }
+                }
+                busy={settingsBusy}
+                onOpen={openSettings}
+              />
+              {/* 声音/震动单独一行：通知开着不等于会响/会震（渠道可被单独关掉） */}
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 14, marginTop: 4 }}>
+                <span style={{ color: 'var(--ink-3)' }}>到点声音</span>
+                <span>{restCap.canSound ? '可能会响' : '不会响'}</span>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 14, marginTop: 4 }}>
+                <span style={{ color: 'var(--ink-3)' }}>到点震动</span>
+                <span>{restCap.canVibrate ? '可能会震动' : '不会震动'}</span>
+              </div>
+
+              {/*
+                B3：跳转结果提示 + **常驻**"系统通知设置"辅助入口。
+                常驻入口让用户在系统不再弹权限框时也能自助。
+              */}
+              {settingsMsg ? (
+                <p
+                  role="status"
+                  style={{
+                    fontSize: 12.5,
+                    color: 'var(--ink-2)',
+                    lineHeight: 1.6,
+                    margin: '8px 0 0',
+                  }}
+                >
+                  {settingsMsg}
+                </p>
+              ) : null}
+              <button
+                className="btn btn-ghost btn-sm"
+                style={{ marginTop: 8, minHeight: 32, fontSize: 12 }}
+                disabled={settingsBusy !== null}
+                onClick={() => openSettings('app-notifications')}
+              >
+                {settingsBusy === 'app-notifications' ? '打开中…' : '系统通知设置'}
+              </button>
+
+              {/*
+                结论区：只有 canAlert 为真才说"可以提醒"。
+                渠道/总开关关闭时，即使权限已允许也**不得**宣称离开 App 也能提醒（P2 #3）。
+              */}
+              {restCap.canAlert ? (
+                <p style={{ fontSize: 12.5, color: 'var(--ink-2)', lineHeight: 1.7, marginTop: 10, marginBottom: 0 }}>
+                  通知权限与「组间休息」渠道已开启，系统仍可能延迟或拦截提醒。
+                  {restCap.canSound ? '' : ' 「组间休息」渠道的声音被关闭了，到时不会响。'}
+                  {restCap.canVibrate ? '' : ' 「组间休息」渠道的震动被关闭了，到时不会震动。'}
+                  {' '}深度省电（Doze）与厂商后台策略都可能推迟甚至拦截，
+                  <strong>因此不保证每一组都准点送达或震动</strong>。
+                </p>
+              ) : (
+                <div
+                  style={{
+                    marginTop: 10,
+                    padding: '8px 10px',
+                    background: 'var(--paper-3)',
+                    borderLeft: '3px solid var(--brick)',
+                    fontSize: 12.5,
+                    lineHeight: 1.7,
+                  }}
+                >
+                  <strong>现在不会提醒。</strong>
+                  {!restCap.notificationsGranted
+                    ? ' 通知权限未允许。'
+                    : !restCap.appNotificationsEnabled
+                      ? ' 系统设置里 MOTION 的通知被关闭了。'
+                      : !restCap.channelEnabled
+                        ? ' 「组间休息」通知渠道被关闭了。'
+                        : ' 提醒当前不可用。'}
+                  {!restCap.channelVibrates && restCap.channelEnabled
+                    ? ' 震动也被关闭了，到时不会有震动。'
+                    : ''}
+                  {' '}请在系统设置中开启后回到本页查看。
+                </div>
+              )}
+
+              {/*
+                最小本地诊断（G2）：只显示**本机**最近几条排程/触发/通知结果，
+                用来区分"排程没成功 / 广播没到 / 通知被拦 / 通知抛错"。
+                不含 token、不含训练内容、不联网、不外发。
+              */}
+              {restCap.recentDiag.length > 0 ? (
+                <details style={{ marginTop: 10 }}>
+                  <summary style={{ fontSize: 12.5, color: 'var(--ink-2)', cursor: 'pointer' }}>
+                    最近提醒记录（本机，仅用于排查）
+                  </summary>
+                  <ul
+                    style={{
+                      fontSize: 11.5,
+                      color: 'var(--ink-3)',
+                      lineHeight: 1.6,
+                      margin: '6px 0 0',
+                      paddingLeft: 16,
+                      fontFamily: 'var(--f-mono)',
+                    }}
+                  >
+                    {restCap.recentDiag.slice(-8).map((line, i) => (
+                      <li key={`${i}-${line}`}>{diagLabel(line)}</li>
+                    ))}
+                  </ul>
+                  <p style={{ fontSize: 11.5, color: 'var(--ink-3)', lineHeight: 1.6, margin: '6px 0 0' }}>
+                    这些记录只说明系统有没有接受排程、广播有没有到、通知有没有发出去；
+                    不证明系统一定按时送达或一定震动。
+                  </p>
+                </details>
+              ) : null}
+
+              {!restCap.notificationsGranted ? (
+                <button
+                  className="btn btn-ghost btn-sm"
+                  style={{ marginTop: 10 }}
+                  disabled={restAsking}
+                  onClick={async () => {
+                    setRestAsking(true);
+                    const granted = await requestRestNotificationPermission();
+                    // 刷新后直接用返回的最新状态判断，避免再读一次造成竞态
+                    const cap = await refreshRestCap();
+                    setRestAsking(false);
+                    // 只按**完整能力**报告，不因权限通过就宣称已就绪
+                    if (cap.canAlert) {
+                      // 只承诺"通知通道已打开"，不承诺"每组都准点/一定震动"
+                      pushToast(
+                        cap.canVibrate
+                          ? '通知权限与渠道已开启；系统省电策略仍可能延迟或拦截。'
+                          : '通知已开启，但渠道震动被关闭，到时不会震动。',
+                        'ok',
+                      );
+                    } else if (granted) {
+                      pushToast('通知权限已允许，但通知总开关或提醒渠道仍关闭，现在不会提醒。', 'error');
+                    } else {
+                      pushToast('仍未允许通知；到时不会提醒。', 'error');
+                    }
+                  }}
+                >
+                  {restAsking ? '正在请求…' : '请求通知权限'}
+                </button>
+              ) : null}
+            </>
+          )}
         </div>
       </section>
 

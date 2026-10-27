@@ -1,12 +1,27 @@
-/* 首页：选择计划 → 看循环位置 → 选部位/训练日 → 开始或继续训练。
-   日期来自设备真实时间；训练日与日历解耦，不会因为隔天自动推进。 */
+/* 首页：选择计划 → 看循环位置 → 选训练日 → 开始或继续训练。
+   日期来自设备真实时间；训练日与日历解耦，不会因为隔天自动推进。
+   G4：贴纸改为「每个具体 PlanDay 一张」，身份 = planId + day.id。 */
 
 import { useMemo, useState } from 'react';
 import { useStore } from '../store';
 import { navigate } from '../lib/router';
 import { fmtDate, fmtRelativeDay, fmtWeekday } from '../lib/format';
-import { StickerPicker, type Focus } from '../ui/StickerPicker';
-import { createSession, targetGroupsOf } from '../domain/session';
+import {
+  StickerPicker,
+  dayStickerKey,
+  nextSelectedDayId,
+  planDayStickers,
+  resolveSelectedDay,
+} from '../ui/StickerPicker';
+import {
+  createSession,
+  createAdhocCardioSession,
+  createRestSession,
+  targetGroupsOf,
+} from '../domain/session';
+import { localDateKey } from '../domain/localDate';
+import { sessionKindOf } from '../domain/sessionKind';
+import { atomicCreateRest } from '../db/tx';
 import { ExerciseOverviewRow } from '../ui/TargetLine';
 import type { Plan, PlanDay, Session } from '../domain/types';
 import { Sheet } from '../ui/Sheet';
@@ -31,13 +46,19 @@ export function Home() {
     pushToast,
     sessions,
     refreshSessions,
+    refreshPlans,
   } = useStore();
   // 当前计划持久化在 settings 里（审计 R2-07：导航/刷新后不能回到默认）
 
-  const [focus, setFocus] = useState<Focus>('chest');
+  /** 选中的具体计划日（G4）：只存 day.id，不存名字/focus/round，也不落库 */
+  const [selectedDayId, setSelectedDayId] = useState<string | null>(null);
   const [dayPickerOpen, setDayPickerOpen] = useState(false);
   const [planPickerOpen, setPlanPickerOpen] = useState(false);
   const [pendingStart, setPendingStart] = useState<PlanDay | null>(null);
+  /** 计划内休息日（第2阶段 G8b）：待确认「记录休息」+ 是否推进循环 */
+  const [pendingRest, setPendingRest] = useState<PlanDay | null>(null);
+  const [restAdvance, setRestAdvance] = useState(false);
+  const [restBusy, setRestBusy] = useState(false);
   /** 已有未结束训练时的冲突引导（任务 F） */
   const [conflict, setConflict] = useState<{ targetDay: PlanDay; existing: Session } | null>(null);
   /** 冲突处理中（避免重复点击）+ 被另一标签页持锁时的明确提示 */
@@ -50,18 +71,19 @@ export function Home() {
   }, [plans, settings.currentPlanId]);
   const today = Date.now();
 
-  const focusDays = useMemo(
-    () => (plan ? plan.days.filter((d) => d.kind === 'train' && d.focus === focus) : []),
-    [plan, focus],
-  );
-  const available = useMemo(() => {
-    const map = { chest: false, back: false, legs: false } as Record<Focus, boolean>;
-    if (plan) for (const d of plan.days) if (d.kind === 'train') map[d.focus] = true;
-    return map;
-  }, [plan]);
+  /**
+   * 每个具体计划日一张贴纸（G4）。
+   * 名称 / 数量 / 顺序**直接来自 plan.days**，不按名字 / focus / round 合并，
+   * 也不自动补 A/B —— 两天就是两张。
+   */
+  const stickers = useMemo(() => planDayStickers(plan), [plan]);
 
   const recentSessions = useMemo(
-    () => sessions.filter((s) => s.status === 'completed').slice(0, 3),
+    () =>
+      sessions
+        // 最近完成只显示训练（完全休息不混入训练列表）
+        .filter((s) => s.status === 'completed' && sessionKindOf(s) !== 'rest')
+        .slice(0, 3),
     [sessions],
   );
 
@@ -84,6 +106,18 @@ export function Home() {
   const canStart = true;
   // 旧数据可能残留多条未结束训练：全部列出来让用户逐条处理（任务 F）
   const orphanActives = activeSessions;
+
+  /**
+   * 选中日解析（G4）：只认 `day.id`，**不按名字 / focus / round 匹配**。
+   *
+   * · 选中项随计划内容失效（计划被改/被删）时自动回落到循环当前位置，不报错；
+   * · 回落只影响「本页显示」，**不写库、不改 cursor**（选择本身永不推进循环）。
+   */
+  const selectedDay: PlanDay | undefined = resolveSelectedDay(plan, selectedDayId);
+  const selectedKey = selectedDay ? dayStickerKey(plan.id, selectedDay.id) : null;
+  const cycleKey = cycleDay ? dayStickerKey(plan.id, cycleDay.id) : null;
+  /** 选中日的展示区（力量/有氧/休息统一走这一个来源，不再按 focus 过滤） */
+  const selectedDays: PlanDay[] = selectedDay ? [selectedDay] : [];
 
   /**
    * 开始训练。
@@ -113,6 +147,104 @@ export function Home() {
       navigate(`/session/${session.id}`);
     } catch (err) {
       pushToast(err instanceof Error ? `无法开始训练：${err.message}` : '无法开始训练', 'error');
+    }
+  }
+
+  /**
+   * 开始**临时独立有氧**（第2阶段）。
+   *
+   * · 不借当前力量 dayId（用 adhoc:<sessionId>），因此默认**不推进**循环
+   * · 已有未结束训练时先引导处理
+   */
+  async function startAdhocCardio(preset: 'treadmill-incline' | 'stair-climber') {
+    if (!plan) return;
+    const existing = activeSessions[0];
+    if (existing) {
+      pushToast('还有一次训练没有结束，请先结束或放弃它。', 'error');
+      return;
+    }
+    const params = preset === 'treadmill-incline' ? { speedKmh: 4, inclinePct: 4 } : { level: 5 };
+    const session = createAdhocCardioSession({ plan, preset, params });
+    try {
+      const r = await createTrainingSession(session);
+      if (!r.ok) {
+        pushToast(r.message, 'error');
+        return;
+      }
+      navigate(`/session/${session.id}`);
+    } catch (err) {
+      pushToast(err instanceof Error ? `无法开始有氧：${err.message}` : '无法开始有氧', 'error');
+    }
+  }
+
+  /**
+   * 记录**完全休息**（第2阶段）。
+   *
+   * 同日去重/冲突核验/循环推进都在 create-rest 事务内完成；
+   * 与 active/实际训练强互斥（不能把真实训练标成没练）。
+   */
+  async function recordFullRest() {
+    if (!plan) return;
+    const restDate = localDateKey();
+    const existing = activeSessions[0];
+    if (existing) {
+      pushToast('还有一次训练没有结束，请先结束或放弃它，再记录完全休息。', 'error');
+      return;
+    }
+    const session = createRestSession({ plan, restDate, origin: 'temporary' });
+    try {
+      const r = await atomicCreateRest({ session, restDate, advanceCycle: false });
+      if (!r.ok) {
+        pushToast(r.message, 'error');
+        return;
+      }
+      await refreshSessions();
+      await refreshPlans();
+      pushToast('已记录今天完全休息。');
+    } catch (err) {
+      pushToast(err instanceof Error ? `记录失败：${err.message}` : '记录失败', 'error');
+    }
+  }
+
+  /**
+   * 记录**计划内休息日**（G8b）。
+   *
+   * · 走受约束的 create-rest 事务：同日去重、与 active/实际训练互斥、
+   *   读最新计划、按明确选择推进一次，全在一个事务内完成。
+   * · stay/advance 由用户在确认面板里明确选择（不默认推进）。
+   * · 与临时休息不同：origin='plan'，dayId 用计划日自身（不借力量日 ID）。
+   */
+  async function recordPlanRest(day: PlanDay, advance: boolean) {
+    if (!plan) return;
+    const restDate = localDateKey();
+    const existing = activeSessions[0];
+    if (existing) {
+      pushToast('还有一次训练没有结束，请先结束或放弃它，再记录休息。', 'error');
+      return;
+    }
+    const session = createRestSession({ plan, restDate, origin: 'plan' });
+    // 计划内休息：快照里带上该休息日的名字/说明，历史可读
+    session.day = {
+      dayId: day.id,
+      dayName: day.name,
+      partText: day.restNote ?? '休息',
+    };
+    session.cycleIndexAtStart = plan.cursor;
+    setRestBusy(true);
+    try {
+      const r = await atomicCreateRest({ session, restDate, advanceCycle: advance });
+      if (!r.ok) {
+        pushToast(r.message, 'error');
+        return;
+      }
+      await refreshSessions();
+      if (advance) await refreshPlans();
+      setPendingRest(null);
+      pushToast(advance ? '已记录休息，循环已前进一位。' : '已记录休息，循环位置保持不变。');
+    } catch (err) {
+      pushToast(err instanceof Error ? `记录失败：${err.message}` : '记录失败', 'error');
+    } finally {
+      setRestBusy(false);
     }
   }
 
@@ -231,7 +363,11 @@ export function Home() {
           <div style={{ minWidth: 0 }}>
             <div className="mono-label">循环位置 {plan.cursor + 1} / {plan.days.length}</div>
             <div style={{ fontSize: 15, fontWeight: 600, marginTop: 2 }}>
-              {cycleDay?.kind === 'rest' ? `${cycleDay.name}日` : `下一练 · ${cycleDay?.name}`}
+              {cycleDay?.kind === 'rest'
+                ? `${cycleDay.name}日`
+                : cycleDay?.kind === 'cardio'
+                  ? `下一练 · ${cycleDay.name}（有氧）`
+                  : `下一练 · ${cycleDay?.name}`}
             </div>
             {cycleDay?.kind === 'rest' && cycleDay.restNote ? (
               <div style={{ fontSize: 13, color: 'var(--ink-3)', marginTop: 2 }}>{cycleDay.restNote}</div>
@@ -299,28 +435,71 @@ export function Home() {
         </section>
       ) : null}
 
-      {/* ── 部位贴纸 ─────────────────── */}
+      {/* ── 计划日贴纸（G4：每个 PlanDay 一张）───── */}
       <section style={{ marginTop: 18 }}>
         <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between' }}>
           <h2 className="h-section">今天练什么</h2>
           <span className="mono-label">点贴纸切换</span>
         </div>
-        <StickerPicker value={focus} onChange={setFocus} available={available} />
+        {/* 贴纸数量/名称/顺序 = plan.days 原样（不按 focus 合并、不补 A/B）。
+            选中只改本页 state：不写库、不改 cursor（nextSelectedDayId 只回传 day.id）。 */}
+        <StickerPicker
+          items={stickers}
+          value={selectedKey}
+          cycleKey={cycleKey}
+          onSelect={(item) => setSelectedDayId(nextSelectedDayId(item.dayId))}
+        />
+
+        {/* ── 有氧 / 完全休息入口（第2阶段）── */}
+        <div style={{ display: 'flex', gap: 8, marginTop: 14, flexWrap: 'wrap' }}>
+          <button
+            className="btn btn-ghost btn-sm"
+            onClick={() => void startAdhocCardio('treadmill-incline')}
+            disabled={!!activeSessions[0]}
+          >
+            有氧爬坡
+          </button>
+          <button
+            className="btn btn-ghost btn-sm"
+            onClick={() => void startAdhocCardio('stair-climber')}
+            disabled={!!activeSessions[0]}
+          >
+            爬楼机
+          </button>
+          <button
+            className="btn btn-ghost btn-sm"
+            style={{ marginLeft: 'auto' }}
+            onClick={() => void recordFullRest()}
+            disabled={!!activeSessions[0]}
+          >
+            今天完全休息
+          </button>
+        </div>
+        <p style={{ fontSize: 12, color: 'var(--ink-4)', lineHeight: 1.6, marginTop: 6, marginBottom: 0 }}>
+          临时有氧/完全休息默认不改变循环位置；有氧与力量可以保存在同一次训练里。
+        </p>
       </section>
 
-      {/* ── 训练日选择 ───────────────── */}
+      {/* ── 选中的计划日 ─────────────── */}
       <section style={{ marginTop: 10 }}>
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-          {focusDays.map((d) => {
+          {selectedDays.map((d) => {
             const isCycle = cycleDay?.id === d.id;
             const total = d.exercises.reduce((n, ex) => n + targetGroupsOf(ex), 0);
             return (
               <button
                 key={d.id}
                 className="slip"
-                onClick={() => setPendingStart(d)}
+                onClick={() => {
+                  if (d.kind === 'rest') {
+                    setRestAdvance(false);
+                    setPendingRest(d);
+                    return;
+                  }
+                  setPendingStart(d);
+                }}
                 style={{
-                  flex: '1 1 46%',
+                  flex: '1 1 100%',
                   minWidth: 0,
                   padding: 12,
                   textAlign: 'left',
@@ -331,58 +510,131 @@ export function Home() {
                 }}
               >
                 <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 6 }}>
-                  <span style={{ fontFamily: 'var(--f-serif)', fontSize: 19, fontWeight: 700 }}>{d.name}</span>
-                  <span className="mono-label" style={{ fontSize: 11 }}>
-                    {d.round} 轮
+                  <span
+                    style={{
+                      fontFamily: 'var(--f-serif)',
+                      fontSize: 19,
+                      fontWeight: 700,
+                      whiteSpace: 'normal',
+                      overflowWrap: 'anywhere',
+                      minWidth: 0,
+                    }}
+                  >
+                    {d.name}
+                  </span>
+                  <span className="mono-label" style={{ fontSize: 11, flex: 'none' }}>
+                    {d.kind === 'rest' ? '休息日' : d.kind === 'cardio' ? '有氧日' : d.round ? `${d.round} 轮` : '力量日'}
                   </span>
                 </div>
                 <div style={{ fontSize: 13, color: 'var(--ink-3)', marginTop: 4 }}>
-                  {d.exercises.length} 个动作 · {total} 组
+                  {d.kind === 'rest'
+                    ? (d.restNote ?? '休息日 · 可记录完全休息')
+                    : d.kind === 'cardio'
+                      ? `${(d.cardio ?? []).length} 个有氧项目`
+                      : `${d.exercises.length} 个动作 · ${total} 组`}
                 </div>
                 {isCycle ? (
                   <span className="tag tag-brick" style={{ marginTop: 8 }}>
                     循环当前
                   </span>
                 ) : null}
+                <div style={{ fontSize: 12, color: 'var(--ink-4)', marginTop: 8 }}>
+                  {d.kind === 'rest' ? '点按记录休息 ›' : d.kind === 'cardio' ? '点按开始有氧 ›' : '点按开始训练 ›'}
+                </div>
               </button>
             );
           })}
-          {!focusDays.length ? (
+          {!selectedDays.length ? (
             <div className="empty" style={{ width: '100%' }}>
-              <div className="empty-title" style={{ padding: 20 }}>这个部位在计划里还没有训练日</div>
+              <div className="empty-title" style={{ padding: 20 }}>计划里还没有训练日</div>
             </div>
           ) : null}
         </div>
       </section>
 
-      {/* ── 今日动作概览 ─────────────── */}
+      {/* ── 选中日内容概览 ─────────────── */}
       <section style={{ marginTop: 18 }}>
         <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between' }}>
-          <h2 className="h-section">动作概览</h2>
+          <h2 className="h-section">{selectedDay ? `${selectedDay.name} · 内容` : '动作概览'}</h2>
           <button className="btn btn-ghost btn-sm" onClick={() => setDayPickerOpen(true)}>
             全部训练日
           </button>
         </div>
         <div className="slip" style={{ marginTop: 8 }}>
-          {focusDays.map((d) => (
+          {selectedDays.map((d) => (
             <div key={d.id} style={{ padding: '12px 14px', borderBottom: '1px solid var(--rule)' }}>
               <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 10 }}>
-                <span style={{ fontSize: 15, fontWeight: 600 }}>{d.name}</span>
-                <span className="mono-label" style={{ fontSize: 11 }}>
-                  {d.exercises.length} 个动作
+                <span
+                  style={{
+                    fontSize: 15,
+                    fontWeight: 600,
+                    whiteSpace: 'normal',
+                    overflowWrap: 'anywhere',
+                    minWidth: 0,
+                  }}
+                >
+                  {d.name}
+                </span>
+                <span className="mono-label" style={{ fontSize: 11, flex: 'none' }}>
+                  {d.kind === 'rest'
+                    ? '休息'
+                    : d.kind === 'cardio'
+                      ? `${(d.cardio ?? []).length} 个有氧项目`
+                      : `${d.exercises.length} 个动作`}
                 </span>
               </div>
-              <ul style={{ margin: '6px 0 0', padding: 0, listStyle: 'none' }}>
-                {d.exercises.map((ex) => (
-                  <ExerciseOverviewRow key={ex.id} ex={ex} />
-                ))}
-              </ul>
+              {d.kind === 'rest' ? (
+                <p style={{ fontSize: 13, color: 'var(--ink-3)', margin: '6px 0 0', lineHeight: 1.6 }}>
+                  {d.restNote ?? '休息日：不生成训练记录，可选记录「完全休息」。'}
+                </p>
+              ) : d.kind === 'cardio' ? (
+                <ul style={{ margin: '6px 0 0', padding: 0, listStyle: 'none' }}>
+                  {(d.cardio ?? []).length ? (
+                    (d.cardio ?? []).map((pc) => (
+                      <li
+                        key={pc.id}
+                        style={{
+                          padding: '8px 0',
+                          borderBottom: '1px dashed var(--rule)',
+                          fontSize: 14,
+                          whiteSpace: 'normal',
+                          overflowWrap: 'anywhere',
+                        }}
+                      >
+                        {pc.name}
+                        <span style={{ color: 'var(--ink-4)', marginLeft: 6, fontSize: 12 }}>
+                          {pc.preset === 'treadmill-incline'
+                            ? `${pc.target.speedKmh ?? '—'} km/h · ${pc.target.inclinePct ?? '—'}%`
+                            : `档位 ${pc.target.level ?? '—'}`}
+                        </span>
+                      </li>
+                    ))
+                  ) : (
+                    <li style={{ fontSize: 13, color: 'var(--ink-3)', padding: '6px 0' }}>
+                      这一日还没有有氧项目（可到计划页添加）。
+                    </li>
+                  )}
+                </ul>
+              ) : (
+                <ul style={{ margin: '6px 0 0', padding: 0, listStyle: 'none' }}>
+                  {d.exercises.map((ex) => (
+                    <ExerciseOverviewRow key={ex.id} ex={ex} />
+                  ))}
+                </ul>
+              )}
               <button
                 className="btn btn-primary btn-sm"
                 style={{ marginTop: 10 }}
-                onClick={() => setPendingStart(d)}
+                onClick={() => {
+                  if (d.kind === 'rest') {
+                    setRestAdvance(false);
+                    setPendingRest(d);
+                    return;
+                  }
+                  setPendingStart(d);
+                }}
               >
-                开始 {d.name}
+                {d.kind === 'rest' ? `记录休息 · ${d.name}` : d.kind === 'cardio' ? `开始有氧 · ${d.name}` : `开始 ${d.name}`}
               </button>
             </div>
           ))}
@@ -631,7 +883,9 @@ export function Home() {
               onClick={() => {
                 setDayPickerOpen(false);
                 if (d.kind === 'rest') {
-                  pushToast('休息日不生成训练记录，可在首页「推进」循环。');
+                  // 计划内休息日：给出明确的「记录休息 + stay/advance」入口（G8b）
+                  setRestAdvance(false);
+                  setPendingRest(d);
                   return;
                 }
                 setPendingStart(d);
@@ -643,7 +897,11 @@ export function Home() {
                   {d.kind === 'rest' ? '（休息）' : ''}
                 </span>
                 <span className="row-sub">
-                  {d.kind === 'rest' ? d.restNote : `${d.exercises.length} 个动作`}
+                  {d.kind === 'rest'
+                    ? (d.restNote ?? '休息日 · 可记录完全休息')
+                    : d.kind === 'cardio'
+                      ? `${(d.cardio ?? []).length} 个有氧项目`
+                      : `${d.exercises.length} 个动作`}
                 </span>
               </span>
               {i === plan.cursor ? <span className="row-end tag tag-brick">当前</span> : null}
@@ -655,7 +913,7 @@ export function Home() {
       {/* 开始前确认：是否推进循环 */}
       <Sheet
         open={!!pendingStart}
-        title={pendingStart ? `开始 ${pendingStart.name}` : ''}
+        title={pendingStart ? `开始 ${pendingStart.kind === 'cardio' ? '有氧' : '训练'} · ${pendingStart.name}` : ''}
         onClose={() => setPendingStart(null)}
         footer={
           <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
@@ -668,7 +926,7 @@ export function Home() {
                 void startTraining(d);
               }}
             >
-              开始训练
+              {pendingStart?.kind === 'cardio' ? '开始有氧' : '开始训练'}
             </button>
             <button className="btn btn-ghost" style={{ width: '100%' }} onClick={() => setPendingStart(null)}>
               取消
@@ -681,10 +939,29 @@ export function Home() {
             <div style={{ fontSize: 14, color: 'var(--ink-2)', lineHeight: 1.65 }}>
               计划：{plan.name}
               <br />
-              动作：{pendingStart.exercises.length} 个 ·{' '}
-              {pendingStart.exercises.reduce((n, ex) => n + targetGroupsOf(ex), 0)} 组
-              <br />
-              热身：{pendingStart.warmups.length} 项（不计入正式组）
+              {pendingStart.kind === 'cardio' ? (
+                /* 有氧日：显示有氧项目与目标参数（非力量不显示动作/组数/轮次，避免“0 动作”误导） */
+                <>
+                  {(pendingStart.cardio ?? []).length
+                    ? (pendingStart.cardio ?? []).map((pc) => (
+                        <span key={pc.id}>
+                          {pc.name}：
+                          {pc.preset === 'treadmill-incline'
+                            ? `速度 ${pc.target.speedKmh ?? '—'} km/h · 坡度 ${pc.target.inclinePct ?? '—'}%`
+                            : `档位 ${pc.target.level ?? '—'}`}
+                          <br />
+                        </span>
+                      ))
+                    : '这一日还没有有氧项目（可到计划页添加）。'}
+                </>
+              ) : (
+                <>
+                  动作：{pendingStart.exercises.length} 个 ·{' '}
+                  {pendingStart.exercises.reduce((n, ex) => n + targetGroupsOf(ex), 0)} 组
+                  <br />
+                  热身：{pendingStart.warmups.length} 项（不计入正式组）
+                </>
+              )}
             </div>
             <div
               style={{
@@ -699,6 +976,64 @@ export function Home() {
               {cycleDay?.id === pendingStart.id
                 ? '这是循环当前位置。结束后可选择是否推进。'
                 : `这不是循环当前位置（当前是「${cycleDay?.name}」）。开始后循环位置不会自动改变。`}
+            </div>
+          </>
+        ) : null}
+      </Sheet>
+
+      {/* 计划内休息日确认：记录完全休息 + 明确 stay/advance（G8b）。
+          同日去重、与训练互斥、事务内一次推进都由 create-rest 保证。 */}
+      <Sheet
+        open={!!pendingRest}
+        title={pendingRest ? `记录休息 · ${pendingRest.name}` : ''}
+        onClose={() => setPendingRest(null)}
+        footer={
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            <button
+              className="btn btn-primary btn-lg"
+              disabled={restBusy}
+              onClick={() => {
+                const d = pendingRest!;
+                void recordPlanRest(d, restAdvance);
+              }}
+            >
+              {restBusy ? '正在记录…' : restAdvance ? '记录休息并推进循环' : '记录休息（保持循环位置）'}
+            </button>
+            <button
+              className="btn btn-ghost"
+              style={{ width: '100%' }}
+              disabled={restBusy}
+              onClick={() => setRestAdvance((v) => !v)}
+              aria-pressed={restAdvance}
+            >
+              {restAdvance ? '✓ 结束后推进循环' : '不推进循环（点按切换）'}
+            </button>
+            <button className="btn btn-ghost" style={{ width: '100%' }} onClick={() => setPendingRest(null)}>
+              取消
+            </button>
+          </div>
+        }
+      >
+        {pendingRest ? (
+          <>
+            <div style={{ fontSize: 14, color: 'var(--ink-2)', lineHeight: 1.65 }}>
+              {pendingRest.restNote ? `${pendingRest.restNote}` : '休息日'}
+              <br />
+              今天将记录为「完全休息」。休息不计入训练次数、时长、组数或有氧量。
+            </div>
+            <div
+              style={{
+                marginTop: 12,
+                padding: 10,
+                background: 'var(--paper-3)',
+                fontSize: 13,
+                lineHeight: 1.6,
+                color: 'var(--ink-2)',
+              }}
+            >
+              {cycleDay?.id === pendingRest.id
+                ? '这是循环当前位置。记录时可选择推进一次或不推进。'
+                : `这不是循环当前位置（当前是「${cycleDay?.name}」）。默认不推进。`}
             </div>
           </>
         ) : null}

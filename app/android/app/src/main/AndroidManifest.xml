@@ -24,6 +24,25 @@
 
         </activity>
 
+        <!-- 需求 2：休息到时的广播接收器（AlarmManager 投递，进程不必存活） -->
+        <receiver
+            android:name=".plugins.RestAlarmReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="app.motion.personal.REST_DONE" />
+            </intent-filter>
+        </receiver>
+
+        <!--
+          A2 批准的最小普通后台增强：当前一段休息的可见前台计时服务。
+          非导出；只在用户从可见 Activity 操作休息开始/恢复/加时时启动。
+          API34+ 使用最窄的 systemExempted 类型（需实际持有精确闹钟授权）。
+        -->
+        <service
+            android:name=".plugins.RestCountdownService"
+            android:exported="false"
+            android:foregroundServiceType="systemExempted" />
+
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"
@@ -38,4 +57,31 @@
     <!-- Permissions -->
 
     <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- 需求 2：组间休息到时震动 -->
+    <!-- VIBRATE：普通安装权限，仅用于到时震动 -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- POST_NOTIFICATIONS：Android 13+ 运行时权限。只影响「通知」可见性；
+         即使被拒，震动仍会执行（见 RestReminderPlugin 的权限说明） -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- SCHEDULE_EXACT_ALARM：Android 12+ 精确调度。用户可关闭；
+         被关闭时插件降级为不精确闹钟，并在结果里如实返回 exact:false -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+
+    <!--
+      A2 普通后台增强所需的最小权限（刻意只加这两项 + 上面的 type 声明）：
+      · FOREGROUND_SERVICE：启动前台服务的基本要求；
+      · WAKE_LOCK：仅用于当前段的有界 partial wake lock（显式超时、到期释放）。
+      不申请 FOREGROUND_SERVICE_SPECIAL_USE，不申请电池优化豁免，不加 AlarmClock。
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!--
+      A3 #1：targetSdk 36 下 API34+ 使用 systemExempted 类型时，必须同时声明
+      FOREGROUND_SERVICE_SYSTEM_EXEMPTED 这项**普通权限**；
+      只有 FOREGROUND_SERVICE 不足以合法使用该类型（运行时会抛类型不允许）。
+      这仍是普通权限，不弹框、不新增用户可见授权；不申请 specialUse / 电池豁免。
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SYSTEM_EXEMPTED" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
 </manifest>

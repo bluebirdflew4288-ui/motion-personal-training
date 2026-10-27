@@ -58,7 +58,15 @@ function Routes() {
 
   let body: React.ReactNode;
   if (parts[0] === 'session' && parts[1]) {
-    body = <SessionPage sessionId={parts[1]} />;
+    /**
+     * REVIEW-2 收尾 P2：用 key 绑定训练实例。
+     *
+     * 同一个组件实例从训练 A 切到训练 B 时（hash 变化但组件不卸载），
+     * 计时状态与原生提醒归属都属于 A；不重挂会把 A 的计时显示在 B 上、
+     * 甚至把 A 的 token 写进 B 的快照。
+     * 以 sessionId 作为 key，保证跨训练切换一定重新挂载、状态彻底隔离。
+     */
+    body = <SessionPage key={parts[1]} sessionId={parts[1]} />;
   } else if (parts[0] === 'history' && parts[1]) {
     body = <HistoryDetailPage id={parts[1]} />;
   } else if (parts[0] === 'history') {

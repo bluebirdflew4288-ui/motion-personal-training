@@ -7,32 +7,43 @@ import { navigate } from '../lib/router';
 import { fmtDateWithWeek, fmtDuration, fmtTime, fmtWeight } from '../lib/format';
 import type { Session, SessionSet } from '../domain/types';
 import { isSetLogged, summarizeSession, withSet } from '../domain/session';
+import { sessionKindOf } from '../domain/sessionKind';
+import { describeCardioParams, liveElapsedMs } from '../domain/cardio';
 import { Confirm } from '../ui/Confirm';
 import { DraftCell } from '../ui/DraftCell';
 import { deleteSession } from '../db/repo';
-import { revisionOf } from '../db/tx';
+import { atomicDeleteRest, revisionOf } from '../db/tx';
 
 export function HistoryPage() {
   const { sessions } = useStore();
   const [query, setQuery] = useState('');
   const [month, setMonth] = useState<string>('all');
 
-  const completed = useMemo(
+  /**
+   * 历史列表包含完全休息记录（可见），
+   * 但「X 次完成」这类**训练次数**必须排除 rest（第2阶段统计口径）。
+   */
+  const completedAll = useMemo(
     () => sessions.filter((s) => s.status === 'completed' && s.endedAt),
     [sessions],
+  );
+  const completed = useMemo(
+    () => completedAll.filter((s) => sessionKindOf(s) !== 'rest'),
+    [completedAll],
   );
 
   const months = useMemo(() => {
     const set = new Set<string>();
-    for (const s of completed) {
+    for (const s of completedAll) {
       const d = new Date(s.startedAt);
       set.add(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`);
     }
     return [...set].sort().reverse();
   }, [completed]);
 
+  /** 列表展示**包含**休息记录（历史可见），但训练次数统计排除 */
   const filtered = useMemo(() => {
-    let list = completed;
+    let list = completedAll;
     if (month !== 'all') {
       list = list.filter((s) => {
         const d = new Date(s.startedAt);
@@ -50,7 +61,7 @@ export function HistoryPage() {
       );
     }
     return list;
-  }, [completed, month, query]);
+  }, [completedAll, month, query]);
 
   const grouped = useMemo(() => {
     const map = new Map<string, typeof filtered>();
@@ -92,10 +103,12 @@ export function HistoryPage() {
         </select>
       </div>
 
-      {!completed.length ? (
+      {/* G2：只有休息记录时也不能显示 EMPTY —— 休息是可见记录，可查看/撤销。
+          空态以"可展示记录"为准；上方的训练次数仍排除休息。 */}
+      {!completedAll.length ? (
         <div className="empty" style={{ marginTop: 24 }}>
           <div className="empty-mark">EMPTY</div>
-          <h2 className="empty-title">还没有完成的训练</h2>
+          <h2 className="empty-title">还没有任何记录</h2>
           <p className="empty-body">
             在首页选一个训练日，记录并结束第一次训练后，这里会按日期出现完整记录。未结束的训练不会出现在历史里。
           </p>
@@ -115,11 +128,15 @@ export function HistoryPage() {
               <h2 className="h-section" style={{ fontSize: 15 }}>
                 {day}
               </h2>
-              <span className="mono-label">{list.length} 次</span>
+              {/* 日级"次数"同样排除休息，避免把休息显示成"1 次"训练 */}
+              <span className="mono-label">
+                {list.filter((x) => sessionKindOf(x) !== 'rest').length} 次
+              </span>
             </div>
             <div className="rows" style={{ marginTop: 2 }}>
               {list.map((s) => {
                 const sum = summarizeSession(s, s.endedAt ?? Date.now());
+                const kind = sessionKindOf(s);
                 return (
                   <button key={s.id} className="row" onClick={() => navigate(`/history/${s.id}`)}>
                     <span
@@ -140,9 +157,17 @@ export function HistoryPage() {
                         {s.cycleIndexAtStart !== undefined ? '' : ''}
                       </span>
                       <span className="row-sub">
-                        {sum.completedSets} 组 · {fmtDuration(sum.durationMs)}
-                        {sum.partialGroups ? ` · ${sum.partialGroups} 部分` : ''}
-                        {s.note ? ' · 有备注' : ''}
+                        {kind === 'rest' ? (
+                          <>完全休息 · 不计入训练次数</>
+                        ) : (
+                          <>
+                            {sum.completedSets > 0 ? `${sum.completedSets} 组 · ` : ''}
+                            {fmtDuration(sum.durationMs)}
+                            {sum.cardioMs > 0 ? ` · 有氧 ${fmtDuration(sum.cardioMs)}` : ''}
+                            {sum.partialGroups ? ` · ${sum.partialGroups} 部分` : ''}
+                            {s.note ? ' · 有备注' : ''}
+                          </>
+                        )}
                       </span>
                     </span>
                     <span className="row-end" style={{ color: 'var(--ink-4)' }}>
@@ -285,43 +310,143 @@ export function HistoryDetailPage({ id }: { id: string }) {
           {session.planName} · {fmtTime(session.startedAt)} – {session.endedAt ? fmtTime(session.endedAt) : '—'}
         </div>
 
-        <div
-          style={{
-            display: 'grid',
-            gridTemplateColumns: 'repeat(3, 1fr)',
-            gap: 10,
-            marginTop: 14,
-            paddingTop: 12,
-            borderTop: '1px solid var(--rule)',
-          }}
-        >
-          <div>
-            <div className="mono-label">完成组</div>
-            <div style={{ fontFamily: 'var(--f-num)', fontSize: 22, fontWeight: 700 }}>
-              {sum.completedSets}
-              <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>/{sum.targetSets}</span>
+        {/*
+          顶部摘要按类型显示（第2阶段 G8）：
+          · 休息 → 完全不显示力量摘要（下方有专门的「完全休息」区块）
+          · 纯有氧（无力量动作）→ 只显示总用时与有氧时长，不显示伪 0/0 完成组、动作分母
+          · 力量 / 力量+有氧 → 保留原有三项（完成组 / 时长 / 动作）
+        */}
+        {sessionKindOf(session) === 'rest' ? null : sessionKindOf(session) === 'cardio' ? (
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(2, 1fr)',
+              gap: 10,
+              marginTop: 14,
+              paddingTop: 12,
+              borderTop: '1px solid var(--rule)',
+            }}
+          >
+            <div>
+              <div className="mono-label">总用时</div>
+              <div style={{ fontFamily: 'var(--f-num)', fontSize: 22, fontWeight: 700 }}>
+                {fmtDuration(sum.durationMs)}
+              </div>
+            </div>
+            <div>
+              <div className="mono-label">有氧时长</div>
+              <div style={{ fontFamily: 'var(--f-num)', fontSize: 22, fontWeight: 700 }}>
+                {fmtDuration(sum.cardioMs)}
+              </div>
             </div>
           </div>
-          <div>
-            <div className="mono-label">时长</div>
-            <div style={{ fontFamily: 'var(--f-num)', fontSize: 22, fontWeight: 700 }}>
-              {fmtDuration(sum.durationMs)}
+        ) : (
+          <>
+            <div
+              style={{
+                display: 'grid',
+                gridTemplateColumns: 'repeat(3, 1fr)',
+                gap: 10,
+                marginTop: 14,
+                paddingTop: 12,
+                borderTop: '1px solid var(--rule)',
+              }}
+            >
+              <div>
+                <div className="mono-label">完成组</div>
+                <div style={{ fontFamily: 'var(--f-num)', fontSize: 22, fontWeight: 700 }}>
+                  {sum.completedSets}
+                  <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>/{sum.targetSets}</span>
+                </div>
+              </div>
+              <div>
+                <div className="mono-label">时长</div>
+                <div style={{ fontFamily: 'var(--f-num)', fontSize: 22, fontWeight: 700 }}>
+                  {fmtDuration(sum.durationMs)}
+                </div>
+              </div>
+              <div>
+                <div className="mono-label">动作</div>
+                <div style={{ fontFamily: 'var(--f-num)', fontSize: 22, fontWeight: 700 }}>
+                  {sum.exercisesDone}
+                  <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>/{session.exercises.length}</span>
+                </div>
+              </div>
             </div>
-          </div>
-          <div>
-            <div className="mono-label">动作</div>
-            <div style={{ fontFamily: 'var(--f-num)', fontSize: 22, fontWeight: 700 }}>
-              {sum.exercisesDone}
-              <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>/{session.exercises.length}</span>
-            </div>
-          </div>
-        </div>
-        {sum.partialGroups ? (
-          <div style={{ marginTop: 10 }}>
-            <span className="tag tag-warn">{sum.partialGroups} 个部分完成大组（未按完整组统计）</span>
-          </div>
-        ) : null}
+            {sum.cardioMs > 0 ? (
+              <div style={{ marginTop: 8, fontSize: 13, color: 'var(--ink-3)' }}>
+                其中有氧 {fmtDuration(sum.cardioMs)}（与总用时分别统计，不相加）
+              </div>
+            ) : null}
+            {sum.partialGroups ? (
+              <div style={{ marginTop: 10 }}>
+                <span className="tag tag-warn">{sum.partialGroups} 个部分完成大组（未按完整组统计）</span>
+              </div>
+            ) : null}
+          </>
+        )}
       </section>
+
+      {/* 完全休息：不展示力量摘要，明确标注不计入训练次数 */}
+      {sessionKindOf(session) === 'rest' ? (
+        <section style={{ marginTop: 16 }}>
+          <h2 className="h-section">完全休息</h2>
+          <div
+            style={{
+              marginTop: 8,
+              padding: '10px 12px',
+              background: 'var(--paper-3)',
+              borderLeft: '3px solid var(--rule-strong)',
+              fontSize: 13,
+              lineHeight: 1.7,
+              color: 'var(--ink-2)',
+            }}
+          >
+            这一天记录为完全休息（{session.restDate ?? '日期未知'}）。
+            不计入训练次数、时长、力量组数或有氧量。
+          </div>
+        </section>
+      ) : null}
+
+      {/* 有氧明细：与力量同一条历史，时长单列（不并入总时长） */}
+      {(session.cardio ?? []).length ? (
+        <section style={{ marginTop: 16 }}>
+          <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between' }}>
+            <h2 className="h-section">有氧</h2>
+            <span className="mono-label">共 {fmtDuration(sum.cardioMs)}</span>
+          </div>
+          {(session.cardio ?? []).map((c) => (
+            <div key={c.id} className="slip" style={{ marginTop: 8, padding: '10px 14px' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
+                <span style={{ fontWeight: 600 }}>{c.name}</span>
+                <span className="mono-label">{fmtDuration(liveElapsedMs(c, session.endedAt ?? Date.now()))}</span>
+              </div>
+              <div style={{ fontSize: 12.5, color: 'var(--ink-3)', marginTop: 4 }}>
+                {describeCardioParams(c.preset, c.currentParams)} · {c.segments.length} 段
+              </div>
+              {c.segments.map((seg) => (
+                <div
+                  key={seg.id}
+                  style={{
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    fontSize: 12,
+                    color: 'var(--ink-2)',
+                    padding: '3px 0',
+                    borderBottom: '1px dashed var(--rule)',
+                  }}
+                >
+                  <span style={{ fontFamily: 'var(--f-mono)' }}>
+                    {fmtDuration(seg.startElapsedMs)} –{' '}
+                    {seg.endElapsedMs === null ? '进行中' : fmtDuration(seg.endElapsedMs)}
+                  </span>
+                  <span>{describeCardioParams(c.preset, seg.params)}</span>
+                </div>
+              ))}
+            </div>
+          ))}
+        </section>
+      ) : null}
 
       {session.warmups.length ? (
         <section style={{ marginTop: 16 }}>
@@ -332,6 +457,9 @@ export function HistoryDetailPage({ id }: { id: string }) {
         </section>
       ) : null}
 
+      {/* 动作明细只适用于力量记录（含力量+有氧的 mixed）。
+          休息 / 纯有氧没有力量 set 编辑器，不显示空区避免误导（G8）。 */}
+      {sessionKindOf(session) !== 'strength' ? null : (
       <section style={{ marginTop: 16 }}>
         <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 10 }}>
           <h2 className="h-section">动作明细</h2>
@@ -483,6 +611,7 @@ export function HistoryDetailPage({ id }: { id: string }) {
           </div>
         ) : null}
       </section>
+      )}
 
       <section style={{ marginTop: 18 }}>
         <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between' }}>
@@ -527,17 +656,43 @@ export function HistoryDetailPage({ id }: { id: string }) {
 
       <Confirm
         open={confirmDelete}
-        title="删除这条训练记录？"
-        body="删除后这条记录不再计入统计，也不能恢复。建议先导出备份。"
+        title={sessionKindOf(session) === 'rest' ? '撤销这条完全休息记录？' : '删除这条训练记录？'}
+        body={
+          sessionKindOf(session) === 'rest'
+            ? '撤销只影响这条休息记录，不会删除任何真实训练，也不会回退循环位置。'
+            : '删除后这条记录不再计入统计，也不能恢复。建议先导出备份。'
+        }
         confirmText="删除"
         danger
         onCancel={() => setConfirmDelete(false)}
         onConfirm={async () => {
           try {
-            await deleteSession(session.id);
+            /**
+             * G2：撤销完全休息必须走**受约束事务入口**（atomicDeleteRest），
+             * 而不是裸 `deleteSession`。它按稳定身份（session.id + kind + 固定
+             * restDate）核验，别页已改动/重建同日记录时返回冲突，
+             * 且只删该 rest、不碰真实训练、不回退 cursor。
+             */
+            if (sessionKindOf(session) === 'rest') {
+              const r = await atomicDeleteRest({
+                session,
+                restDate: session.restDate ?? '',
+              });
+              if (!r.ok) {
+                // 等待事务真实结果：失败不关窗、不假报已撤销
+                pushToast(r.message, 'error');
+                return;
+              }
+            } else {
+              await deleteSession(session.id);
+            }
             await refreshSessions();
             setConfirmDelete(false);
-            pushToast('记录已删除，统计已同步更新。');
+            pushToast(
+              sessionKindOf(session) === 'rest'
+                ? '已撤销这条完全休息记录。'
+                : '记录已删除，统计已同步更新。',
+            );
             navigate('/history');
           } catch (err) {
             pushToast(err instanceof Error ? `删除失败：${err.message}` : '删除失败', 'error');

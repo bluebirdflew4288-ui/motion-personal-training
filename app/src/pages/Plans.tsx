@@ -1,9 +1,9 @@
 /* 计划管理：新建 / 复制 / 重命名 / 删除 / 编辑训练日与动作。
    所有保存立即写库；失败会提示，不静默失败。 */
 
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useStore } from '../store';
-import { navigate } from '../lib/router';
+import { navigate, registerLeaveGuard, useRoute } from '../lib/router';
 import { Sheet } from '../ui/Sheet';
 import { Confirm } from '../ui/Confirm';
 import { DraftTextField } from '../ui/DraftTextField';
@@ -27,10 +27,19 @@ import {
   updateTarget,
   updateWarmup,
 } from '../domain/planEdit';
-import { MAX_EXERCISES, MAX_REPS, MAX_STRAIGHT_SETS } from '../domain/limits';
+import {
+  MAX_CARDIO_ENTRIES,
+  MAX_EXERCISES,
+  MAX_INCLINE_PCT,
+  MAX_REPS,
+  MAX_SPEED_KMH,
+  MAX_STRAIGHT_SETS,
+  MAX_STAIR_LEVEL,
+} from '../domain/limits';
 import { createV32Plan } from '../domain/presets/v32';
 import { targetGroupsOf } from '../domain/session';
 import { DraftNumberField } from '../ui/DraftNumberField';
+import { TemplateImportSheet } from '../ui/TemplateImportSheet';
 import { DropSetEditor } from '../ui/DropSetEditor';
 import {
   mergeFlushedDropDraft,
@@ -48,15 +57,260 @@ import {
   validateDropDraft,
   type DropSetDraft,
 } from '../domain/dropSet';
-import { deletePlan } from '../db/repo';
+import { atomicDeletePlanWithCurrent } from '../db/repo';
 import { searchExercises } from '../domain/presets/library';
-import type { ExerciseTarget, Plan, PlanDay, PlanExercise } from '../domain/types';
+import type { ExerciseTarget, Plan, PlanCardio, PlanDay, PlanExercise } from '../domain/types';
 
 const FOCUS_LABEL = { chest: '胸', back: '背', legs: '腿' } as const;
 
+/**
+ * G5：计划管理页的**管理选择**。
+ *
+ * ── 与训练用 currentPlanId 分离 ────────────────────────────────
+ * `settings.currentPlanId` 决定「训练用哪个计划」；
+ * 本页的「正在管理哪个计划」是**独立的查看态**，绝不因为查看/编辑 B
+ * 而静默把训练计划从 A 切到 B。
+ *
+ * ── 初始选择优先级（已裁决）──────────────────────────────────
+ *   ① 路由里有效的管理 planId
+ *   ② 有效的训练 settings.currentPlanId
+ *   ③ 计划列表首项
+ *
+ * ── 为什么用 state 而不是纯路由 ────────────────────────────────
+ * 切换必须经过**草稿门禁**（见 requestManageSwitch）：若当前视图还有
+ * 合法保存在途 / 错误 / 未完值 / IME / 未保存配置草稿，就不能直接卸载。
+ * 因此选择先落到 state，门禁通过后才真正切换并同步路由。
+ */
+/**
+ * B4-R2：**字段 owner 的完整生命周期**（注册 → 上报 → 注销）。
+ *
+ * <p>为什么必须有一个统一 hook：
+ * 旧实现里 `fieldDirtyHandler(fieldId)` 只是返回一个稳定回调，
+ * 组件卸载时**没有任何人**调用 `unregisterField` ——
+ * 于是已卸载字段的 dirty 永久留在 Map 里，离页门禁被幽灵 dirty 卡死
+ * （Codex 真实 002：合法 3→4 blur → 取消恢复 3 → ‹计划 无反应）。
+ *
+ * <p>本 hook 把三件事绑在同一个 effect 生命周期上：
+ * <ul>
+ *   <li>拿到稳定上报回调（不每次渲染新建，避免 effect 反复重跑）；</li>
+ *   <li>卸载时调用 `unregisterField`，**只清自己的键**；</li>
+ *   <li>卸载时额外上报一次 `dirty=false`，覆盖"组件已消失但父层还没收到 false"的窗口。</li>
+ * </ul>
+ *
+ * @param fieldId 该字段的稳定唯一 id（同一页面内不得重复）
+ * @param onDirty 父层上报函数（PlansPage 传 reportFieldDirty）
+ * @param onSaving 父层保存在途上报函数（可选）
+ * @param unregister 父层注销函数
+ * @returns 稳定的 dirty / saving 上报回调
+ */
+function useFieldOwner(
+  fieldId: string,
+  onDirty: (fieldId: string, dirty: boolean) => void,
+  onSaving: ((fieldId: string, saving: boolean) => void) | undefined,
+  unregister: (fieldId: string) => void,
+): {
+  reportDirty: (dirty: boolean) => void;
+  reportSaving: (saving: boolean) => void;
+} {
+  const callbacks = useMemo(
+    () => ({
+      reportDirty: (dirty: boolean) => onDirty(fieldId, dirty),
+      reportSaving: (saving: boolean) => onSaving?.(fieldId, saving),
+    }),
+    [fieldId, onDirty, onSaving],
+  );
+  useEffect(() => {
+    return () => {
+      // 卸载：先把本字段标记为干净，再真正注销（顺序保证不会被残留 true 卡住）
+      onDirty(fieldId, false);
+      unregister(fieldId);
+    };
+  }, [fieldId, onDirty, unregister]);
+  return callbacks;
+}
+
+/**
+ * B4-R2：编辑页字段 owner 的完整生命周期（注册 → 上报 → 卸载注销）。
+ *
+ * 与 PlansPage 的 {@link useFieldOwner} 同构，只是写入编辑页自己的 owner 表。
+ * 所有需要离页门禁的字段都应通过它拿上报回调，避免"注册了但没人注销"。
+ */
+function useEditorFieldOwner(
+  fieldId: string,
+  reportDirty: (fieldId: string, dirty: boolean) => void,
+  unregister: (fieldId: string) => void,
+): (dirty: boolean) => void {
+  const cb = useCallback(
+    (dirty: boolean) => reportDirty(fieldId, dirty),
+    [fieldId, reportDirty],
+  );
+  useEffect(() => {
+    return () => {
+      // 卸载：先标记干净再注销（顺序保证不会被残留 true 卡住）
+      reportDirty(fieldId, false);
+      unregister(fieldId);
+    };
+  }, [fieldId, reportDirty, unregister]);
+  return cb;
+}
+
 export function PlansPage() {
-  const { plans, upsertPlan, pushToast, refreshPlans } = useStore();
+  const { plans, upsertPlan, pushToast, refreshPlans, refreshSettings, settings } = useStore();
+  const route = useRoute();
+
+  /** 当前正在管理的 planId（null 表示尚未确定，由下方 effect 初始化） */
+  const [managePlanId, setManagePlanId] = useState<string | null>(null);
+  /**
+   * 切换门禁：非 null 时表示"有一次切换请求正在等草稿门禁结果"。
+   * 门禁未通过前**不卸载**当前视图，只把请求挂起。
+   */
+  const [pendingSwitch, setPendingSwitch] = useState<string | null>(null);
+  /**
+   * **按稳定 ID 聚合**的不可卸载状态（B2 修复 G5-R1）。
+   *
+   * 旧实现只有一个 `dirtyRef` 布尔：计划名与每个训练日**共用同一个写口**，
+   * 后渲染的干净字段会把前面仍脏/仍错误/仍在途字段的 true 改回 false，
+   * 门禁随后误放行 —— 这正是 Codex 真实 CUA 确证的"空计划名被切走丢草稿"。
+   *
+   * 现在每个字段/配置用**稳定 fieldId** 登记自己的状态，门禁取"任一为真"。
+   * 卸载时注销，避免已卸载字段的残留状态永久阻塞。
+   */
+  /** B3/G5-R2：放弃信号 epoch（供字段 reset 草稿） */
+  const [discardEpoch, setDiscardEpoch] = useState(0);
+  /**
+   * 脏字段聚合（B4/G5-R1/R3）。
+   *
+   * 用 state 而不是 ref：ref 变化不会让依赖它的 effect 重跑。
+   * 保留 Map 语义（按 fieldId 聚合，任一为真即脏）。
+   */
+  const [dirtyFields, setDirtyFields] = useState<ReadonlyMap<string, boolean>>(new Map());
+  /**
+   * B3/G5-R4：**合法的保存在途**单独跟踪，与"脏"区分。
+   *
+   * 真实失败：plans.put 命中 hold 时用户切换被拦；保存 7.3 秒后成功，
+   * 但请求已丢，UI 仍停在旧页且 blocked 提示不消失，
+   * 用户被迫点"放弃"才能完成一个**已经保存成功**的切换。
+   *
+   * 现在：保存在途 → 记住目标；保存成功且视图变干净 → **自动续原请求**。
+   */
+  /**
+   * 在途保存（B4/G5-R3）。
+   *
+   * **必须是 state，不能是 ref**：ref 变化不触发重渲染，
+   * 依赖它的"自动续原请求" effect 永远不会重新执行 ——
+   * 这正是 B3 真实失败的原因（保存成功后仍停在旧页、blocked 提示不消失）。
+   *
+   * 用 Set 的浅拷贝做 state 值，保证引用变化可被 React 观察到。
+   */
+  const [savingFields, setSavingFields] = useState<ReadonlySet<string>>(new Set());
+  const isAnySaving = (): boolean => savingFields.size > 0;
+  const reportFieldSaving = (fieldId: string, saving: boolean): void => {
+    setSavingFields((prev) => {
+      const next = new Set(prev);
+      if (saving) next.add(fieldId);
+      else next.delete(fieldId);
+      // 引用相等则返回原值，避免无意义重渲染
+      return next.size === prev.size && [...next].every((k) => prev.has(k)) ? prev : next;
+    });
+  };
+  /** 门禁判定：任一仍存活字段不可卸载 → 阻止 */
+  const isAnyDirty = (): boolean => {
+    for (const v of dirtyFields.values()) if (v) return true;
+    return false;
+  };
+  /** 字段登记/更新（state 驱动，保证 effect 可观察） */
+  const reportFieldDirty = (fieldId: string, dirty: boolean): void => {
+    setDirtyFields((prev) => {
+      const next = new Map(prev);
+      if (dirty) next.set(fieldId, true);
+      else next.delete(fieldId);
+      return next;
+    });
+  };
+  /** 字段注销（卸载时调用） */
+  /**
+   * 字段注销（B4/G5-R4：**真的删除**，不用 void 占位）。
+   *
+   * 不注销会让已卸载字段的脏状态永久阻塞门禁（幽灵 dirty）。
+   */
+  const unregisterField = (fieldId: string): void => {
+    setDirtyFields((prev) => {
+      if (!prev.has(fieldId)) return prev;
+      const next = new Map(prev);
+      next.delete(fieldId);
+      return next;
+    });
+    setSavingFields((prev) => {
+      if (!prev.has(fieldId)) return prev;
+      const next = new Set(prev);
+      next.delete(fieldId);
+      return next;
+    });
+    dirtyHandlersRef.current.delete(fieldId);
+  };
+  /**
+   * 子组件卸载时注销自己的登记（B2/G5-R1）。
+   * 不注销会让已卸载字段的脏状态永久阻塞门禁。
+   */
+  useEffect(() => {
+    return () => {
+      // 卸载：清空聚合与 handler 缓存（避免残留状态）
+      setDirtyFields(new Map());
+      setSavingFields(new Set());
+      dirtyHandlersRef.current.clear();
+    };
+  }, []);
+
+  /** 供子组件用的稳定回调工厂：同一 fieldId 复用同一函数，避免每次渲染新建 */
+  const dirtyHandlersRef = useRef<Map<string, (dirty: boolean) => void>>(new Map());
+  /** 供子组件上报"该字段保存在途" */
+  /**
+   * 供子组件上报"保存在途"与"卸载注销"的稳定接口。
+   * 注意：这里是**真实返回可调用函数**，不是 void 占位。
+   */
+  const fieldSavingHandler = (fieldId: string): ((saving: boolean) => void) => {
+    return (saving: boolean) => reportFieldSaving(fieldId, saving);
+  };
+  /**
+   * 供子组件在卸载时注销自己的 owner（真的删除，不留幽灵 dirty）。
+   *
+   * B4-R2：**必须有真正的生命周期消费者**（B4-R1 里这里是 `void` 占位，
+   * 函数体可执行但没有任何调用方 —— 静态修复不等于接上）。
+   *
+   * <p>消费者：`fieldDirtyHandler` 与 `fieldSavingHandler` 返回的回调在
+   * 字段卸载时由字段自己调 `fieldUnregister(fieldId)()`。
+   * 见下方 `useFieldOwner` 辅助 hook —— 所有上报字段都通过它注册，
+   * 保证"注册/上报/注销"是同一份生命周期。
+   */
+  const fieldUnregister = (fieldId: string): (() => void) => {
+    return () => unregisterField(fieldId);
+  };
+  /**
+   * B4-R2：把 `fieldUnregister` 真正接到字段生命周期上。
+   *
+   * 上面注释里说的"消费者"就是它：所有上报字段通过 `useFieldOwner` 注册，
+   * 卸载时同时 `reportFieldDirty(false)` + `unregisterField`。
+   * 这里显式引用一次，保证 TS 不再把它当未使用（它是 API，不是占位）。
+   */
+  const fieldUnregisterRef = useRef(fieldUnregister);
+  fieldUnregisterRef.current = fieldUnregister;
+  const fieldDirtyHandler = (fieldId: string): ((dirty: boolean) => void) => {
+    let fn = dirtyHandlersRef.current.get(fieldId);
+    if (!fn) {
+      fn = (dirty: boolean) => reportFieldDirty(fieldId, dirty);
+      dirtyHandlersRef.current.set(fieldId, fn);
+    }
+    return fn;
+  };
+  /** 切换被拦截时的可见提示（不静默丢弃用户输入） */
+  const [switchBlocked, setSwitchBlocked] = useState(false);
+  /**
+   * B2/G5 导入 race 修复：记录"刚创建/导入、等待 plans 刷新"的新 ID。
+   * 初始化 effect 见到它时不因"plans 暂无该 ID"而回退旧选择。
+   */
+  const pendingNewPlanIdRef = useRef<string | null>(null);
   const [newOpen, setNewOpen] = useState(false);
+  const [tplOpen, setTplOpen] = useState(false);
   const [newName, setNewName] = useState('');
   const [deleteTarget, setDeleteTarget] = useState<Plan | null>(null);
   /**
@@ -100,17 +354,198 @@ export function PlansPage() {
     return found;
   }
 
+  /**
+   * 初始管理选择：路由 → 训练 current → 首项（已裁决优先级）。
+   *
+   * 只在**尚未确定**或**当前选中已失效**时重新计算，
+   * 避免用户手动选择后又被 effect 拉回。
+   */
+  useEffect(() => {
+    const routePlanId = route.parts[0] === 'plans' ? route.query.get('plan') : null;
+    const routeValid = !!routePlanId && plans.some((p) => p.id === routePlanId);
+    const currentValid =
+      !!settings.currentPlanId && plans.some((p) => p.id === settings.currentPlanId);
+    /**
+     * B2 导入 race：若存在"刚导入、等待刷新"的新 ID，
+     * 即使当前 plans 尚未包含它也**不回退**（等 refresh 完成后自然有效）。
+     */
+    const pendingNew = pendingNewPlanIdRef.current;
+    if (pendingNew && !plans.some((p) => p.id === pendingNew)) {
+      return; // 等刷新，不判无效
+    }
+    if (pendingNew && plans.some((p) => p.id === pendingNew)) {
+      // 刷新完成且新 ID 已存在 → 清标记
+      pendingNewPlanIdRef.current = null;
+    }
+
+    const stillValid = !!managePlanId && plans.some((p) => p.id === managePlanId);
+
+    if (stillValid) return; // 用户已有有效选择，不打扰
+
+    const next = routeValid
+      ? (routePlanId as string)
+      : currentValid
+        ? (settings.currentPlanId as string)
+        : plans[0]?.id ?? null;
+    setManagePlanId(next);
+  }, [plans, route, settings.currentPlanId, managePlanId]);
+
+  /** 把管理选择写回路由（只改 query，不动训练 settings） */
+  useEffect(() => {
+    if (!managePlanId) return;
+    const routePlanId = route.parts[0] === 'plans' ? route.query.get('plan') : null;
+    if (routePlanId === managePlanId) return;
+    navigate(`/plans?plan=${encodeURIComponent(managePlanId)}`, true);
+  }, [managePlanId, route]);
+
+  /**
+   * 请求切换管理计划 —— **必须经过草稿门禁**（G5 关键）。
+   *
+   * 若当前视图还有不可安全丢弃的状态（合法保存在途 / 错误 / 未完值 /
+   * IME 组合 / 未保存配置草稿），则**不切换、不卸载**，只提示用户先处理。
+   * 只有干净状态（或用户明确取消丢弃后）才真正切换。
+   */
+  function requestManageSwitch(nextId: string): void {
+    if (!nextId || nextId === managePlanId) return;
+    /**
+     * B3/G5-R4：**合法保存在途**时先等结果，成功后自动续原请求。
+     * 与"脏且无在途保存"区分：后者需要用户处理/放弃，前者只需等待。
+     */
+    if (isAnySaving() || isAnyDirty()) {
+      setPendingSwitch(nextId);
+      setSwitchBlocked(true);
+      return;
+    }
+    setSwitchBlocked(false);
+    setPendingSwitch(null);
+    setManagePlanId(nextId);
+  }
+
+  /**
+   * B3/G5-R4：视图变干净且无在途保存时，**自动续**之前被挂起的切换。
+   *
+   * 这样"保存成功后仍要用户点放弃"的错误路径被消除。
+   */
+  useEffect(() => {
+    if (!switchBlocked || !pendingSwitch) return;
+    // 依赖 savingFields/dirtyFields：它们从 true→false 时本 effect 会重跑
+    if (isAnySaving() || isAnyDirty()) return;
+    // 已干净且保存完成 → 继续原请求
+    const target = pendingSwitch;
+    setSwitchBlocked(false);
+    setPendingSwitch(null);
+    setManagePlanId(target);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [switchBlocked, pendingSwitch, discardEpoch, savingFields, dirtyFields]);
+
+  /**
+   * **明确放弃**：清掉所有字段草稿并切到请求目标（B2 修复 G5-R2）。
+   *
+   * 旧实现只清一个 ref、且无目标，既没执行切换也没真正取消草稿。
+   * 现在：
+   *   · 通知所有登记字段"放弃"（通过 bump 一个 epoch，让子组件 reset）；
+   *   · 清空聚合状态；
+   *   · 真正切到 pendingSwitch 目标。
+   */
+  const performDiscardAndSwitch = (): void => {
+    const target = pendingSwitch;
+    // 让所有字段收到"放弃"信号（epoch 变化 → 子组件 reset 草稿）
+    setDiscardEpoch((n) => n + 1);
+    setDirtyFields(new Map());
+    setSavingFields(new Set());
+    setSwitchBlocked(false);
+    setPendingSwitch(null);
+    if (target && target !== managePlanId) setManagePlanId(target);
+  };
+
+  /**
+   * B2/G5-R3：把聚合脏状态注册为**离页守卫**。
+   *
+   * 这样"进入日编辑""返回""主导航""浏览器返回"等所有走 navigate 的路径
+   * 都被同一门禁拦住，不再各写一套判断。
+   * 用 ref 读取最新聚合值，避免闭包过期。
+   */
+  const isAnyDirtyRef = useRef(isAnyDirty);
+  isAnyDirtyRef.current = isAnyDirty;
+  useEffect(() => {
+    return registerLeaveGuard(() => !isAnyDirtyRef.current());
+  }, []);
+
+  /** 当前管理计划对象（可能为 undefined：计划刚被删除） */
+  const managedPlan = useMemo(
+    () => (managePlanId ? plans.find((p) => p.id === managePlanId) : undefined),
+    [plans, managePlanId],
+  );
+
   return (
     <main className="page page-top page-bottom-space">
       <header style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 10 }}>
         <h1 className="h-serif" style={{ fontSize: 26 }}>
           训练计划
         </h1>
-        <button className="btn btn-sm btn-primary" onClick={() => setNewOpen(true)}>
-          + 新建
-        </button>
+        {/* 新建 / 导入常驻，不随所选计划变化 */}
+        <div style={{ display: 'flex', gap: 6, flex: 'none' }}>
+          <button className="btn btn-sm btn-primary" onClick={() => setNewOpen(true)}>
+            + 新建
+          </button>
+          <button className="btn btn-sm btn-ghost" onClick={() => setTplOpen(true)}>
+            导入
+          </button>
+        </div>
       </header>
       <hr className="rule-line" style={{ marginTop: 8 }} />
+
+      {/*
+        G5：顶部管理选择框。
+        · 只切换**管理查看**对象，不动训练用 settings.currentPlanId
+        · 切换走草稿门禁：脏状态时不卸载当前视图
+      */}
+      {plans.length > 0 ? (
+        <div style={{ marginTop: 12 }}>
+          <label
+            htmlFor="manage-plan-select"
+            style={{ display: 'block', fontSize: 12, color: 'var(--ink-3)', marginBottom: 4 }}
+          >
+            正在管理的计划（不影响训练用计划）
+          </label>
+          <select
+            id="manage-plan-select"
+            className="input"
+            value={managePlanId ?? ''}
+            aria-label="选择要管理的计划"
+            onChange={(e) => requestManageSwitch(e.target.value)}
+            style={{ minHeight: 44 }}
+          >
+            {plans.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.name}
+                {p.id === settings.currentPlanId ? '（训练中）' : ''}
+              </option>
+            ))}
+          </select>
+          {switchBlocked ? (
+            <div
+              role="alert"
+              style={{
+                marginTop: 6,
+                fontSize: 12.5,
+                color: 'var(--brick)',
+                lineHeight: 1.6,
+              }}
+            >
+              当前计划还有未保存的内容（正在保存、保存失败或正在输入）。
+              请先处理完，或点「放弃修改」后再切换。
+              <button
+                className="btn btn-ghost btn-sm"
+                style={{ marginLeft: 8 }}
+                onClick={performDiscardAndSwitch}
+              >
+                放弃修改并切换
+              </button>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
 
       {!plans.length ? (
         <div className="empty" style={{ marginTop: 24 }}>
@@ -129,7 +564,11 @@ export function PlansPage() {
         </div>
       ) : null}
 
-      {plans.map((plan) => (
+      {/* G5：主体**只展示所选计划**，不再把所有计划各自展开 */}
+      {managedPlan ? (
+        (() => {
+          const plan = managedPlan;
+          return (
         <section key={plan.id} className="slip" style={{ marginTop: 14, padding: '14px 14px 10px' }}>
           <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
             <div style={{ flex: 1, minWidth: 0 }}>
@@ -140,6 +579,10 @@ export function PlansPage() {
                 ariaLabel="计划名称"
                 maxLength={200}
                 onCommit={(next) => save(renamePlan(currentPlan(plan.id), next))}
+                /* G5-R1：按稳定 fieldId 聚合，避免被其他干净字段覆盖 */
+                onDirtyChange={fieldDirtyHandler(`plan-name:${plan.id}`)}
+                onSavingChange={fieldSavingHandler(`plan-name:${plan.id}`)}
+                discardEpoch={discardEpoch}
               />
               <div style={{ fontSize: 13, color: 'var(--ink-3)', marginTop: 2 }}>
                 {plan.days.length} 天 · {plan.days.filter((d) => d.kind === 'train').length} 个训练日 · 循环位置{' '}
@@ -178,6 +621,9 @@ export function PlansPage() {
                 onRequestDelete={(target) =>
                   setDayDelete({ planId: plan.id, dayId: target.id, name: target.name })
                 }
+                onDirtyChange={fieldDirtyHandler(`day-name:${plan.id}:${d.id}`)}
+                onSavingChange={fieldSavingHandler(`day-name:${plan.id}:${d.id}`)}
+                discardEpoch={discardEpoch}
               />
             ))}
           </div>
@@ -195,7 +641,9 @@ export function PlansPage() {
             </button>
           </div>
         </section>
-      ))}
+          );
+        })()
+      ) : null}
 
       <Sheet open={newOpen} title="新建计划" onClose={() => setNewOpen(false)}>
         <div className="field">
@@ -213,10 +661,24 @@ export function PlansPage() {
             className="btn btn-primary"
             onClick={async () => {
               const plan = createV32Plan();
-              const ok = await save({ ...plan, name: newName.trim() || plan.name, id: `plan-${Date.now()}` });
+              const newId = `plan-${Date.now()}`;
+              const ok = await save({ ...plan, name: newName.trim() || plan.name, id: newId });
               if (!ok) return; // 失败保留弹层与输入，可重试
               setNewName('');
               setNewOpen(false);
+              /**
+               * B2/G5-R4：新建成功**不得**静默卸载仍有草稿的旧视图。
+               *
+               * 旧实现直接 setManagePlanId，等于把"新建成功"当成"放弃旧草稿"授权。
+               * 现在若旧视图仍有草稿 → 挂起这次切换并提示用户明确处理；
+               * 旧视图干净时才直接切。
+               */
+              if (isAnyDirty()) {
+                setPendingSwitch(newId);
+                setSwitchBlocked(true);
+              } else {
+                setManagePlanId(newId);
+              }
               pushToast('已新建计划。');
             }}
           >
@@ -225,6 +687,15 @@ export function PlansPage() {
           <button
             className="btn btn-ghost"
             onClick={() => {
+              setNewOpen(false);
+              setTplOpen(true);
+            }}
+          >
+            导入计划模板（JSON）
+          </button>
+          <button
+            className="btn btn-ghost"
+            onClick={async () => {
               const now = Date.now();
               // 空白计划 = 一个空训练日，动作与热身都为空（审计 R2-08）
               const blank: Plan = {
@@ -237,17 +708,29 @@ export function PlansPage() {
                   {
                     id: `day-${now}`,
                     name: '训练日 1',
-                    focus: 'chest',
-                    round: 'A',
+                    /**
+                     * B2/G4 修复：**不得隐式补 chest/A**。
+                     * Codex 真实空白新建后提交 DB 明确含 focus=chest、round=A，
+                     * 与"新自定义力量日允许省略"直接冲突。
+                     * 域层 addDay/模板/备份已改为可省略，此处入口漏改。
+                     */
                     kind: 'train',
                     warmups: [],
                     exercises: [],
                   },
                 ],
               };
-              void save(blank);
+              const okBlank = await save(blank);
+              if (!okBlank) return; // 失败保留弹层与输入，可重试
               setNewName('');
               setNewOpen(false);
+              // B2/G5-R4：同样经过门禁，不静默丢弃旧草稿
+              if (isAnyDirty()) {
+                setPendingSwitch(blank.id);
+                setSwitchBlocked(true);
+              } else {
+                setManagePlanId(blank.id);
+              }
             }}
           >
             新建空白计划（一个空训练日）
@@ -258,6 +741,44 @@ export function PlansPage() {
         </div>
       </Sheet>
 
+      {/* 第3阶段：固定 JSON 计划模板导入（严格校验 → 只读预览 → 确认 insert-only） */}
+      <TemplateImportSheet
+        open={tplOpen}
+        onClose={() => setTplOpen(false)}
+        onImported={(imported: Plan) => {
+          void refreshPlans();
+          /**
+           * B2/G5-R4 + 导入 race 修复：
+           * · 不静默丢弃旧草稿（同新建路径）；
+           * · **延迟到 refresh 完成后再校验新 ID 有效**，避免初始化 effect
+           *   在 plans 尚未含新 ID 时把它判为失效并回退旧选择。
+           */
+          if (!imported?.id) return;
+          /**
+           * B4-R3 closure2 · N06：**先登记"等待中的新 ID"，再做 dirty 分流**。
+           *
+           * <h2>真实缺陷</h2>
+           * 旧实现只在"不 dirty"分支才写 {@code pendingNewPlanIdRef}。
+           * 于是「A 名称清空（dirty）→ 导入新计划 → 只 hold readonly 刷新 →
+           * 点放弃修改并切换」时：discard 先把管理选择切到新 ID，
+           * 但初始化 effect 在 plans 尚未包含新 ID 时没有任何"等待"依据，
+           * 直接按 route/current 回退到旧 A —— 新计划明明已写入却切不过去。
+           *
+           * <p>现在标记在**分流之前**登记：无论走"直接切"还是"先放弃再切"，
+           * 初始化 effect 都会**保留等待**，直到刷新真的能看见这个新 ID，
+           * 再让选择停在它上面；期间不写训练 currentPlan/cursor，也不覆盖 A。
+           */
+          pendingNewPlanIdRef.current = imported.id;
+          if (isAnyDirty()) {
+            setPendingSwitch(imported.id);
+            setSwitchBlocked(true);
+            return;
+          }
+          setManagePlanId(imported.id);
+        }}
+        pushToast={pushToast}
+      />
+
       <Confirm
         open={!!deleteTarget}
         title="删除计划？"
@@ -267,11 +788,65 @@ export function PlansPage() {
         onCancel={() => setDeleteTarget(null)}
         onConfirm={async () => {
           if (!deleteTarget) return;
+          const deletedId = deleteTarget.id;
           try {
-            await deletePlan(deleteTarget.id);
+            /**
+             * B3/G5-R5 产品裁决：**删除计划与匹配 current 清理必须在同一笔事务内**。
+             *
+             * 旧流程先 deletePlan 成功、再独立 setCurrentPlan；后者失败就留下
+             * "plans 无 A、settings.currentPlanId 仍 A"的悬空引用，
+             * UI 只能弹 toast 让用户自己重选（Codex B2 真实注入 settings.put abort 复现）。
+             *
+             * 现在用 `atomicDeletePlanWithCurrent`：两个 store 同一 IDB 事务，
+             * settings 写失败 → **删除一起回滚**，不会半完成。
+             */
+            const r = await atomicDeletePlanWithCurrent(deletedId, (currentId, remaining) => {
+              // 被删的不是当前训练计划 → 不动 current（避免覆盖并发已选）
+              if (currentId !== deletedId) return undefined;
+              // 恰好是当前 → 确定回退到剩余首项；零计划 → null
+              return remaining[0] ?? null;
+            });
+
+            if (!r.ok) {
+              // 事务失败：什么都没改，如实提示可重试
+              pushToast(
+                r.reason === 'plan-not-found'
+                  ? '这个计划已经不存在了。'
+                  : `删除失败：${r.reason ?? '未知原因'}（未做任何修改）`,
+                'error',
+              );
+              return;
+            }
+
+            /**
+             * B4/G5-R4：删除成功后**必须同步内存 Store**。
+             *
+             * 真实失败：正常事务完成、raw 已删 A 且 current=B，
+             * 但 Store 仍 current=已删 A，UI 无"训练中"标记 ——
+             * 因为 `refreshSettings` 从未被接进成功链。
+             */
             await refreshPlans();
+            await refreshSettings();
             setDeleteTarget(null);
-            pushToast('计划已删除，历史记录未受影响。');
+
+            // 管理查看对象被删 → 按优先级回退（仅在事务成功后）
+            if (managePlanId === deletedId) {
+              const fallback = plans.find((p) => p.id !== deletedId);
+              setManagePlanId(fallback?.id ?? null);
+            }
+
+            if (r.newCurrentPlanId === null) {
+              pushToast('计划已删除；现在没有训练计划，可以新建或导入。历史记录未受影响。');
+            } else if (r.newCurrentPlanId !== deletedId) {
+              const name = plans.find((p) => p.id === r.newCurrentPlanId)?.name;
+              pushToast(
+                name
+                  ? `计划已删除；训练计划已回退到「${name}」。历史记录未受影响。`
+                  : '计划已删除；训练计划已回退。历史记录未受影响。',
+              );
+            } else {
+              pushToast('计划已删除，历史记录未受影响。');
+            }
           } catch (err) {
             pushToast(err instanceof Error ? `删除失败：${err.message}` : '删除失败', 'error');
           }
@@ -346,10 +921,19 @@ function PlanDayRow({
   onSave,
   onOpen,
   onRequestDelete,
+  onDirtyChange,
+  onSavingChange,
+  discardEpoch,
 }: {
   plan: Plan;
   day: PlanDay;
   index: number;
+  /** G5：训练日名称草稿未保存时上报（按 fieldId 聚合） */
+  onDirtyChange?: (dirty: boolean) => void;
+  /** G5-R2：放弃信号，变化即重置草稿 */
+  discardEpoch?: number;
+  /** B4：保存在途上报 */
+  onSavingChange?: (saving: boolean) => void;
   /** 行内保存：必须**如实返回是否成功**（草稿输入据此决定是否认保存） */
   onSave: (p: Plan) => Promise<boolean>;
   onOpen: () => void;
@@ -388,6 +972,10 @@ function PlanDayRow({
           ariaLabel={`第 ${index + 1} 天名称`}
           maxLength={100}
           onCommit={(next) => onSave(renameDay(plan, day.id, next))}
+          /* G5：训练日名称草稿未保存时阻止切换管理计划 */
+          onDirtyChange={onDirtyChange}
+          onSavingChange={onSavingChange}
+          discardEpoch={discardEpoch}
         />
       </div>
       <div
@@ -401,7 +989,11 @@ function PlanDayRow({
         }}
       >
         <span className="tag tag-quiet" style={{ flex: 'none' }}>
-          {day.kind === 'rest' ? '休息' : `${day.exercises.length} 动作`}
+          {day.kind === 'rest'
+            ? '休息'
+            : day.kind === 'cardio'
+              ? `有氧 · ${day.cardio?.length ?? 0} 项`
+              : `${day.exercises.length} 动作`}
         </span>
         <button className="btn btn-ghost btn-sm" style={{ flex: 'none', minHeight: 44 }} onClick={onOpen}>
           编辑
@@ -458,12 +1050,23 @@ function ExistingDropEditor({
   dayId,
   exercise,
   onSave,
+  onDirtyChange,
+  ownerFieldId,
+  onUnregisterOwner,
 }: {
   plan: Plan;
   dayId: string;
   exercise: PlanExercise;
   /** 必须如实返回是否成功：失败时编辑器要保留草稿，不能静默关窗 */
   onSave: (p: Plan) => Promise<boolean>;
+  /** B2/G5-R3：配置草稿未保存时上报，供统一离页门禁使用 */
+  onDirtyChange?: (dirty: boolean) => void;
+  /**
+   * B4-R2：本配置在父层 owner 表里的键。
+   * 提供后，本组件卸载时会**真的注销**它（缺口 2 的修复点）。
+   */
+  ownerFieldId?: string;
+  onUnregisterOwner?: (fieldId: string) => void;
 }) {
   const saved: DropSetDraft = useMemo(
     () => (exercise.target.kind === 'dropSet' ? dropTargetToDraft(exercise.target) : defaultDropDraft()),
@@ -483,6 +1086,49 @@ function ExistingDropEditor({
 
   const issues = validateDropDraft(draft);
   const dirty = JSON.stringify(draft) !== JSON.stringify(saved);
+
+  /**
+   * B4-R1：**不再由本层单独上报**，避免与外层 structuredDirty / 内层 raw
+   * 两路写同一个 owner（内层 false 会清掉外层仍脏的状态）。
+   *
+   * 现在把 `structuredDirty` 传给 DropSetEditor，由它**合并后单次上报**。
+   * 注意：saving 也要纳入合并值。
+   */
+  const structuredDirty = dirty || saving;
+
+  /**
+   * B4-R2：**本配置的 owner 上报回调走完整生命周期**（缺口 2 修复点之一）。
+   *
+   * 在组件顶层调用（符合 Hooks 规则），卸载时自动报 false + 注销该键。
+   * 与下面的显式卸载 effect 一起保证"组件消失 ⇒ owner 释放"。
+   */
+  const reportOwnerDirty = useEditorFieldOwner(
+    ownerFieldId ?? '',
+    (_id, d) => onDirtyChange?.(d),
+    (id) => onUnregisterOwner?.(id),
+  );
+  // 供渲染期上报使用（DropSetEditor 的回调仍走原 onDirtyChange，二者不冲突）
+  void reportOwnerDirty;
+
+  /**
+   * B4-R2：**卸载时真正注销本配置的 owner**（缺口 2）。
+   *
+   * 真实失败链：合法 3→4 blur → 取消（resetAll + setOpen(false)）→
+   * DropSetEditor 卸载 → 没有人为这个 key 报 false →
+   * 仍挂载的 PlanDayEditor owner 表永久为 true → ‹计划 无反应。
+   *
+   * 这里把"组件消失"和"owner 释放"绑死：卸载即报 false + 注销该键。
+   * 只清自己的键，不清整表（其它字段的存活草稿必须保留）。
+   */
+  useEffect(() => {
+    if (!ownerFieldId || !onUnregisterOwner) return undefined;
+    return () => {
+      onDirtyChange?.(false);
+      onUnregisterOwner(ownerFieldId);
+    };
+    // onDirtyChange 是父层稳定回调（dirtyHandlersRef 缓存），不会每次渲染变化
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ownerFieldId, onUnregisterOwner]);
 
   if (!open) {
     return (
@@ -529,6 +1175,9 @@ function ExistingDropEditor({
         form={form}
         fieldPrefix={`ex.${exercise.id}`}
         scopeNote="修改只影响未来训练；已保存的历史保持原样。"
+        /* B4-R1：结构化脏与内部 raw 在本组件内合并后单次上报 */
+        structuredDirty={structuredDirty}
+        onDirtyChange={onDirtyChange}
       />
 
       {error ? (
@@ -625,6 +1274,77 @@ function comparabilityLabelText(d: DropSetDraft): string {
 
 export function PlanDayEditor({ planId, dayId }: { planId: string; dayId: string }) {
   const { plans, upsertPlan, pushToast } = useStore();
+  /**
+   * B2/G5-R3：编辑页也必须有**统一离页门禁**。
+   *
+   * Codex 真实 CUA 确证两条：
+   * · 管理页有未保存草稿时，直接"编辑训练日"仍导航；
+   * · 递减组轮数 3→4 未保存，点"‹计划"无提示返回，草稿丢失。
+   *
+   * 现在按 fieldId 聚合本页所有字段/配置状态，并注册为 router 的离页守卫。
+   * 与 PlansPage 用同一机制，不引入第二套框架。
+   */
+  const editorDirtyRef = useRef<Map<string, boolean>>(new Map());
+  const reportEditorDirty = (fieldId: string, dirty: boolean): void => {
+    if (dirty) editorDirtyRef.current.set(fieldId, true);
+    else editorDirtyRef.current.delete(fieldId);
+  };
+  const isEditorDirty = (): boolean => {
+    for (const v of editorDirtyRef.current.values()) if (v) return true;
+    return false;
+  };
+  /**
+   * B4-R2：**字段 owner 注销**（G5 实证缺口 2）。
+   *
+   * <p>真实失败：递减组配置里合法 3→4 真实 blur → 点「取消」恢复 3 →
+   * 点 ‹计划 **无反应**。根因是配置 owner 由**会卸载的内层 DropSetEditor**
+   * 独占上报，取消后内层卸载，但没有人清掉仍挂载的 `editorDirtyRef` 里的 true
+   * → 门禁永久为脏。
+   *
+   * <p>修法：提供真正可调用的注销入口，并由字段/配置在卸载时调用
+   * （见 {@link useFieldOwner}）。只删**自己的键**，不清整个 Map
+   * —— 清整表会把其它仍存活的草稿一起隐藏。
+   */
+  const unregisterEditorField = (fieldId: string): void => {
+    editorDirtyRef.current.delete(fieldId);
+  };
+  /**
+   * 编辑页的 owner 生命周期包装（与 PlansPage 的 useFieldOwner 同一语义，
+   * 只是写入不同的 owner 表）。
+   */
+
+  const isEditorDirtyRef = useRef(isEditorDirty);
+  /**
+   * B4-R2：**编辑页整体卸载时清空本页 owner 表**。
+   *
+   * 与"单字段注销"互补：单字段注销解决"配置面板卸载但页面还在"（缺口 2 主路径）；
+   * 本 effect 解决"整个编辑页离开"（此时所有字段都消失，整表清空是正确的）。
+   * 两者都不清**别的页面**的表 —— 各自持有自己的 ref。
+   */
+  useEffect(() => {
+    const table = editorDirtyRef.current;
+    return () => {
+      table.clear();
+    };
+  }, []);
+  isEditorDirtyRef.current = isEditorDirty;
+  useEffect(() => {
+    const off = registerLeaveGuard(() => !isEditorDirtyRef.current());
+    return () => {
+      off();
+      editorDirtyRef.current.clear();
+    };
+  }, []);
+  /** 稳定的 fieldId → handler 工厂 */
+  const editorDirtyHandlersRef = useRef<Map<string, (d: boolean) => void>>(new Map());
+  const editorDirtyHandler = (fieldId: string): ((d: boolean) => void) => {
+    let fn = editorDirtyHandlersRef.current.get(fieldId);
+    if (!fn) {
+      fn = (d: boolean) => reportEditorDirty(fieldId, d);
+      editorDirtyHandlersRef.current.set(fieldId, fn);
+    }
+    return fn;
+  };
   const plan = plans.find((p) => p.id === planId);
   const day = plan?.days.find((d) => d.id === dayId);
   const [addOpen, setAddOpen] = useState(false);
@@ -656,6 +1376,11 @@ export function PlanDayEditor({ planId, dayId }: { planId: string; dayId: string
   const results = useMemo(() => (query.trim() ? searchExercises(query) : searchExercises('').slice(0, 14)), [query]);
 
   useEffect(() => {
+    /**
+     * G5：计划已不存在（被删除）→ 回管理页。
+     * 不带 plan 参数，让管理页按既定优先级（路由→训练 current→首项）回退，
+     * 不强行指向一个已失效 ID（避免 404 或空视图）。
+     */
     if (!plan) navigate('/plans', true);
   }, [plan]);
 
@@ -693,10 +1418,49 @@ export function PlanDayEditor({ planId, dayId }: { planId: string; dayId: string
     return found;
   }
 
+  /**
+   * 有氧日：编辑某个预设的**目标/初始参数**（G8a）。
+   *
+   * · 字段固定两预设（坡走 speedKmh/inclinePct；爬楼 level），不做自定义字段设计器。
+   * · 不适用参数不写入（保持缺省，不混 null/undefined 两套输出）。
+   * · 基于 currentPlan 合并，避免渲染闭包里旧 plan 覆盖别处变更。
+   * · 数值已由 DraftNumberField 校验（范围/整数/有限），这里只负责落库。
+   */
+  function updateCardioTarget(cardioId: string, patch: Partial<PlanCardio['target']>) {
+    const latest = currentPlan(planId);
+    const next: Plan = {
+      ...latest,
+      days: latest.days.map((d) => {
+        if (d.id !== dayId) return d;
+        return {
+          ...d,
+          cardio: (d.cardio ?? []).map((pc) => {
+            if (pc.id !== cardioId) return pc;
+            const merged = { ...pc.target, ...patch };
+            // 按预设规范只保留适用字段（缺省不写）
+            const target: PlanCardio['target'] =
+              pc.preset === 'treadmill-incline'
+                ? {
+                    ...(typeof merged.speedKmh === 'number' ? { speedKmh: merged.speedKmh } : {}),
+                    ...(typeof merged.inclinePct === 'number' ? { inclinePct: merged.inclinePct } : {}),
+                  }
+                : { ...(typeof merged.level === 'number' ? { level: merged.level } : {}) };
+            return { ...pc, target };
+          }),
+        };
+      }),
+    };
+    void save(next);
+  }
+
   return (
     <main className="page page-top page-bottom-space">
       <header style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-        <button className="btn btn-ghost btn-sm" onClick={() => navigate('/plans')}>
+        {/* G5：返回时保留管理 ID，避免回到首项而丢失用户正在管理的计划 */}
+        <button
+          className="btn btn-ghost btn-sm"
+          onClick={() => navigate(`/plans?plan=${encodeURIComponent(planId)}`)}
+        >
           ‹ 计划
         </button>
       </header>
@@ -719,12 +1483,25 @@ export function PlanDayEditor({ planId, dayId }: { planId: string; dayId: string
             {FOCUS_LABEL[f]}
           </button>
         ))}
-        <button
-          className={`btn btn-sm ${day.kind === 'rest' ? 'btn-primary' : 'btn-ghost'}`}
-          onClick={() => void save(setDayKind(plan, day.id, day.kind === 'rest' ? 'train' : 'rest'))}
-        >
-          {day.kind === 'rest' ? '休息日' : '设为休息日'}
-        </button>
+        {/* 日类型三态（第2阶段）：力量 / 有氧 / 休息 */}
+        {(
+          [
+            ['train', '力量日'],
+            ['cardio', '有氧日'],
+            ['rest', '休息日'],
+          ] as const
+        ).map(([k, label]) => (
+          <button
+            key={k}
+            className={`btn btn-sm ${day.kind === k ? 'btn-primary' : 'btn-ghost'}`}
+            onClick={() => {
+              if (day.kind === k) return;
+              void save(setDayKind(plan, day.id, k));
+            }}
+          >
+            {label}
+          </button>
+        ))}
       </div>
 
       {day.kind === 'rest' ? (
@@ -742,6 +1519,154 @@ export function PlanDayEditor({ planId, dayId }: { planId: string; dayId: string
             }
           />
         </div>
+      ) : day.kind === 'cardio' ? (
+        /**
+         * 有氧日：只编辑**目标/初始参数**，不含实际计时记录。
+         * 不显示力量编辑器（避免"导入成功但语义错误"的力量结构）。
+         */
+        <section style={{ marginTop: 16 }}>
+          <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between' }}>
+            <h2 className="h-section">有氧项目</h2>
+            <span className="mono-label">目标 / 初始值</span>
+          </div>
+          {(day.cardio ?? []).length ? (
+            <div className="rows" style={{ marginTop: 6 }}>
+              {(day.cardio ?? []).map((pc) => (
+                <div
+                  key={pc.id}
+                  className="row"
+                  style={{ cursor: 'default', alignItems: 'flex-start', flexWrap: 'wrap' }}
+                >
+                  <span className="row-main" style={{ minWidth: 0 }}>
+                    <span className="row-title">{pc.name}</span>
+                    <span className="row-sub">目标 / 初始值（实际训练中可再调整）</span>
+                  </span>
+                  <button
+                    className="btn btn-ghost btn-sm"
+                    style={{ color: 'var(--brick)', minWidth: 44, padding: 0 }}
+                    aria-label={`删除${pc.name}`}
+                    onClick={() =>
+                      void save({
+                        ...plan,
+                        days: plan.days.map((d) =>
+                          d.id === day.id
+                            ? { ...d, cardio: (d.cardio ?? []).filter((x) => x.id !== pc.id) }
+                            : d,
+                        ),
+                      })
+                    }
+                  >
+                    ×
+                  </button>
+                  {/*
+                    目标数值编辑：复用受保护的 DraftNumberField（不静默回填 0、
+                    非法值不入库），单位/步长/上限与训练中一致。
+                    坡走 = 速度 km/h（0.1 步长）+ 坡度 %；爬楼 = 整数档位。
+                    这是目标/初始值编辑，**不是**自定义参数设计器（字段固定两预设）。
+                  */}
+                  <div
+                    style={{
+                      flex: '1 1 100%',
+                      display: 'grid',
+                      gridTemplateColumns: pc.preset === 'treadmill-incline' ? 'repeat(2, minmax(0,1fr))' : 'repeat(1, minmax(0,1fr))',
+                      gap: 8,
+                      marginTop: 8,
+                      paddingLeft: 2,
+                    }}
+                  >
+                    {pc.preset === 'treadmill-incline' ? (
+                      <>
+                        <DraftNumberField
+                          onDirtyChange={editorDirtyHandler(`num:cardio:${day.id}:${pc.id}:speed`)}
+                          label="速度"
+                          value={pc.target.speedKmh ?? 0}
+                          min={0}
+                          max={MAX_SPEED_KMH}
+                          integer={false}
+                          unit="km/h"
+                          fieldId={`cardio.${pc.id}.speed`}
+                          onCommit={(v) => void updateCardioTarget(pc.id, { speedKmh: v })}
+                        />
+                        <DraftNumberField
+                          onDirtyChange={editorDirtyHandler(`num:cardio:${day.id}:${pc.id}:incline`)}
+                          label="坡度"
+                          value={pc.target.inclinePct ?? 0}
+                          min={0}
+                          max={MAX_INCLINE_PCT}
+                          integer={false}
+                          unit="%"
+                          fieldId={`cardio.${pc.id}.incline`}
+                          onCommit={(v) => void updateCardioTarget(pc.id, { inclinePct: v })}
+                        />
+                      </>
+                    ) : (
+                      <DraftNumberField
+                        onDirtyChange={editorDirtyHandler(`num:cardio:${day.id}:${pc.id}:level`)}
+                        label="档位"
+                        value={pc.target.level ?? 1}
+                        min={1}
+                        max={MAX_STAIR_LEVEL}
+                        unit="档"
+                        fieldId={`cardio.${pc.id}.level`}
+                        onCommit={(v) => void updateCardioTarget(pc.id, { level: v })}
+                      />
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p style={{ fontSize: 13, color: 'var(--ink-3)', lineHeight: 1.65, marginTop: 6 }}>
+              这一日还没有有氧项目。可以添加「有氧爬坡」或「爬楼机」作为今天的默认目标。
+            </p>
+          )}
+          <div style={{ display: 'flex', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
+            {(
+              [
+                ['treadmill-incline', '有氧爬坡', { speedKmh: 4, inclinePct: 4 }],
+                ['stair-climber', '爬楼机', { level: 5 }],
+              ] as const
+            ).map(([preset, label, target]) => (
+              <button
+                key={preset}
+                className="btn btn-ghost btn-sm"
+                // G3：容量在编辑端也一致核验（不只渲染靠它求绿）：达上限即禁用，
+                // 避免生成无法恢复的超量计划。
+                disabled={(day.cardio ?? []).length >= MAX_CARDIO_ENTRIES}
+                onClick={() => {
+                  if ((day.cardio ?? []).length >= MAX_CARDIO_ENTRIES) {
+                    pushToast(`一次计划最多 ${MAX_CARDIO_ENTRIES} 个有氧项目`, 'error');
+                    return;
+                  }
+                  void save({
+                    ...plan,
+                    days: plan.days.map((d) =>
+                      d.id === day.id
+                        ? {
+                            ...d,
+                            cardio: [
+                              ...(d.cardio ?? []),
+                              {
+                                id: `pc-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+                                preset,
+                                name: label,
+                                target,
+                              },
+                            ],
+                          }
+                        : d,
+                    ),
+                  });
+                }}
+              >
+                + {label}
+              </button>
+            ))}
+          </div>
+          <p style={{ fontSize: 12, color: 'var(--ink-4)', lineHeight: 1.6, marginTop: 10 }}>
+            这里只保存目标/初始参数；实际计时与分段属于训练记录，改计划不会改动历史。
+          </p>
+        </section>
       ) : (
         <>
           <section style={{ marginTop: 16 }}>
@@ -910,6 +1835,7 @@ export function PlanDayEditor({ planId, dayId }: { planId: string; dayId: string
                 {ex.target.kind === 'straight' ? (
                   <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0,1fr))', gap: 8, marginTop: 8 }}>
                     <DraftNumberField
+                      onDirtyChange={editorDirtyHandler(`num:ex:${day.id}:${ex.id}:sets`)}
                       label="组数"
                       value={ex.target.sets}
                       min={0}
@@ -921,6 +1847,7 @@ export function PlanDayEditor({ planId, dayId }: { planId: string; dayId: string
                       }}
                     />
                     <DraftNumberField
+                      onDirtyChange={editorDirtyHandler(`num:ex:${day.id}:${ex.id}:repsMin`)}
                       label="次数下限"
                       value={ex.target.repsMin}
                       min={0}
@@ -933,6 +1860,7 @@ export function PlanDayEditor({ planId, dayId }: { planId: string; dayId: string
                       onCommit={(v) => void save(updateTarget(plan, day.id, ex.id, { repsMin: v }))}
                     />
                     <DraftNumberField
+                      onDirtyChange={editorDirtyHandler(`num:ex:${day.id}:${ex.id}:repsMax`)}
                       label="次数上限"
                       value={ex.target.repsMax}
                       min={0}
@@ -945,6 +1873,7 @@ export function PlanDayEditor({ planId, dayId }: { planId: string; dayId: string
                       onCommit={(v) => void save(updateTarget(plan, day.id, ex.id, { repsMax: v }))}
                     />
                     <DraftNumberField
+                      onDirtyChange={editorDirtyHandler(`num:ex:${day.id}:${ex.id}:restSec`)}
                       label="休息秒"
                       value={ex.restSec}
                       min={0}
@@ -953,6 +1882,7 @@ export function PlanDayEditor({ planId, dayId }: { planId: string; dayId: string
                       onCommit={(v) => void save(updateExercise(plan, day.id, ex.id, { restSec: v }))}
                     />
                     <DraftNumberField
+                      onDirtyChange={editorDirtyHandler(`num:ex:${day.id}:${ex.id}:weight`)}
                       label="建议重量"
                       value={ex.target.suggestedWeightKg ?? 0}
                       min={0}
@@ -973,6 +1903,14 @@ export function PlanDayEditor({ planId, dayId }: { planId: string; dayId: string
                       dayId={day.id}
                       exercise={ex}
                       onSave={save}
+                      onDirtyChange={editorDirtyHandler(`drop-config:${day.id}:${ex.id}`)}
+                      /*
+                        B4-R2：把该配置的 owner 生命周期交给统一的注销入口。
+                        ExistingDropEditor 卸载（取消/保存成功/删除实体/类型切换）时
+                        会真的清掉自己的键，不再留幽灵 dirty 卡住离页门禁。
+                      */
+                      ownerFieldId={`drop-config:${day.id}:${ex.id}`}
+                      onUnregisterOwner={unregisterEditorField}
                     />
                   </div>
                 )}
@@ -1061,6 +1999,7 @@ export function PlanDayEditor({ planId, dayId }: { planId: string; dayId: string
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0,1fr))', gap: 8 }}>
                 {/* V3-04：三个字段接真实草稿，保存时用用户输入 */}
                 <DraftNumberField
+                  onDirtyChange={editorDirtyHandler(`num:add:${day.id}:sets`)}
                   label="组数"
                   value={addStraightDraft.sets}
                   min={1}
@@ -1070,6 +2009,7 @@ export function PlanDayEditor({ planId, dayId }: { planId: string; dayId: string
                   onCommit={(v) => setAddStraightDraft((d) => ({ ...d, sets: v }))}
                 />
                 <DraftNumberField
+                  onDirtyChange={editorDirtyHandler(`num:add:${day.id}:repsMin`)}
                   label="次数下限"
                   value={addStraightDraft.repsMin}
                   min={0}
@@ -1080,6 +2020,7 @@ export function PlanDayEditor({ planId, dayId }: { planId: string; dayId: string
                   onCommit={(v) => setAddStraightDraft((d) => ({ ...d, repsMin: v }))}
                 />
                 <DraftNumberField
+                  onDirtyChange={editorDirtyHandler(`num:add:${day.id}:repsMax`)}
                   label="次数上限"
                   value={addStraightDraft.repsMax}
                   min={0}
@@ -1091,7 +2032,14 @@ export function PlanDayEditor({ planId, dayId }: { planId: string; dayId: string
                 />
               </div>
             ) : (
-              <DropSetEditor draft={addDropDraft} onChange={setAddDropDraft} form={addFormApi} fieldPrefix="addDrop" />
+              <DropSetEditor
+                draft={addDropDraft}
+                onChange={setAddDropDraft}
+                form={addFormApi}
+                fieldPrefix="addDrop"
+                /* B4/G5-R5：新增动作的递减配置也算离页门禁的 owner */
+                onDirtyChange={editorDirtyHandler(`add:drop:${day.id}`)}
+              />
             )}
 
             {addForm === 'straight' ? (

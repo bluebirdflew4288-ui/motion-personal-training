@@ -1,7 +1,7 @@
 {
   "name": "motion-training-app",
   "private": true,
-  "version": "1.0.0",
+  "version": "0.1.7",
   "type": "module",
   "description": "MOTION — 个人训练工作区（离线优先的本地训练记录 Web App）",
   "scripts": {
@@ -11,7 +11,7 @@
     "serve": "node scripts/serve.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc -b --noEmit false --emitDeclarationOnly false",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
     "serve:v2": "node scripts/serve.mjs --dist dist-v2 --port 5299",
     "build:v1": "MOTION_OUT_DIR=dist npm run build",
     "serve:v1": "node scripts/serve.mjs --dist dist --port 5199",

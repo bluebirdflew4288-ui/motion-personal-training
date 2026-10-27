@@ -195,3 +195,13 @@ _archive/maintenance-20261022/temp-workdirs-20261022.tar.gz   # 二选一，建�
 - 未停止运行中的服务（5999 端口仍在）
 - 未触碰 `node_modules`、SDK/JDK/Gradle、签名目录、AVD
 - 未提交、未推送、未部署、未新增 Agent、未扩大到其他 Workspace
+
+---
+
+## 9. 2026-10-27 GitHub 同步准备（仅记录与精确暂存）
+
+本轮为用户确认 0.1.7 当前测试包后的私有 GitHub 同步准备。Root 授权只覆盖审定源码闭包、必要维护文档/配置、四个带环境路径覆盖的 UI 自查脚本、fixtures/templates 与已验收 0.1.7 APK。0.1.2 APK、旧 v2 测试依赖、0.1.3–0.1.6 APK、其余 rollback、dist 和验收材料按各自用途保留。
+
+本轮不删除、不移动任何项目资产，不清理 AppleDouble。Root 对指定保护目录（APK、rollback/archive、各 verify 与历史 dist）保存的快照包含 10,802 个实文件、506,921,354 字节；这是所选保护目录的清单，不代表全树，也不含一般依赖目录。整个 Project 的物理元数据计数为 20,067 个 `._*`/`.DS_Store` 项（计数含依赖与旧 gitdir）。这些都是保护/盘面统计，不是待清理目标。生成的 Android `assets/public`、Capacitor 配置/插件清单遵循原有 `.gitignore`，保持本机。
+
+当前阶段仅准备精确暂存供 Root 审查，尚未提交或推送。Root 后续计划在 APFS 独立新克隆验证；本记录不预先宣称其结果。细节见 `GITHUB-SYNC-017.md` 和 Codex Task `tasks/2026-10-27_motion-017-github-sync-hygiene/luna-audit/`。

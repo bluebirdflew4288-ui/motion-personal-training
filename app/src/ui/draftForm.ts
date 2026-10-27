@@ -27,6 +27,16 @@ export interface DraftFieldHandle {
   flush: () => DraftFieldResult;
   /** 丢弃本地草稿，回到受控值 */
   reset: () => void;
+  /**
+   * B4-R2：**当前字段是否不可安全卸载**（被动读，不写 state）。
+   *
+   * <p>必须覆盖四类状态，不能只看 invalid：
+   * 合法但**未提交**的 raw、空、未完（`7.`）、IME 组合态、以及保存中。
+   * 缺任一类都会出现"草稿看起来干净、实际丢失"的真实失败。
+   *
+   * 未提供时退回 {@link flush} 的 ok 判定（兼容旧字段）。
+   */
+  isUnsafeToUnmount?: () => boolean;
 }
 
 export interface DraftFlushOutcome {
@@ -42,8 +52,52 @@ export interface DraftFlushOutcome {
 export interface DraftFormApi {
   register: (id: string, handle: DraftFieldHandle) => void;
   unregister: (id: string) => void;
+  /**
+   * B4-R2：订阅**字段集合的被动变化**。
+   *
+   * <p>为什么必须有订阅（G5 实证缺口 1 的根因）：
+   * `probeRawValid()` 只是"读一次快照"，纯读不产生任何通知。
+   * 子字段清空/报错/IME 只改**自己的**本地 state，父层的 `draft` 与 `form`
+   * 身份都不变 → 依赖 `[draft, form]` 的 effect **永远不会重跑**，
+   * 于是 `rawInvalid` 一直是 false，离页门禁放行、草稿丢失。
+   *
+   * <p>现在字段在"不可卸载状态"真正变化时**主动通知**父层；
+   * 父层据此重算并上报，不再依赖 draft/form 身份变化。
+   *
+   * @returns 取消订阅函数
+   */
+  subscribe: (listener: () => void) => () => void;
+  /**
+   * B4-R2：**被动**汇总当前是否有字段不可安全卸载（不写 state）。
+   *
+   * 与 `probeRawValid` 的区别：后者只判 raw 合法性，
+   * 本方法还包含"合法未提交""IME 组合态""保存中"。
+   */
+  hasUnsafeField: () => boolean;
+  /**
+   * B4-R2：字段级不可卸载状态（供父层按 fieldId 精确聚合，避免互相覆盖）。
+   */
+  unsafeFieldIds: () => string[];
+  /** 当前已注册字段 id（诊断/注销核对用） */
+  registeredIds: () => string[];
+  /**
+   * 字段侧上报入口（B4-R2）：把"我是否不可安全卸载"告诉父表单。
+   *
+   * 字段必须在 raw/error/IME/saving **真实变化**时调用，
+   * 不能只在 render 里调用一次（那样仍不会产生被动通知）。
+   */
+  _reportUnsafe?: (id: string, unsafe: boolean) => void;
   /** 汇总校验所有已注册字段的当前文本草稿，并返回解析值映射 */
   flushAll: () => DraftFlushOutcome;
+  /**
+   * **被动**合法性探测：只读，**不写 state**。
+   *
+   * <p>与 `flushAll` 的区别：flushAll 会 `setErrors` 并驱动 form 重建，
+   * 在 effect 里调用会造成自激循环。本函数专供"观察内部 raw 是否干净"使用。
+   *
+   * @returns true 表示全部已注册字段 raw 合法
+   */
+  probeRawValid: () => boolean;
   /** 丢弃所有字段本地草稿并清空错误 */
   resetAll: () => void;
   /** 字段级错误（用于父级展示/禁用保存） */
@@ -54,21 +108,93 @@ export interface DraftFormApi {
 
 export function useDraftForm(): DraftFormApi {
   const handles = useRef(new Map<string, DraftFieldHandle>());
+  /**
+   * B4-R2：每个字段**最后一次上报的不可卸载状态**。
+   *
+   * 用 Map 而不是单个布尔：某个字段恢复干净时只能清**它自己**，
+   * 绝不能把其它仍脏字段的状态一起清掉（"全清 Map 掩盖存活草稿"是被明确禁止的）。
+   */
+  const unsafeRef = useRef(new Map<string, boolean>());
+  /** 被动变化订阅者（父层 effect 用它重算聚合） */
+  const listenersRef = useRef(new Set<() => void>());
   const [errors, setErrors] = useState<Record<string, string>>({});
+
+  const notify = useCallback(() => {
+    for (const fn of Array.from(listenersRef.current)) {
+      try {
+        fn();
+      } catch {
+        // 单个订阅者异常不影响其它订阅者
+      }
+    }
+  }, []);
+
+  const subscribe = useCallback((listener: () => void) => {
+    listenersRef.current.add(listener);
+    return () => {
+      listenersRef.current.delete(listener);
+    };
+  }, []);
 
   const register = useCallback((id: string, handle: DraftFieldHandle) => {
     handles.current.set(id, handle);
+    // 新注册字段先按"干净"起步，随后由字段自己上报真实状态
+    if (!unsafeRef.current.has(id)) unsafeRef.current.set(id, false);
   }, []);
 
-  const unregister = useCallback((id: string) => {
-    handles.current.delete(id);
-    setErrors((prev) => {
-      if (!(id in prev)) return prev;
-      const next = { ...prev };
-      delete next[id];
-      return next;
-    });
+  const unregister = useCallback(
+    (id: string) => {
+      handles.current.delete(id);
+      // 注销必须**同时**清掉该字段的不可卸载登记，否则已卸载字段会永久阻塞门禁
+      const hadUnsafe = unsafeRef.current.delete(id);
+      setErrors((prev) => {
+        if (!(id in prev)) return prev;
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
+      if (hadUnsafe) notify();
+    },
+    [notify],
+  );
+
+  /**
+   * B4-R2：字段主动上报"我是否不可安全卸载"。
+   *
+   * 这是 raw/error/IME/saving 变化的**唯一入口**：
+   * 字段在真实状态变化时调用它 → 父层收到被动通知 → 聚合重算。
+   */
+  const reportUnsafe = useCallback(
+    (id: string, unsafe: boolean) => {
+      const prev = unsafeRef.current.get(id) ?? false;
+      if (prev === unsafe) return;
+      unsafeRef.current.set(id, unsafe);
+      notify();
+    },
+    [notify],
+  );
+
+  const hasUnsafeField = useCallback((): boolean => {
+    for (const v of unsafeRef.current.values()) if (v) return true;
+    // 兜底：未上报过的字段用 isUnsafeToUnmount/flush 判定
+    for (const [id, handle] of handles.current) {
+      if (unsafeRef.current.has(id)) continue;
+      try {
+        if (handle.isUnsafeToUnmount ? handle.isUnsafeToUnmount() : !handle.flush().ok) return true;
+      } catch {
+        return true; // 探测失败按脏处理（保守）
+      }
+    }
+    return false;
   }, []);
+
+  const unsafeFieldIds = useCallback((): string[] => {
+    const out: string[] = [];
+    for (const [id, v] of unsafeRef.current) if (v) out.push(id);
+    return out;
+  }, []);
+
+  const registeredIds = useCallback((): string[] => Array.from(handles.current.keys()), []);
 
   const flushAll = useCallback((): DraftFlushOutcome => {
     const found: Record<string, string> = {};
@@ -85,6 +211,31 @@ export function useDraftForm(): DraftFormApi {
     return { ok: Object.keys(found).length === 0, errors: found, values };
   }, []);
 
+  /**
+   * **被动**合法性探测（B4-R1 修复循环风险）。
+   *
+   * <p>`flushAll()` 会无条件 `setErrors(新对象)`，而 form 的 useMemo 依赖 errors，
+   * 于是在 effect 里调用它就会形成
+   * `effect → setErrors → 新 form → effect` 的**自激循环**
+   * （Codex 静态审查指出的真实可达回归）。
+   *
+   * <p>本函数只读各字段当前 raw 文本并解析，**不写任何 state**，
+   * 因此可以安全地在 effect / 渲染期用于"内部 raw 是否干净"的观察。
+   *
+   * @returns true 表示所有已注册字段的 raw 都合法（无空/未完/非法）
+   */
+  const probeRawValid = useCallback((): boolean => {
+    for (const handle of handles.current.values()) {
+      try {
+        const r = handle.flush();
+        if (!r.ok) return false;
+      } catch {
+        return false;
+      }
+    }
+    return true;
+  }, []);
+
   const resetAll = useCallback(() => {
     for (const handle of handles.current.values()) handle.reset();
     setErrors({});
@@ -92,9 +243,41 @@ export function useDraftForm(): DraftFormApi {
 
   const clearErrors = useCallback(() => setErrors({}), []);
 
+  /**
+   * B4-R2：把 `reportUnsafe` 挂到返回对象上（字段侧调用）。
+   *
+   * 单独命名 `_reportUnsafe` 避免与公开 API 混淆；字段组件通过
+   * `form._reportUnsafe?.(fieldId, unsafe)` 上报。
+   */
   return useMemo(
-    () => ({ register, unregister, flushAll, resetAll, errors, clearErrors }),
-    [register, unregister, flushAll, resetAll, errors, clearErrors],
+    () => ({
+      register,
+      unregister,
+      flushAll,
+      probeRawValid,
+      resetAll,
+      errors,
+      clearErrors,
+      subscribe,
+      hasUnsafeField,
+      unsafeFieldIds,
+      registeredIds,
+      _reportUnsafe: reportUnsafe,
+    }),
+    [
+      register,
+      unregister,
+      flushAll,
+      probeRawValid,
+      resetAll,
+      errors,
+      clearErrors,
+      subscribe,
+      hasUnsafeField,
+      unsafeFieldIds,
+      registeredIds,
+      reportUnsafe,
+    ],
   );
 }
 
@@ -145,9 +328,34 @@ export function parseDraftNumber(raw: string, opts: ParseDraftNumberOptions = {}
  *
  * 空串必须保留到用户修正或显式 reset()。
  */
+/**
+ * 外部 value 变化时，是否应当**采纳**并覆盖本地草稿。
+ *
+ * ── B2/G3 修复的真实缺陷（Codex 真实 CUA 确证）──────────────
+ * 旧实现 `void draft` —— **完全忽略草稿内容**，只要 `value !== lastCommitted`
+ * 就无条件采纳。于是真实路径：
+ *   用户在精确框输入未完 `7.` → 点 range 拖动 → 输入框失焦（focused=false）
+ *   → range 的 onChange 让外部 value 从 5.5 变 15.5
+ *   → 本函数返回 true → 草稿被改成 `15.5`、**错误被清** → 后续提交写新段。
+ * 用户的未完/非法输入被静默吞掉。
+ *
+ * ── 现在的规则 ────────────────────────────────────────────────
+ * 只有**干净草稿**（用户没有未提交意图）才采纳外部值：
+ *   · 草稿与已提交基线一致 → 干净 → 采纳（保持外部同步）；
+ *   · 草稿为空串、未完（`7.`）、非法、或与基线不同 → **保留草稿**，不采纳。
+ * 空串的保留语义与既有 F4-I02 修复一致（不能把"清空必填项"洗回旧值）。
+ */
 export function shouldSyncExternal(value: number, lastCommitted: number, draft: string): boolean {
-  void draft;
-  return value !== lastCommitted;
+  // 外部值没变：不需要同步
+  if (value === lastCommitted) return false;
+  // 草稿与已提交基线一致 = 用户没有未提交意图 → 可以采纳外部更新
+  const baseline = String(lastCommitted);
+  if (draft === baseline) return true;
+  /**
+   * 草稿非空但与基线不同 → 用户有未提交意图（含未完 `7.`、非法 `99999`）→ 保留。
+   * 草稿为空 → 也保留（既有 F4-I02 语义：空串要留到用户修正）。
+   */
+  return false;
 }
 
 /**

@@ -6,7 +6,12 @@
    · 返回结构化错误路径，便于在预览界面指出哪里坏了。 */
 
 import type {
+  CardioEntry,
+  CardioParams,
+  CardioPreset,
+  CardioSegment,
   DropSetTarget,
+  PlanCardio,
   ExerciseTarget,
   Plan,
   PlanDay,
@@ -23,6 +28,9 @@ import type {
    这里不再保留任何本地上限字面量，保证「编辑器能生成的合法数据」与「备份能接受的合法数据」
    是同一组数字（此前计划 60 / 训练 slice 60 不一致，导致 61 个动作导入后静默只剩 60）。 */
 import {
+  MAX_CARDIO_ENTRIES,
+  MAX_CARDIO_MS,
+  MAX_CARDIO_SEGMENTS,
   MAX_DAYS,
   MAX_EXERCISES,
   MAX_LOGGED_REPS,
@@ -34,9 +42,17 @@ import {
   MAX_SET_ROWS,
   MAX_STAGES_ACCEPTED,
   MAX_STRAIGHT_SETS,
+  MAX_INCLINE_PCT,
+  MAX_SPEED_KMH,
+  MAX_STAIR_LEVEL,
   MAX_TEXT,
   MAX_WEIGHT,
+  MIN_INCLINE_PCT,
+  MIN_SPEED_KMH,
+  MIN_STAIR_LEVEL,
 } from '../domain/limits';
+import { validateCardioEntry as validateCardioEntryInvariants } from '../domain/cardio';
+import { isLocalDateKey } from '../domain/localDate';
 
 export interface ValidationIssue {
   path: string;
@@ -301,15 +317,62 @@ function validatePlanDay(c: Ctx, v: unknown, path: string): PlanDay | null {
     if (warmups.length !== v.warmups.length) c.add(`${path}.warmups`, '存在无法解析的热身项');
   }
 
+  const kind = oneOf(c, v.kind, `${path}.kind`, ['train', 'cardio', 'rest'] as const) ?? 'train';
+
+  // 计划有氧目标（仅 cardio 日有意义）
+  let planCardio: PlanCardio[] | undefined;
+  if (v.cardio !== undefined) {
+    if (kind !== 'cardio') {
+      c.add(`${path}.cardio`, '只有有氧日才能包含计划有氧目标');
+    } else if (!Array.isArray(v.cardio)) {
+      c.add(`${path}.cardio`, '计划有氧目标必须是数组');
+    } else if (v.cardio.length > MAX_CARDIO_ENTRIES) {
+      c.add(`${path}.cardio`, `有氧项目数 ${v.cardio.length} 超过上限 ${MAX_CARDIO_ENTRIES}`);
+    } else {
+      planCardio = v.cardio
+        .map((pc, i) => validatePlanCardio(c, pc, `${path}.cardio[${i}]`))
+        .filter((x): x is PlanCardio => x !== null);
+      if (planCardio.length !== v.cardio.length) c.add(`${path}.cardio`, '存在无法解析的有氧目标');
+    }
+  }
+
   return {
     id: dayId,
     name: str(c, v.name, `${path}.name`, { max: 100 }),
-    focus: oneOf(c, v.focus, `${path}.focus`, ['chest', 'back', 'legs'] as const) ?? 'chest',
-    round: oneOf(c, v.round, `${path}.round`, ['A', 'B'] as const) ?? 'A',
-    kind: oneOf(c, v.kind, `${path}.kind`, ['train', 'rest'] as const) ?? 'train',
+    // focus/round 仅力量日适用；非力量日不伪造（旧数据已有值原样保留）
+    ...(kind === 'train'
+      ? {
+          /**
+           * G4 模型边界（已裁决）：力量日的 focus/round **可省略**，
+           * 缺省时不再隐式补 chest/A（否则新自定义力量日会被静默改写）。
+           * 显式提供时仍按既有合法枚举校验，非法值由 oneOf 记录错误并返回 undefined。
+           */
+          ...(v.focus !== undefined
+            ? {
+                focus:
+                  oneOf(c, v.focus, `${path}.focus`, ['chest', 'back', 'legs'] as const) ?? undefined,
+              }
+            : {}),
+          ...(v.round !== undefined
+            ? { round: oneOf(c, v.round, `${path}.round`, ['A', 'B'] as const) ?? undefined }
+            : {}),
+        }
+      : {
+          ...(v.focus !== undefined
+            ? {
+                focus:
+                  oneOf(c, v.focus, `${path}.focus`, ['chest', 'back', 'legs'] as const) ?? undefined,
+              }
+            : {}),
+          ...(v.round !== undefined
+            ? { round: oneOf(c, v.round, `${path}.round`, ['A', 'B'] as const) ?? undefined }
+            : {}),
+        }),
+    kind,
     restNote: v.restNote === undefined ? undefined : str(c, v.restNote, `${path}.restNote`, { max: 400, optional: true }),
     warmups,
     exercises,
+    ...(planCardio !== undefined ? { cardio: planCardio } : {}),
   };
 }
 
@@ -513,6 +576,75 @@ function validateSession(c: Ctx, v: unknown, path: string): Session | null {
     c.add(`${path}.endedAt`, '结束时间早于开始时间');
   }
 
+  // 解析 status 一次：终态校验与返回对象共用，避免漏洞与重复解析
+  const statusParsed =
+    oneOf(c, v.status, `${path}.status`, ['active', 'completed', 'discarded'] as const) ?? 'completed';
+
+  // ── 有氧项目（第2阶段）：逐层校验并**带入返回对象** ──
+  let cardioEntries: CardioEntry[] = [];
+  if (v.cardio !== undefined) {
+    if (!Array.isArray(v.cardio)) {
+      c.add(`${path}.cardio`, '有氧项目必须是数组');
+    } else if (v.cardio.length > MAX_CARDIO_ENTRIES) {
+      c.add(`${path}.cardio`, `有氧项目数 ${v.cardio.length} 超过上限 ${MAX_CARDIO_ENTRIES}`);
+    } else {
+      cardioEntries = v.cardio
+        .map((ce, i) => validateCardioEntry(c, ce, `${path}.cardio[${i}]`))
+        .filter((x): x is CardioEntry => x !== null);
+      if (cardioEntries.length !== v.cardio.length) c.add(`${path}.cardio`, '存在无法解析的有氧项目');
+      if (cardioEntries.filter((x) => x.status === 'running').length > 1) {
+        c.add(`${path}.cardio`, '同一次训练最多只能有一个正在运行的有氧项目');
+      }
+      /**
+       * REVIEW-2 #2：**终态记录不得残留运行痕迹**。
+       *
+       * session.status 为 completed/discarded 时，任何 cardio entry 都不能
+       * 仍是 running、带非空 runningSinceAt 锚点或有未封口段 ——
+       * 否则"已结束的备份"里计时还在增长，且这类结构是 finish/discard
+       * 封口逻辑本该消除的。合法 pending（从未开始、无时长、无开段）允许保留。
+       * 旧力量/v1 没有 cardio 字段，天然不受影响（不重建、不清空旧历史）。
+       */
+      // 用解析后的 status（缺省/非法值也会走到 completed 默认），避免漏洞
+      const terminal = statusParsed === 'completed' || statusParsed === 'discarded';
+      if (terminal) {
+        cardioEntries.forEach((ce, i) => {
+          const cp = `${path}.cardio[${i}]`;
+          if (ce.status === 'running') {
+            c.add(`${cp}.status`, '训练已结束，有氧项目不能仍处于运行状态');
+          }
+          if (ce.runningSinceAt !== null) {
+            c.add(`${cp}.runningSinceAt`, '终态记录不应保留运行锚点');
+          }
+          if (ce.segments.some((sg) => sg.endElapsedMs === null)) {
+            c.add(`${cp}.segments`, '终态记录不应存在未封口分段');
+          }
+        });
+      }
+    }
+  }
+
+  // 完全休息：本地日期键
+  let restDateParsed: string | undefined;
+  if (v.restDate !== undefined) {
+    if (!isLocalDateKey(v.restDate)) {
+      c.add(`${path}.restDate`, '休息日期必须是本地 YYYY-MM-DD');
+    } else {
+      restDateParsed = v.restDate;
+    }
+  }
+
+  // 整次训练暂停导致被停住的有氧 id 列表
+  let pausedBySession: string[] | undefined;
+  if (v.cardioPausedBySession !== undefined) {
+    if (!Array.isArray(v.cardioPausedBySession)) {
+      c.add(`${path}.cardioPausedBySession`, '必须是数组');
+    } else {
+      pausedBySession = v.cardioPausedBySession.map((x, i) =>
+        str(c, x, `${path}.cardioPausedBySession[${i}]`, { max: 120 }),
+      );
+    }
+  }
+
   return {
     id: str(c, v.id, `${path}.id`, { max: 120 }),
     planId: str(c, v.planId, `${path}.planId`, { max: 120 }),
@@ -520,8 +652,16 @@ function validateSession(c: Ctx, v: unknown, path: string): Session | null {
     day: {
       dayId: str(c, day.dayId, `${path}.day.dayId`, { max: 120 }),
       dayName: str(c, day.dayName, `${path}.day.dayName`, { max: 100 }),
-      focus: oneOf(c, day.focus, `${path}.day.focus`, ['chest', 'back', 'legs'] as const) ?? 'chest',
-      round: oneOf(c, day.round, `${path}.day.round`, ['A', 'B'] as const) ?? 'A',
+      // focus/round 可选：非力量记录不伪造；旧记录已有值原样保留
+      ...(day.focus !== undefined
+        ? {
+            focus:
+              oneOf(c, day.focus, `${path}.day.focus`, ['chest', 'back', 'legs'] as const) ?? undefined,
+          }
+        : {}),
+      ...(day.round !== undefined
+        ? { round: oneOf(c, day.round, `${path}.day.round`, ['A', 'B'] as const) ?? undefined }
+        : {}),
       partText: str(c, day.partText, `${path}.day.partText`, { max: 300 }),
     },
     cycleIndexAtStart:
@@ -532,7 +672,7 @@ function validateSession(c: Ctx, v: unknown, path: string): Session | null {
         : num(c, v.targetSetsAtStart, `${path}.targetSetsAtStart`, { min: 0, max: 5000, integer: true }) ?? undefined,
     startedAt: startedAt ?? Date.now(),
     endedAt,
-    status: oneOf(c, v.status, `${path}.status`, ['active', 'completed', 'discarded'] as const) ?? 'completed',
+    status: statusParsed,
     pausedMs: num(c, v.pausedMs, `${path}.pausedMs`, { min: 0, max: 86400000, integer: true }) ?? 0,
     pausedAt: v.pausedAt === null || v.pausedAt === undefined ? null : timestamp(c, v.pausedAt, `${path}.pausedAt`, { nullable: true }),
     warmups,
@@ -550,6 +690,22 @@ function validateSession(c: Ctx, v: unknown, path: string): Session | null {
         ? undefined
         : num(c, v.revision, `${path}.revision`, { min: 0, max: Number.MAX_SAFE_INTEGER, integer: true }) ??
           undefined,
+    // ── 第2阶段字段（全部可选；缺省合法）──
+    ...(v.kind === undefined
+      ? {}
+      : {
+          kind:
+            oneOf(c, v.kind, `${path}.kind`, ['strength', 'cardio', 'rest'] as const) ?? undefined,
+        }),
+    ...(v.origin === undefined
+      ? {}
+      : {
+          origin:
+            oneOf(c, v.origin, `${path}.origin`, ['plan', 'temporary'] as const) ?? undefined,
+        }),
+    ...(restDateParsed !== undefined ? { restDate: restDateParsed } : {}),
+    cardio: cardioEntries,
+    ...(pausedBySession !== undefined ? { cardioPausedBySession: pausedBySession } : {}),
   };
 }
 
@@ -631,5 +787,163 @@ export function validateDataDeep(data: unknown): DeepValidation<ValidatedData> {
       settings: Array.isArray(data.settings) ? (data.settings as unknown[]) : [],
     },
     warnings,
+  };
+}
+
+/* ── 第2阶段：有氧 / 休息字段的逐层校验 ────────────────
+   注意：validate 是**按已知字段重建对象**，不是原样保留；
+   新字段必须逐层验证并写回返回对象，否则导出 JSON 里有字段
+   也不代表恢复后还在（往返会丢）。 */
+
+function validateCardioParams(c: Ctx, v: unknown, path: string, preset: CardioPreset): CardioParams | null {
+  if (!isObj(v)) {
+    c.add(path, '有氧参数必须是对象');
+    return null;
+  }
+  const out: CardioParams = {};
+  const allowed = new Set<keyof CardioParams>(
+    preset === 'treadmill-incline' ? ['speedKmh', 'inclinePct'] : ['level'],
+  );
+
+  // 不适用字段必须缺省
+  for (const key of ['speedKmh', 'inclinePct', 'level'] as const) {
+    if (v[key] !== undefined && !allowed.has(key)) {
+      c.add(`${path}.${key}`, '该预设不使用此参数');
+    }
+  }
+
+  if (preset === 'treadmill-incline') {
+    const speed = num(c, v.speedKmh, `${path}.speedKmh`, {
+      min: MIN_SPEED_KMH,
+      max: MAX_SPEED_KMH,
+    });
+    if (speed !== null) out.speedKmh = speed;
+    const inc = num(c, v.inclinePct, `${path}.inclinePct`, {
+      min: MIN_INCLINE_PCT,
+      max: MAX_INCLINE_PCT,
+    });
+    if (inc !== null) out.inclinePct = inc;
+  } else {
+    const level = num(c, v.level, `${path}.level`, {
+      min: MIN_STAIR_LEVEL,
+      max: MAX_STAIR_LEVEL,
+      integer: true,
+    });
+    if (level !== null) out.level = level;
+  }
+  return out;
+}
+
+function validateCardioSegment(c: Ctx, v: unknown, path: string, preset: CardioPreset): CardioSegment | null {
+  if (!isObj(v)) {
+    c.add(path, '有氧分段必须是对象');
+    return null;
+  }
+  const params = validateCardioParams(c, v.params, `${path}.params`, preset);
+  const startElapsedMs = num(c, v.startElapsedMs, `${path}.startElapsedMs`, {
+    min: 0,
+    max: MAX_CARDIO_MS,
+    integer: true,
+  });
+  const endElapsedMs =
+    v.endElapsedMs === null || v.endElapsedMs === undefined
+      ? null
+      : num(c, v.endElapsedMs, `${path}.endElapsedMs`, { min: 0, max: MAX_CARDIO_MS, integer: true });
+  if (endElapsedMs !== null && startElapsedMs !== null && endElapsedMs < startElapsedMs) {
+    c.add(`${path}.endElapsedMs`, '分段终点早于起点（负时长）');
+  }
+  return {
+    id: str(c, v.id, `${path}.id`, { max: 120 }),
+    startElapsedMs: startElapsedMs ?? 0,
+    endElapsedMs,
+    params: params ?? {},
+  };
+}
+
+function validateCardioEntry(c: Ctx, v: unknown, path: string): CardioEntry | null {
+  if (!isObj(v)) {
+    c.add(path, '有氧项目必须是对象');
+    return null;
+  }
+  const preset = oneOf(c, v.preset, `${path}.preset`, ['treadmill-incline', 'stair-climber'] as const);
+  if (!preset) {
+    c.add(`${path}.preset`, '有氧预设不合法');
+    return null;
+  }
+  const status = oneOf(c, v.status, `${path}.status`, ['pending', 'running', 'paused', 'done'] as const) ?? 'pending';
+  const currentParams = validateCardioParams(c, v.currentParams, `${path}.currentParams`, preset) ?? {};
+  const target =
+    v.target === null || v.target === undefined
+      ? null
+      : validateCardioParams(c, v.target, `${path}.target`, preset);
+
+  let segments: CardioSegment[] = [];
+  if (!Array.isArray(v.segments)) {
+    c.add(`${path}.segments`, '缺少分段数组');
+  } else if (v.segments.length > MAX_CARDIO_SEGMENTS) {
+    c.add(`${path}.segments`, `分段数 ${v.segments.length} 超过上限 ${MAX_CARDIO_SEGMENTS}`);
+  } else {
+    segments = v.segments
+      .map((s, i) => validateCardioSegment(c, s, `${path}.segments[${i}]`, preset))
+      .filter((x): x is CardioSegment => x !== null);
+    if (segments.length !== v.segments.length) c.add(`${path}.segments`, '存在无法解析的分段');
+  }
+
+  const elapsedMs = num(c, v.elapsedMs, `${path}.elapsedMs`, {
+    min: 0,
+    max: MAX_CARDIO_MS,
+    integer: true,
+  }) ?? 0;
+  const runningSinceAt =
+    v.runningSinceAt === null || v.runningSinceAt === undefined
+      ? null
+      : timestamp(c, v.runningSinceAt, `${path}.runningSinceAt`, { nullable: true });
+
+  if (status === 'running' && runningSinceAt === null) {
+    c.add(`${path}.runningSinceAt`, '运行中的有氧必须有墙钟锚点');
+  }
+  if (status !== 'running' && runningSinceAt !== null) {
+    c.add(`${path}.runningSinceAt`, '非运行状态不应保留锚点');
+  }
+
+  // 分段不变量（与运行时同一套规则）
+  const entryForCheck: CardioEntry = {
+    id: str(c, v.id, `${path}.id`, { max: 120 }),
+    preset,
+    name: str(c, v.name, `${path}.name`, { max: 100 }),
+    planCardioId:
+      v.planCardioId === null || v.planCardioId === undefined
+        ? null
+        : str(c, v.planCardioId, `${path}.planCardioId`, { max: 120 }),
+    target,
+    elapsedMs,
+    runningSinceAt,
+    status,
+    currentParams,
+    segments,
+    note: v.note === undefined ? undefined : str(c, v.note, `${path}.note`, { max: MAX_TEXT, optional: true }),
+  };
+  for (const issue of validateCardioEntryInvariants(entryForCheck)) {
+    c.add(`${path}.${issue.path}`, issue.message);
+  }
+  return entryForCheck;
+}
+
+function validatePlanCardio(c: Ctx, v: unknown, path: string): PlanCardio | null {
+  if (!isObj(v)) {
+    c.add(path, '计划有氧目标必须是对象');
+    return null;
+  }
+  const preset = oneOf(c, v.preset, `${path}.preset`, ['treadmill-incline', 'stair-climber'] as const);
+  if (!preset) {
+    c.add(`${path}.preset`, '有氧预设不合法');
+    return null;
+  }
+  return {
+    id: str(c, v.id, `${path}.id`, { max: 120 }),
+    preset,
+    name: str(c, v.name, `${path}.name`, { max: 100 }),
+    target: validateCardioParams(c, v.target, `${path}.target`, preset) ?? {},
+    note: v.note === undefined ? undefined : str(c, v.note, `${path}.note`, { max: MAX_TEXT, optional: true }),
   };
 }

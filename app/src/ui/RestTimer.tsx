@@ -7,6 +7,20 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { fmtCountdown } from '../lib/format';
+import {
+  cancelRestReminder,
+  getActiveRest,
+  newRestToken,
+  scheduleRestReminder,
+  type RestScheduleOrigin,
+} from '../lib/restReminder';
+import { RestScheduleController } from '../lib/restSchedule';
+import {
+  clearRestTimerSnapshot,
+  decideRestore,
+  loadRestTimerSnapshot,
+  saveRestTimerSnapshot,
+} from '../lib/restTimerSnapshot';
 
 export interface RestTimerApi {
   /** 当前是否在计时（含暂停态） */
@@ -15,58 +29,703 @@ export interface RestTimerApi {
   endsAt: number | null;
   /** 暂停时冻结的剩余毫秒 */
   pausedRemaining: number | null;
+  /** 本次休息的唯一 token（原生去重与身份核验用） */
+  token: string | null;
+  /**
+   * 是否还有**未完成的原生取消责任**（B4-R3 F2）。
+   *
+   * <p>为 true 表示：用户已经暂停/停止，但原生按身份取消**失败**（例如写盘失败，
+   * 身份与 alarm 被正确保留）。此时界面不能假装"已经停了" —— 提醒仍可能响，
+   * 必须如实提示并给出可重试入口。
+   */
+  cancelPending: boolean;
+  /** 最近一次取消失败的短原因；无失败为 null */
+  cancelErrorReason: string | null;
+  /**
+   * 是否存在**已确认失败**的取消（区别于"正在取消"）。
+   *
+   * <p>UI 只在这个为 true 时才提示"取消未完成 + 重试"，
+   * 避免刚点暂停（请求在途）就闪错误。
+   */
+  cancelFailed: boolean;
   start: (sec: number) => void;
   pause: () => void;
   resume: () => void;
   adjust: (deltaSec: number) => void;
   stop: () => void;
+  /** 手动重试未完成的精确取消（只按登记的原始身份，不会误伤新计时） */
+  retryCancel: () => void;
 }
 
-export function useRestTimer(defaultSec: number): RestTimerApi {
+export function useRestTimer(
+  defaultSec: number,
+  /**
+   * 归属的训练实例 ID。传入后计时会按 session 持久化，
+   * 页面重建（切后台被回收 / 重新进入）可恢复（BRIEF 第2项）。
+   */
+  sessionId?: string,
+): RestTimerApi {
   const [endsAt, setEndsAt] = useState<number | null>(null);
   const [pausedRemaining, setPausedRemaining] = useState<number | null>(null);
+  /** 本次休息的身份：原生提醒与页面状态共用同一个 token */
+  const [token, setToken] = useState<string | null>(null);
   const defaultRef = useRef(defaultSec);
   defaultRef.current = defaultSec;
+  /** 当前 token 的同步镜像：供 async 回调读到最新值（避免闭包过期） */
+  const tokenRef = useRef<string | null>(null);
+  /** 当前代次：由控制器在响应归属判定后提交，取消/消费必须带上 */
+  const genRef = useRef<number>(0);
+  /**
+   * B4-R3 F2：未完成的**原生取消责任**镜像。
+   *
+   * <p>控制器的责任表是权威事实，但它是同步 getter、不会触发 React 渲染。
+   * 这里用一个轻量 tick 把"责任数量/失败原因"反映到界面，
+   * 让"暂停了但原生取消失败"不再是静默现象。
+   */
+  const [cancelDutyTick, setCancelDutyTick] = useState(0);
+  const bumpCancelDuty = useCallback(() => setCancelDutyTick((n) => n + 1), []);
+  /** sessionId 的同步镜像（供回调读取最新值） */
+  const sessionRef = useRef<string | undefined>(sessionId);
+  sessionRef.current = sessionId;
+
+  /**
+   * 排程协调器：负责异步响应的归属、迟到补偿与代次提交（REVIEW-1 #2）。
+   * 用 ref 持有，保证整个页面实例只有一份。
+   */
+  /** 最近一次写入快照的输入（onCommit 回写时需要复用同样的 endsAt/paused/status） */
+  const lastPersistRef = useRef<{
+    token: string;
+    status: 'running' | 'paused';
+    endsAt: number | null;
+    pausedRemaining: number | null;
+  } | null>(null);
+
+  /**
+   * 原生确认排程成功 → **立刻把代次回写进快照**（REVIEW-2 #1 断点一）。
+   *
+   * start() 写快照时原生还没回，generation 只能是 null；
+   * 若不在 ack 后回写，快照永久停在 null，重建后无凭据可取消原生提醒
+   * （真实 Chrome 链路已复现该失败）。
+   */
+  /**
+   * 当前实例的**实时状态镜像**（用于 ack 回写时判断真实 UI 状态）。
+   *
+   * REVIEW-3 #1 指出：旧组件（或本次休息已被暂停/取代）的迟到 ack
+   * 不能把**新组件已暂停**的同 token 快照回写成 running。
+   * 因此回写必须基于"此刻真实的 UI 状态"，而不是某次 persist 的历史快照。
+   */
+  const liveStateRef = useRef<{
+    token: string | null;
+    status: 'running' | 'paused';
+    endsAt: number | null;
+    pausedRemaining: number | null;
+  }>({ token: null, status: 'running', endsAt: null, pausedRemaining: null });
+
+  const onScheduleCommitted = useCallback(
+    (committedToken: string, generation: number) => {
+      /**
+       * REVIEW-4 #1：**旧实例卸载后必须真正失效回写**。
+       *
+       * 旧实现只比较本实例自己的 liveStateRef —— 它永远认为自己在 running，
+       * 根本不知道新页面已经 paused，于是迟到的 ack 会把真实快照改回 running。
+       * 这里用 controller 的 disposed 门禁（组件卸载时置位）阻断旧实例回写；
+       * 注意**只阻断回写，不取消原生提醒**（提醒可能正被新页面接管）。
+       */
+      if (controller.isDisposed) return;
+      const sid = sessionRef.current;
+      if (!sid) return;
+      // 只处理「当前这次休息」：旧 token 的迟到 ack 一律忽略
+      if (tokenRef.current !== committedToken) return;
+      const live = liveStateRef.current;
+      if (live.token !== committedToken) return;
+      /**
+       * 关键：ack 只补 generation，**不改写 status**。
+       * 若此刻已暂停，就保持 paused（不能回写成 running）。
+       */
+      genRef.current = generation;
+      saveRestTimerSnapshot({
+        sessionId: sid,
+        token: committedToken,
+        generation,
+        intentWatermark: intentSeqRef.current,
+        endsAt: live.status === 'running' ? live.endsAt : null,
+        pausedRemaining: live.status === 'paused' ? live.pausedRemaining : null,
+        status: live.status,
+      });
+    },
+    [],
+  );
+
+  /**
+   * 最近一次**用户操作**的来源（A3 #3）。
+   *
+   * 只有 start / resume / 非零用户调整会写 user-*；自动恢复与 adopt 保持非 user，
+   * 因此不会给原生"偷偷启动前台服务"的许可。
+   */
+  const pendingOriginRef = useRef<RestScheduleOrigin>('query');
+  /**
+   * B4-R2 优先级一 #3：**明确用户新意图**的单调递增编号。
+   *
+   * 只有"用户真的点了动作"（开始/继续/+15）才 +1；
+   * 自动恢复、adopt、核对查询都不推进 —— 它们必须保持原生的
+   * already-fired 门禁，否则旧请求重放会重新响铃。
+   */
+  const intentSeqRef = useRef(0);
+  const nextIntentId = (): number => {
+    intentSeqRef.current += 1;
+    return intentSeqRef.current;
+  };
+  const controllerRef = useRef<RestScheduleController | null>(null);
+  /** onCommit 的 ref 间接层：控制器在首次渲染前就要构造，此时 callback 尚未定义 */
+  const onCommitRef = useRef<((token: string, generation: number) => void) | null>(null);
+  if (controllerRef.current === null) {
+    controllerRef.current = new RestScheduleController(
+      {
+        // origin 由每次 arm 的意图决定（见 armWithOrigin）；默认保守为 query
+        /**
+         * B4-R2 优先级一 #1：把**发起目标截止**一起送进原生。
+         *
+         * 旧实现只送 remainingMs，原生在自己的执行时刻重新 now+remainingMs，
+         * 于是桥接排队耗时被加进休息时长 → "UI 归零了、过一会才响"。
+         */
+        schedule: (t, ms, deadlineAtMs, intentId) =>
+          scheduleRestReminder(t, ms, pendingOriginRef.current, deadlineAtMs, intentId),
+        cancel: (identity) => cancelRestReminder(identity),
+        getActive: () => getActiveRest(),
+      },
+      (t, g) => onCommitRef.current?.(t, g),
+      /**
+       * B4-R3 closure · F2 可见状态：责任表变化即刷新。
+       *
+       * <p>旧实现只在 pause/stop 后挂一个 microtask，于是**晚 ACK 的失败**、
+       * stop 之后的 inactive、会话切换等路径都不会再刷新，失败被静默。
+       * 现在由控制器在每次登记/失败/清理时回调，UI 与真实责任保持同步。
+       */
+      () => bumpCancelDuty(),
+      /**
+       * B4-R3 closure · 水位对齐：原生每次排程都会回报当前水位。
+       * 把它抬进内存序号，**不依赖**异步 getActive 是否已返回 ——
+       * 这样旧 v1 快照（没有水位）在查询晚到时也不会拿落后编号去排程；
+       * 万一仍被拒（stale-intent），controller 会用回报水位重发一次。
+       */
+      (lastIntentId) => {
+        if (controllerRef.current?.isDisposed) return;
+        if (Number.isFinite(lastIntentId) && lastIntentId > intentSeqRef.current) {
+          intentSeqRef.current = Math.floor(lastIntentId);
+        }
+      },
+    );
+  }
+  const controller = controllerRef.current;
+  onCommitRef.current = onScheduleCommitted;
+
+  /** 把当前状态写入快照（页面重建后恢复用） */
+  const persist = useCallback((snap: {
+    token: string | null;
+    status: 'running' | 'paused';
+    endsAt: number | null;
+    pausedRemaining: number | null;
+  }) => {
+    // 先更新实时镜像（ack 回写要用它判断此刻真实状态）
+    liveStateRef.current = {
+      token: snap.token,
+      status: snap.status,
+      endsAt: snap.endsAt,
+      pausedRemaining: snap.pausedRemaining,
+    };
+    const sid = sessionRef.current;
+    if (!sid) return;
+    if (!snap.token) {
+      lastPersistRef.current = null;
+      clearRestTimerSnapshot(sid);
+      return;
+    }
+    lastPersistRef.current = {
+      token: snap.token,
+      status: snap.status,
+      endsAt: snap.endsAt,
+      pausedRemaining: snap.pausedRemaining,
+    };
+    saveRestTimerSnapshot({
+      sessionId: sid,
+      token: snap.token,
+      generation: controller.snapshot.generation,
+      /**
+       * B4-R3 closure · 重挂连续性：**水位随快照持久化**。
+       *
+       * 组件重挂会把内存里的 intentSeqRef 归零；不落水位的话，
+       * 恢复后第一次 +15 会带 ≤ 原生水位的编号被拒，
+       * 于是「界面已延长、原生按旧截止」（dev/prod 实测 75s vs 60s）。
+       */
+      intentWatermark: intentSeqRef.current,
+      endsAt: snap.endsAt,
+      pausedRemaining: snap.pausedRemaining,
+      status: snap.status,
+    });
+  }, [controller]);
 
   const start = useCallback((sec?: number) => {
+    pendingOriginRef.current = 'user-start';
+    const nextToken = newRestToken();
+    const ms = Math.max(0, (sec ?? defaultRef.current) * 1000);
+    /**
+     * B4-R2：**用户点击这一刻**就定下绝对目标截止，并交给原生。
+     * UI 与原生从此共享同一个截止真源，排队耗时不再变成额外休息。
+     */
+    const clickNow = Date.now();
+    const targetDeadline = clickNow + ms;
+    tokenRef.current = nextToken;
+    setToken(nextToken);
     setPausedRemaining(null);
-    setEndsAt(Date.now() + (sec ?? defaultRef.current) * 1000);
-  }, []);
+
+    /**
+     * REVIEW-1 #2：交给协调器处理异步归属。
+     * ms<=0（start(0) 跳过）时协调器会取消旧提醒而不排新的 ——
+     * 旧实现直接不排程、也不取消 A，导致旧提醒仍响。
+     */
+    controller.arm(nextToken, ms, targetDeadline, ms > 0 ? nextIntentId() : 0);
+
+    if (ms <= 0) {
+      // 归零：UI 上不显示计时
+      setEndsAt(null);
+      tokenRef.current = null;
+      setToken(null);
+      genRef.current = 0;
+      persist({ token: null, status: 'running', endsAt: null, pausedRemaining: null });
+      return;
+    }
+
+    // 与交给原生的 deadline 用**同一个** clickNow，UI 与原生不产生分叉
+    const nextEndsAt = targetDeadline;
+    setEndsAt(nextEndsAt);
+    persist({ token: nextToken, status: 'running', endsAt: nextEndsAt, pausedRemaining: null });
+  }, [controller, persist]);
 
   const pause = useCallback(() => {
-    setEndsAt((prev) => {
-      if (prev === null) return null;
-      setPausedRemaining(Math.max(0, prev - Date.now()));
-      return null;
+    const prev = liveStateRef.current.endsAt;
+    if (prev === null) return;
+    const remaining = Math.max(0, prev - Date.now());
+    setPausedRemaining(remaining);
+    setEndsAt(null);
+    // 暂停：协调器按身份取消（响应在途时由迟到补偿兜底，REVIEW-1 #2）
+    /**
+     * A4 #2：**删除**这里的 reason-only stop。
+     *
+     * <p>实证可达序列：FGS 运行中 → cancel 的身份 commit 失败 →
+     * Plugin.cancel=false（正确保留身份/alarm/FGS）→ 但真实 hook 仍调用
+     * 无身份的 stopForegroundTimer('paused') → 该入口无条件停 FGS 并放锁。
+     * 于是"取消失败"反而把服务停了，与"正确保留"矛盾。
+     *
+     * <p>现在只让**统一 native cancel 的 durable + 身份结果**决定收束：
+     * disarm(false) 按身份取消；Plugin.cancel 在真正 durable 成功时才停匹配服务。
+     */
+    controller.disarm(false);
+    // F2：取消结果异步返回；无论成功还是失败都要刷新"责任"镜像
+    void Promise.resolve().then(bumpCancelDuty);
+    const t = tokenRef.current;
+    persist({
+      token: t,
+      status: 'paused',
+      endsAt: null,
+      pausedRemaining: remaining,
     });
-  }, []);
+  }, [controller, persist, bumpCancelDuty]);
 
   const resume = useCallback(() => {
-    setPausedRemaining((prev) => {
-      if (prev === null) return null;
-      setEndsAt(Date.now() + prev);
-      return null;
-    });
-  }, []);
+    const prev = liveStateRef.current.pausedRemaining;
+    if (prev === null) return;
+    const resumeNow = Date.now();
+    const nextEndsAt = resumeNow + prev;
+    setEndsAt(nextEndsAt);
+    setPausedRemaining(null);
+    const t = tokenRef.current;
+    pendingOriginRef.current = 'user-resume';
+    if (t && prev > 0) {
+      // 继续：同一 token 重排（协调器推进意图，旧响应不会污染）
+      // B4-R2：携带点击时刻的绝对截止，原生不得再重新 now+remainingMs
+      controller.arm(t, prev, nextEndsAt, nextIntentId());
+    }
+    persist({ token: t, status: 'running', endsAt: nextEndsAt, pausedRemaining: null });
+  }, [controller, persist]);
 
+  /**
+   * 加减时间。
+   *
+   * ── 截止时间基准（修复 G1：归零后 +15 只剩 12/7 秒或计时条消失）──────
+   * 旧实现：`Math.max(Date.now(), prev + deltaSec * 1000)` —— `prev` 是**旧截止时刻**。
+   * 到期后界面只把显示剩余夹到 0，并没有把截止时间推到"现在"，于是：
+   *   · 过期 d 秒再 +15 → 截止 = 旧 endsAt+15 = 现在 + (15-d)，只剩 max(0, 15-d) 秒；
+   *   · d ≥ 15 → 剩余算成 0 → 走归零分支清 token/快照，计时条消失；
+   *   · 真实 Controller 经 JS 桥送出的 remainingMs 同样缩短（12000/7000），
+   *     过期较久则取消旧提醒且不再排新的 —— 后台提醒跟着一起丢。
+   *
+   * 现在的规则（与用户确认的接受标准一致）：
+   *   · **仍有余量**（运行中未到点）→ 当前余量 + delta，等价于旧截止 + delta；
+   *   · **已归零/已过期**（余量 ≤ 0）→ 从**点按当时**重新给完整 delta 秒；
+   *   · **暂停态** → 只改冻结余量，保持暂停，不排闹钟（继续时统一按余量排）。
+   * 减法（−15）在归零后不会把剩余算成负数并清掉计时条，最少夹到 0 仍保持 active，
+   * 让用户还能继续 +15 或跳过。
+   */
   const adjust = useCallback((deltaSec: number) => {
-    setPausedRemaining((prevPaused) => {
-      if (prevPaused !== null) return Math.max(0, prevPaused + deltaSec * 1000);
-      setEndsAt((prev) => (prev === null ? null : Math.max(Date.now(), prev + deltaSec * 1000)));
-      return null;
-    });
-  }, []);
+    const current = liveStateRef.current;
+    if (current.pausedRemaining !== null) {
+      const nextRemaining = Math.max(0, current.pausedRemaining + deltaSec * 1000);
+      setPausedRemaining(nextRemaining);
+      // 暂停态调整：不排闹钟，恢复时统一按剩余时间排
+      const t = tokenRef.current;
+      persist({
+        token: t,
+        status: 'paused',
+        endsAt: null,
+        pausedRemaining: nextRemaining,
+      });
+      return;
+    }
+    const prev = current.endsAt;
+    if (prev === null) return;
+    const now = Date.now();
+    const currentRemaining = Math.max(0, prev - now);
+    /**
+     * 关键：以**当前真实余量**为基准，而不是旧的绝对截止时刻。
+     * 已到期时 currentRemaining=0 → 基准退化为 now，于是给出完整 delta 秒。
+     */
+    const nextRemaining = currentRemaining + deltaSec * 1000;
+    const t = tokenRef.current;
+    if (!t) {
+      // 没有 token（理论上不该出现）：只更新界面余量，不碰原生
+      const nextEndsAt = nextRemaining > 0 ? now + nextRemaining : prev;
+      setEndsAt(nextEndsAt);
+      persist({ token: null, status: 'running', endsAt: nextEndsAt, pausedRemaining: null });
+      return;
+    }
+    if (nextRemaining > 0) {
+      const nextEndsAt = now + nextRemaining;
+      // 正负非零的显式调整来自用户点击；零调整保留保守 query 来源。
+      pendingOriginRef.current = deltaSec === 0 ? 'query' : 'user-adjust';
+      /**
+       * B4-R2：±15 同样必须携带**本次点击算出的绝对截止**。
+       * 否则"减 15"这类用户操作也会被排队耗时抵消掉一部分，
+       * 表现就是"±15 与实际不符"。
+       */
+      /**
+       * B4-R2：**只有正加时**才是"用户明确要求更多可投递时间"的新意图。
+       * −15 不放宽已 fired 门禁（减时间不该让已响过的提醒再响一次）。
+       */
+      controller.arm(t, nextRemaining, nextEndsAt, deltaSec > 0 ? nextIntentId() : 0);
+      setEndsAt(nextEndsAt);
+      persist({ token: t, status: 'running', endsAt: nextEndsAt, pausedRemaining: null });
+      return;
+    }
+    /**
+     * 减到 0 及以下：保持 active（计时条不消失），只是剩余为 0，
+     * 让用户能继续 +15 或跳过。原生提醒按身份取消（不排新的）。
+     * 旧实现在这里清 token/快照并 return null → 计时条消失，正是 G1 的"消失"。
+     */
+    controller.arm(t, 0);
+    const frozenEndsAt = now;
+    setEndsAt(frozenEndsAt);
+    persist({ token: t, status: 'running', endsAt: frozenEndsAt, pausedRemaining: null });
+  }, [controller, persist]);
 
   const stop = useCallback(() => {
     setEndsAt(null);
     setPausedRemaining(null);
-  }, []);
+    tokenRef.current = null;
+    setToken(null);
+    genRef.current = 0;
+    // 跳过/结束：显式全清（不带身份），旧 token 凭据随即失效
+    /**
+     * A4 #2：显式全清仍由这条**明确 cancel(full-clear)** 路径处理
+     * （disarm(true) → 无身份全清 → Plugin.cancel durable 成功后停服务）。
+     * 不再额外发无身份 stop，避免第二个旁路。
+     */
+    controller.disarm(true);
+    void Promise.resolve().then(bumpCancelDuty);
+    persist({ token: null, status: 'running', endsAt: null, pausedRemaining: null });
+  }, [controller, persist, bumpCancelDuty]);
+
+  /**
+   * 重建恢复（BRIEF 第2项）。
+   *
+   * 只在**首次挂载**执行一次；恢复后：
+   * · running 且未到点 → 恢复 UI 与 token，**不重排原生**（原生闹钟本就在，重复排会双提醒）；
+   * · 已到点 → 不恢复、不提醒（避免迟到提醒），清理快照；
+   * · paused → 恢复暂停态，不排原生。
+   */
+  /**
+   * 已绑定的训练实例（REVIEW-2 收尾 P2）。
+   *
+   * 旧实现用 `restoredRef` 只跑一次：同一组件实例的 sessionId 从 A 变 B 时
+   * 不会重新绑定 → 仍显示 A 的计时，随后 pause 还会把 A 的 token 写进 B 的快照
+   * （跨训练污染）。现在按 sessionId 变化重新绑定：
+   *   · 先把旧实例的计时清空（不写入新实例快照）；
+   *   · 再按新实例的快照恢复。
+   */
+  const boundSessionRef = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    const sid = sessionRef.current;
+    /**
+     * REVIEW-4 / StrictMode：同 sessionId 的重放也要**重新接管**。
+     *
+     * 旧逻辑在这里直接 return，于是 StrictMode 的 cleanup→setup 之后
+     * controller 归属没有被重新建立（恢复快照的路径会失效）。
+     * 现在：仅当「同 sessionId 且 controller 仍持有当前意图」时才跳过；
+     * 否则继续走下面的恢复/接管逻辑（幂等，不会重复排程）。
+     */
+    const sameSession = boundSessionRef.current === sid;
+    const controllerHoldsIntent =
+      controller.snapshot.active && controller.snapshot.token === tokenRef.current;
+    if (sameSession && controllerHoldsIntent) return;
+    const prevSid = boundSessionRef.current;
+    boundSessionRef.current = sid;
+
+    /**
+     * 切换训练实例：清空本实例的计时状态与控制器归属。
+     * 注意**不清除**旧实例的快照（它属于旧训练，可能之后还要恢复），
+     * 只清本组件内存态，避免把 A 的 token 写进 B。
+     */
+    if (prevSid !== undefined && prevSid !== sid) {
+      // 仅真正切换训练实例时才清空归属
+      tokenRef.current = null;
+      setToken(null);
+      setEndsAt(null);
+      setPausedRemaining(null);
+      genRef.current = 0;
+      lastPersistRef.current = null;
+      liveStateRef.current = { token: null, status: 'running', endsAt: null, pausedRemaining: null };
+      // 旧实例的原生提醒不应由新实例的控制器持有（只清内存归属，不碰原生与旧快照）
+      controller.reset();
+    }
+    if (!sid) return;
+    const snap = loadRestTimerSnapshot(sid);
+    const decision = decideRestore(snap);
+    if (decision.kind === 'none') return;
+    if (decision.kind === 'expired') {
+      clearRestTimerSnapshot(sid);
+      return;
+    }
+    if (!snap) return;
+
+    tokenRef.current = snap.token;
+    setToken(snap.token);
+    genRef.current = snap.generation ?? 0;
+    /**
+     * B4-R3 closure · **重挂后的编号连续性**。
+     *
+     * <p>组件重挂会让 hook 内存里的意图序号归零；恢复时必须先把水位抬回
+     * 「快照里记录的水位」，否则下一次 +15 会带一个 ≤ 原生水位的编号，
+     * 被原生判成 {@code stale-intent} 拒绝 —— 表现就是
+     * **界面截止延长了、原生仍按旧截止响**（dev/prod 实测 75s vs 60s）。
+     *
+     * <p>兼容旧数据：旧快照没有水位（读成 0）时，向原生 getActive 取
+     * 当前身份的 {@code lastIntentId} 兜底（该字段是附加字段，旧原生无则忽略）。
+     */
+    const restoreWatermark = (value: number | null | undefined): void => {
+      if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return;
+      if (value > intentSeqRef.current) intentSeqRef.current = Math.floor(value);
+    };
+    restoreWatermark(snap.intentWatermark);
+    if (!snap.intentWatermark) {
+      /**
+       * 旧 v1 快照兜底：向原生取当前水位。
+       *
+       * **归属约束**（Codex 只读审源要求）：结果只允许作用在
+       * "仍是同一个 token、仍是同一个 session、本实例仍存活"的计时上，
+       * 绝不拿旧查询去污染新计时。
+       *
+       * 即使查询还没回来用户就点了 +15，也不会产生"UI 延长、原生没排上"：
+       * 那次请求若被判 stale-intent，controller 会用原生回报的水位
+       * **重发一次**（见 dispatch），用户意图不会丢。
+       */
+      const watermarkToken = snap.token;
+      const watermarkSession = sessionRef.current;
+      void getActiveRest()
+        .then((info) => {
+          if (controller.isDisposed) return;
+          if (sessionRef.current !== watermarkSession) return;
+          if (tokenRef.current !== watermarkToken) return;
+          restoreWatermark(info.lastIntentId);
+        })
+        .catch(() => {
+          // 取不到水位不阻塞恢复；stale-intent 自愈与原生门禁仍是兜底
+        });
+    }
+
+    /**
+     * REVIEW-2 #1 断点二：把**已持有的原生提醒交给控制器**。
+     *
+     * 旧实现只写进 UI 的 ref，控制器仍以为"没有活跃意图"；
+     * 于是恢复后 pause/adjust/stop 全部走空分支 → 原生提醒永远不被取消
+     * （真实 Chrome 链路已复现：cancel 调用数 0、active A/gen1 残留）。
+     *
+     * adopt 之后，暂停/加减/停止与新建路径**完全一致**。
+     * 注意：这里**不重排**原生（闹钟本就挂着），也不做全清掩盖。
+     */
+    /**
+     * REVIEW-3 #1：快照 generation 可能为 null —— 这不是"旧版本兼容"，
+     * 而是**正常生命周期窗口**：start() 写快照时原生 ack 还没回来。
+     * 此时必须向原生**实际核对**当前 token/代次，再安全接管；
+     * 不能"保守什么都不做"（那样暂停后仍会提醒）。
+     */
+    const needVerify = snap.generation === null || snap.generation === undefined;
+
+    if (decision.kind === 'resume-running') {
+      if (needVerify) {
+        void controller.adoptVerified(snap.token).then((r) => {
+          /**
+           * REVIEW-4 补充：**陈旧 query 不得控制新计时的 UI/快照**。
+           * owned=false 表示核对期间用户已换计时/暂停/停止，或本实例已卸载 →
+           * 直接丢弃结果（否则会清掉新 B 的界面，而原生 B 仍 active）。
+           */
+          if (!r.owned || controller.isDisposed) return;
+          // 核对期间用户已暂停/停止 → 保持用户的当前状态，不覆盖
+          if (liveStateRef.current.status === 'paused') return;
+          if (tokenRef.current !== snap.token) return;
+          if (r.generation !== null) {
+            genRef.current = r.generation;
+            // 用核实到的真实代次回写快照，后续 pause 才能按身份取消
+            persist({
+              token: snap.token,
+              status: 'running',
+              endsAt: decision.endsAt,
+              pausedRemaining: null,
+            });
+            return;
+          }
+          /**
+           * 原生确实没有这条活跃提醒（已触发/被清）且仍属当前意图 →
+           * 说明这次休息已结束，清 UI 与快照。
+           */
+          if (r.verified && !r.active) {
+            tokenRef.current = null;
+            setToken(null);
+            setEndsAt(null);
+            setPausedRemaining(null);
+            genRef.current = 0;
+            liveStateRef.current = { token: null, status: 'running', endsAt: null, pausedRemaining: null };
+            const sidNow = sessionRef.current;
+            if (sidNow) clearRestTimerSnapshot(sidNow);
+          }
+        });
+      } else {
+        // 自动恢复：明确非用户操作，不授予 FGS 启动许可
+        pendingOriginRef.current = 'snapshot-restore';
+        controller.adopt(snap.token, snap.generation);
+      }
+      setEndsAt(decision.endsAt);
+      setPausedRemaining(null);
+      if (!needVerify) {
+        persist({
+          token: snap.token,
+          status: 'running',
+          endsAt: decision.endsAt,
+          pausedRemaining: null,
+        });
+      }
+      return;
+    }
+    /**
+     * paused 恢复（REVIEW-4 #2）。
+     *
+     * **暂停时原生本来就应该没有 active 提醒**（pause 已经按身份取消过），
+     * 因此绝不能拿 "原生 active=false" 当作"暂停状态已失效"的证据 ——
+     * 那会把合法的暂停余量清空，导致 resume 无从继续（原 9 项已过行为的回归）。
+     *
+     * 正确做法：
+     *   · 暂停快照**直接恢复余量**，不需要向原生核对；
+     *   · 只有用户点「继续」时才重新排程（resume 内部会 arm）；
+     *   · 也不在这里做任何取消（暂停状态下没有需要取消的原生提醒）。
+     * 未知身份的**running** 恢复仍然要核实（见上面的 resume-running 分支）。
+     */
+    controller.adopt(snap.token, snap.generation);
+    setEndsAt(null);
+    setPausedRemaining(decision.pausedRemaining);
+    persist({
+      token: snap.token,
+      status: 'paused',
+      endsAt: null,
+      pausedRemaining: decision.pausedRemaining,
+    });
+    // sessionId 必须进依赖：否则 prop 从 A 变 B 时 effect 不重跑，
+    // 会继续显示 A 的计时（REVIEW-2 收尾 P2 的真实失败原因）
+  }, [controller, persist, sessionId]);
+
+  /**
+   * controller 生命周期与 effect setup/cleanup **正确配对**（REVIEW-4 修正）。
+   *
+   * 背景：React 开发态 StrictMode 会做 setup → cleanup → setup（复用同一
+   * controller 与 refs）。旧实现 cleanup 无条件 `dispose()` 且不再恢复，
+   * 于是重放后的 ack 回写被永久阻断（generation 无法持久化）。
+   *
+   * 现在：
+   *   · setup  → `activate()`：清除失效标记，迟到 ack / query 结果可正常回写；
+   *   · cleanup → `dispose()`：只阻断本实例回写，**不取消原生提醒**
+   *     （可能正被新页面接管），**也不清空归属**（重放后要能继续用）。
+   *
+   * 真正卸载后不会再有 setup，失效标记保持 → 旧实例回写仍被阻断。
+   * 不依赖延迟秒数、不做环境跳过、不移除 StrictMode。
+   */
+  useEffect(() => {
+    controller.activate();
+    return () => {
+      controller.dispose();
+    };
+  }, [controller]);
 
   const active = endsAt !== null || pausedRemaining !== null;
 
+  /**
+   * B4-R3 F2：**可达的重试入口**。
+   *
+   * <p>只重试控制器里登记的原始 (token, generation)，因此不会误取消后来建立的
+   * 新计时；成功后责任释放、`cancelPending` 归 false。
+   */
+  const retryCancel = useCallback(() => {
+    void controller.retryPendingCancels().then(() => bumpCancelDuty());
+  }, [controller, bumpCancelDuty]);
+
+  /** 取消责任镜像（读取 tick 以保证依赖变化时重算） */
+  const cancelState = useMemo(() => {
+    void cancelDutyTick;
+    const snap = controller.snapshot;
+    return {
+      pending: snap.pendingCancels > 0,
+      failed: snap.cancelFailed > 0,
+      reason: snap.cancelErrorReason,
+    };
+  }, [controller, cancelDutyTick]);
+
   return useMemo(
-    () => ({ active, endsAt, pausedRemaining, start, pause, resume, adjust, stop }),
-    [active, endsAt, pausedRemaining, start, pause, resume, adjust, stop],
+    () => ({
+      active,
+      endsAt,
+      pausedRemaining,
+      token,
+      cancelPending: cancelState.pending,
+      cancelErrorReason: cancelState.reason,
+      cancelFailed: cancelState.failed,
+      start,
+      pause,
+      resume,
+      adjust,
+      stop,
+      retryCancel,
+    }),
+    [
+      active,
+      endsAt,
+      pausedRemaining,
+      token,
+      cancelState.pending,
+      cancelState.failed,
+      cancelState.reason,
+      start,
+      pause,
+      resume,
+      adjust,
+      stop,
+      retryCancel,
+    ],
   );
 }
 
@@ -94,14 +753,85 @@ export function RestTimerBar({ timer }: { timer: RestTimerApi }) {
     return Math.max(0, timer.endsAt - Date.now());
   }, [timer.endsAt, timer.pausedRemaining, tick]);
 
+  /**
+   * 到点时**只更新界面状态**，绝不 consume 原生提醒（第二轮预审 P1 #5）。
+   *
+   * 曾经的错误做法：页面倒计时归零就调用 consumeRestReminder，
+   * 而原生 consume 会取消闹钟并标记已消费 —— 但**唯一的提醒出口是 receiver 的通知**，
+   * 于是页面先归零就把尚未发出的通知吞掉了，用户完全不震。
+   * （也不能靠"后台 effect 不会跑"来保护：前台+非精确调度下页面同样会先归零。）
+   *
+   * 现在的规则：
+   *   · 页面归零 → 只把 UI 标成"休息结束"（doneFired），不碰原生；
+   *   · 原生 receiver 到时 → 由它自己按身份核验发**一次**通知；
+   *   · 去重完全由原生身份（token + generation + fired）保证，不依赖页面配合。
+   * 因此"页面先归零、原生广播稍后到达"仍会正常提醒，且只提醒一次。
+   */
   useEffect(() => {
-    if (remainingMs === 0) doneFired.current = true;
+    if (remainingMs !== 0) return;
+    doneFired.current = true;
   }, [remainingMs]);
 
-  if (!active || remainingMs === null) return null;
+  // 新一轮休息（token 变化）时允许界面再次进入"休息结束"态
+  useEffect(() => {
+    doneFired.current = false;
+  }, [timer.token]);
+
+  /**
+   * B4-R3 closure · **F2 真实可见的取消失败与重试入口**。
+   *
+   * <h2>旧实现的真实缺口（dev/prod 独立验收均 FAIL）</h2>
+   * hook 已经能把 {@code cancelPending} 说出来，但实际 {@code RestTimerBar}
+   * 里**没有任何可见说明，也没有可点的重试**；而且旧条在
+   * {@code !active} 时直接 {@code return null} —— 一旦用户「跳过/结束训练」
+   * 让计时条消失，未完成的取消责任就再也看不见（静默丢失）。
+   *
+   * <h2>现在的行为</h2>
+   * <ul>
+   *   <li>只在**已确认失败**时提示"取消未完成，提醒可能仍会响"（产品语言，
+   *       不向用户暴露 commit/durable 等实现词）；请求还在途时不闪错误；</li>
+   *   <li>提供**真实可点**的「重试取消」按钮，走 identity 精确重试；</li>
+   *   <li>即使计时条本身不显示（已停止/无剩余），这段提示仍然可见 ——
+   *       责任不能因为条消失就静默。</li>
+   * </ul>
+   */
+  const cancelNotice =
+    timer.cancelFailed && timer.cancelPending ? (
+      <div
+        role="status"
+        data-rest-cancel-notice="failed"
+        style={{
+          position: 'sticky',
+          top: 0,
+          zIndex: 31,
+          background: 'var(--brick)',
+          color: 'var(--paper)',
+          padding: '8px 12px',
+          margin: '0 -16px',
+          display: 'flex',
+          alignItems: 'center',
+          gap: 10,
+          flexWrap: 'wrap',
+          fontSize: 13,
+          lineHeight: 1.5,
+        }}
+      >
+        <span>提醒未取消，仍可能响。</span>
+        <button
+          className="btn btn-sm btn-ghost"
+          style={{ color: 'inherit', borderColor: 'rgba(255,255,255,.42)', minWidth: 72 }}
+          onClick={timer.retryCancel}
+          aria-label="重试取消提醒"
+        >
+          重试取消
+        </button>
+      </div>
+    ) : null;
+
+  if (!active || remainingMs === null) return cancelNotice;
 
   const done = remainingMs === 0;
-  return (
+  const bar = (
     <div
       style={{
         position: 'sticky',
@@ -188,6 +918,15 @@ export function RestTimerBar({ timer }: { timer: RestTimerApi }) {
         </button>
       </div>
     </div>
+  );
+
+  // 计时条与取消失败提示可能同时存在（暂停后取消失败就是这种状态）
+  if (!cancelNotice) return bar;
+  return (
+    <>
+      {bar}
+      {cancelNotice}
+    </>
   );
 }
 

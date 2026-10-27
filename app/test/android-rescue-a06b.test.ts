@@ -159,6 +159,14 @@ describe('A06b · 真实 persist 链路的救援（绕过离页守卫）', () =>
       saveQueue: { current: Promise.resolve() },
       lockBlockedRef: { current: false },
       editorId: { current: 'ed-old' },
+      /**
+       * persist 的异常路径会调用 rememberDraft(next)，而 rememberDraft 依赖
+       * 这三个 ref（与真实 Session 组件同构）。此前 env 缺失，
+       * 一旦 persist 走到 catch 就会 ReferenceError —— 正是本测试要覆盖的路径。
+       */
+      ownPublishedSeq: { current: 0 },
+      adoptedRescueSeq: { current: 0 },
+      pendingFromRescue: { current: false },
     };
 
     const env = {

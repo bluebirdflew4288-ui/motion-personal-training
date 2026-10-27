@@ -48,14 +48,29 @@ export function deleteDay(plan: Plan, dayId: string): Plan {
   return { ...plan, days, cursor: Math.min(plan.cursor, days.length - 1) };
 }
 
-export function addDay(plan: Plan, focus: PlanDay['focus'] = 'chest'): Plan {
+/**
+ * 新增训练日。
+ *
+ * <p><b>G4 模型边界（已裁决）</b>：新建/空白日**不得隐式补 chest/A**。
+ * 旧实现默认 `focus='chest'` 且固定 `round='A'`，于是"任意分化"被静默改写成
+ * 胸/A，与"新自定义力量日允许省略 focus/round"直接冲突。
+ *
+ * <p>调用方**显式**传入 focus/round 时仍照写（旧明确值保真）；
+ * 不传就不写该字段，绝不猜。
+ */
+export function addDay(
+  plan: Plan,
+  focus?: PlanDay['focus'],
+  round?: PlanDay['round'],
+): Plan {
   // 容量上限：超出后返回原计划（备份校验也只接受这个范围，见 limits.ts）
   if (plan.days.length >= MAX_DAYS) return plan;
   const day: PlanDay = {
     id: newId('day'),
     name: '新训练日',
-    focus,
-    round: 'A',
+    // 只在显式提供时写入；缺省保持"没有该字段"
+    ...(focus !== undefined ? { focus } : {}),
+    ...(round !== undefined ? { round } : {}),
     kind: 'train',
     warmups: [],
     exercises: [],

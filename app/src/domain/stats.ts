@@ -9,6 +9,7 @@
 
 import type { DumbbellBasis, Session, WeightMode } from './types';
 import { summarizeSession } from './session';
+import { sessionKindOf } from './sessionKind';
 import { isoWeekKey } from '../lib/format';
 import { comparabilityLabel } from './identity';
 import { collectMovementFragments, type MovementFragment } from './comparability';
@@ -26,7 +27,13 @@ export interface Overview {
 }
 
 export function buildOverview(sessions: Session[]): Overview {
-  const done = sessions.filter((s) => s.status === 'completed' && s.endedAt);
+  /**
+   * 分母：已结束且**不是完全休息**的记录。
+   * 完全休息不计入训练次数/周次/日类型/首次最近/平均时长/平均组数。
+   */
+  const done = sessions.filter(
+    (s) => s.status === 'completed' && s.endedAt && sessionKindOf(s) !== 'rest',
+  );
   const weekMap = new Map<string, { count: number; sets: number }>();
   const dayMap = new Map<string, { count: number; sets: number }>();
   let totalSets = 0;

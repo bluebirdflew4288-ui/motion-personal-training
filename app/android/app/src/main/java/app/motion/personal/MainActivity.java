@@ -5,6 +5,7 @@ import android.os.Bundle;
 import com.getcapacitor.BridgeActivity;
 
 import app.motion.personal.plugins.NativeFileBridgePlugin;
+import app.motion.personal.plugins.RestReminderPlugin;
 
 /**
  * MOTION 原生入口。
@@ -24,6 +25,8 @@ public class MainActivity extends BridgeActivity {
     protected void onCreate(Bundle savedInstanceState) {
         // 必须在 super.onCreate 之前注册：BridgeActivity.onCreate 里会加载插件表
         registerPlugin(NativeFileBridgePlugin.class);
+        // 需求 2：组间休息到时的原生提醒（AlarmManager + 震动 + 通知）
+        registerPlugin(RestReminderPlugin.class);
         super.onCreate(savedInstanceState);
     }
 }

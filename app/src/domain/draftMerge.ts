@@ -23,7 +23,7 @@
 
    这个模块是纯函数：不读库、不读 React 状态，便于穷举测试。 */
 
-import type { Session, SessionExercise, SessionSet } from './types';
+import type { CardioEntry, Session, SessionExercise, SessionSet } from './types';
 
 /** 草稿在内存里的形态：永远配对自己的基数版本 */
 export interface PendingDraft {
@@ -177,6 +177,72 @@ export function mergeDraftOntoFresh(
   mergeScalar('note', '训练备注');
   mergeScalar('pausedMs', '暂停时长');
   mergeScalar('pausedAt', '暂停时间');
+
+  /* ── 0b. 有氧（第2阶段）：以 **entry 为最小一致单元** 三方合并 ──
+     段会被封口、继续、修改结束边界，因此不能"只增不覆盖"。
+     规则（PHASE-2-DECISIONS §3）：
+       · entry 按稳定 id 合并；
+       · 一边改力量、一边改有氧 → 保留双方；
+       · 同一 entry 双方都相对 base 改动且结果不同 → 明确冲突
+         （不把两条独立计时分支拼成假的连续运动）；
+       · 不同 entry 的非冲突变更合并后仍校验会话级不变量（最多一个 running）。 */
+  const baseCardio = effBase.cardio ?? [];
+  const mineCardio = mine.cardio ?? [];
+  const freshCardio = fresh.cardio ?? [];
+  const cardioTouched =
+    JSON.stringify(mineCardio) !== JSON.stringify(baseCardio) ||
+    JSON.stringify(freshCardio) !== JSON.stringify(baseCardio);
+  if (cardioTouched) {
+    const merged = mergeCardioEntries({
+      base: baseCardio,
+      mine: mineCardio,
+      fresh: freshCardio,
+      conflicts,
+    });
+    if (merged) {
+      next.cardio = merged;
+      // 合并后仍须满足会话级不变量
+      if (merged.filter((c) => c.status === 'running').length > 1) {
+        conflicts.push({
+          path: '有氧计时',
+          message: '合并后出现多个正在运行的有氧项目，已拒绝自动合并',
+          mine: mineCardio.length,
+          theirs: freshCardio.length,
+        });
+        return { ok: false, conflicts, message: summarize(conflicts) };
+      }
+      applied.push('有氧');
+    }
+  }
+
+  /**
+   * G4b：暂停来源 cardioPausedBySession 是**会话级字段**，必须独立于有氧列表
+   * 是否变动都做三方合并 —— 否则「两边只改暂停来源、有氧 entry 内容相同」时
+   * cardioTouched=false，这段会被整体跳过，fresh（空）覆盖 mine 的暂停来源，
+   * resume 无法恢复（真实草稿合并缺口）。
+   */
+  const basePaused = effBase.cardioPausedBySession ?? [];
+  const minePaused = mine.cardioPausedBySession ?? [];
+  const freshPaused = fresh.cardioPausedBySession ?? [];
+  const pausedSame = (a: string[], b: string[]): boolean =>
+    JSON.stringify(a) === JSON.stringify(b);
+  const pausedMineChanged = !pausedSame(minePaused, basePaused);
+  const pausedFreshChanged = !pausedSame(freshPaused, basePaused);
+  if (pausedMineChanged && pausedFreshChanged && !pausedSame(minePaused, freshPaused)) {
+    conflicts.push({
+      path: '暂停来源',
+      message: '两边都改过"因整次暂停而停住的有氧"列表，无法自动合并',
+      mine: minePaused,
+      theirs: freshPaused,
+    });
+    return { ok: false, conflicts, message: summarize(conflicts) };
+  }
+  if (pausedMineChanged || pausedFreshChanged) {
+    next.cardioPausedBySession = pausedMineChanged ? minePaused : freshPaused;
+    applied.push('暂停来源');
+  } else {
+    next.cardioPausedBySession = freshPaused;
+  }
 
   /* ── 1. 动作集合必须一致：增删动作属于结构变化 → 冲突 ── */
   const baseIds = exerciseIds(effBase);
@@ -403,5 +469,145 @@ export function accumulateDraftIntent(
   if (same(next.note, viewBefore.note) && !same(oldDraft.note, oldBase.note)) {
     result.note = oldDraft.note;
   }
+
+  /**
+   * G4a：有氧**按 entry 整体**累积早先的未存意图。
+   *
+   * 旧实现 result 直接用 next，于是「坡度改到 8」的未存意图会在
+   * 随后一次力量输入（坡度那条没动）后被 next（库里仍是 4）覆盖丢失。
+   * 规则与其它字段一致：本次没动 + 旧草稿在此有意图 → 保留旧意图；
+   * 且**整 entry 取舍，不逐标量拼**（避免 status/anchor/segments 混出假时间线）。
+   */
+  result.cardio = accumulateCardio(oldBase, oldDraft, viewBefore, next);
+
+  /** 会话暂停来源同样按"本次没动就保留旧意图"处理 */
+  if (
+    same(next.cardioPausedBySession ?? [], viewBefore.cardioPausedBySession ?? []) &&
+    !same(oldDraft.cardioPausedBySession ?? [], oldBase.cardioPausedBySession ?? [])
+  ) {
+    result.cardioPausedBySession = oldDraft.cardioPausedBySession ?? [];
+  }
   return result;
+}
+
+/**
+ * 有氧 entry 级累积：整 entry 取舍，不逐标量拼。
+ *
+ * @returns 合并后的 cardio 列表（保留旧草稿的未存意图，同时带上本次新意图）
+ */
+export function accumulateCardio(
+  oldBase: Session,
+  oldDraft: Session,
+  viewBefore: Session,
+  next: Session,
+): CardioEntry[] {
+  const base = oldBase.cardio ?? [];
+  const draft = oldDraft.cardio ?? [];
+  const view = viewBefore.cardio ?? [];
+  const nx = next.cardio ?? [];
+
+  // 有氧结构本次是否被改动（增删/换 id）：改了就以 next 为准
+  const viewStruct = view.map((c) => c.id).join('|');
+  const nextStruct = nx.map((c) => c.id).join('|');
+  if (viewStruct !== nextStruct) return nx;
+
+  const byId = (list: CardioEntry[], id: string) => list.find((c) => c.id === id);
+  return nx.map((n) => {
+    const v = byId(view, n.id);
+    const d = byId(draft, n.id);
+    const b = byId(base, n.id);
+    if (!v || !d || !b) return n;
+    const changedNow = !same(n, v);
+    if (changedNow) return n; // 本次新意图优先
+    if (!same(d, b)) return d; // 旧草稿未存意图保留
+    return n;
+  });
+}
+
+
+/**
+ * 有氧 entry 的三方合并（第2阶段）。
+ *
+ * 返回 null 表示已记录冲突（调用方应整体拒绝）。
+ * 合并粒度 = 单个 entry：整个 entry 深比较，不做逐标量拼接
+ * （避免 status/anchor/params/segments 拼出不一致的混合状态）。
+ */
+export function mergeCardioEntries(args: {
+  base: CardioEntry[];
+  mine: CardioEntry[];
+  fresh: CardioEntry[];
+  conflicts: MergeConflict[];
+}): CardioEntry[] | null {
+  const { base, mine, fresh, conflicts } = args;
+  const ids: string[] = [];
+  const seen = new Set<string>();
+  for (const list of [base, mine, fresh]) {
+    for (const e of list) {
+      if (!seen.has(e.id)) {
+        seen.add(e.id);
+        ids.push(e.id);
+      }
+    }
+  }
+
+  const out: CardioEntry[] = [];
+  for (const id of ids) {
+    const b = base.find((e) => e.id === id);
+    const m = mine.find((e) => e.id === id);
+    const f = fresh.find((e) => e.id === id);
+    const bj = b ? JSON.stringify(b) : null;
+    const mj = m ? JSON.stringify(m) : null;
+    const fj = f ? JSON.stringify(f) : null;
+
+    // 本页没改 → 用 fresh（可能是别处新增/修改，也可能是删除）
+    if (mj === bj) {
+      if (f) out.push(f);
+      continue;
+    }
+    // 本页删了
+    if (m === undefined) {
+      if (fj !== bj) {
+        conflicts.push({
+          path: '有氧项目',
+          message: '本页删除了一个有氧项目，但另一个页面同时改过它',
+          mine: null,
+          theirs: f ?? null,
+        });
+        return null;
+      }
+      continue;
+    }
+    // 本页新增（base 没有）
+    if (b === undefined) {
+      if (f !== undefined && fj !== bj) {
+        conflicts.push({
+          path: '有氧项目',
+          message: '两边各自新增了同 id 的有氧项目且内容不同',
+          mine: m,
+          theirs: f,
+        });
+        return null;
+      }
+      out.push(m);
+      continue;
+    }
+    // 本页改了，看别人
+    if (fj === bj) {
+      out.push(m);
+      continue;
+    }
+    if (fj === mj) {
+      out.push(m);
+      continue;
+    }
+    // 两边都改了且结果不同 → 冲突
+    conflicts.push({
+      path: `有氧「${m.name}」`,
+      message: '这个有氧项目两边都改过且结果不同，不能自动合并',
+      mine: m,
+      theirs: f,
+    });
+    return null;
+  }
+  return out;
 }

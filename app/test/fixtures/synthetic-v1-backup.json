@@ -1,0 +1,806 @@
+{
+  "format": "motion-training-backup",
+  "version": 1,
+  "exportedAt": 1792980000000,
+  "appVersion": "0.1.2",
+  "counts": {
+    "plans": 1,
+    "sessions": 4,
+    "activeSessions": 1
+  },
+  "data": {
+    "plans": [
+      {
+        "id": "synthetic-compat-plan-v1",
+        "name": "合成兼容样本：旧力量计划",
+        "presetId": "v3.2",
+        "cursor": 1,
+        "createdAt": 1792720800000,
+        "updatedAt": 1792720800000,
+        "days": [
+          {
+            "id": "day-chest-a",
+            "name": "胸 A",
+            "focus": "chest",
+            "round": "A",
+            "kind": "train",
+            "warmups": [
+              {
+                "id": "w-chest-1",
+                "name": "弹力带水平拉开",
+                "en": "BAND PULL-APART",
+                "unit": "reps",
+                "targetText": "2 × 10–15"
+              }
+            ],
+            "exercises": [
+              {
+                "id": "ex-ca-1",
+                "exerciseId": "lib-chest-dip",
+                "name": "双杠臂屈伸",
+                "en": "CHEST DIP",
+                "restSec": 150,
+                "target": {
+                  "kind": "straight",
+                  "sets": 3,
+                  "setsMax": 3,
+                  "repsMin": 6,
+                  "repsMax": 10,
+                  "weightMode": "bodyweight_plus",
+                  "suggestedWeightKg": null
+                }
+              },
+              {
+                "id": "ex-ca-2",
+                "exerciseId": "lib-barbell-bench",
+                "name": "自由杠铃卧推",
+                "en": "BARBELL BENCH PRESS",
+                "restSec": 180,
+                "substitutes": [
+                  "哑铃卧推"
+                ],
+                "target": {
+                  "kind": "straight",
+                  "sets": 3,
+                  "setsMax": 3,
+                  "repsMin": 6,
+                  "repsMax": 10,
+                  "weightMode": "external",
+                  "suggestedWeightKg": null
+                }
+              },
+              {
+                "id": "ex-ca-7",
+                "exerciseId": "lib-overhead-db-ext",
+                "name": "哑铃颈后臂屈伸",
+                "en": "OVERHEAD DB EXTENSION",
+                "restSec": 90,
+                "target": {
+                  "kind": "straight",
+                  "sets": 2,
+                  "setsMax": 2,
+                  "repsMin": 10,
+                  "repsMax": 15,
+                  "weightMode": "external",
+                  "suggestedWeightKg": null,
+                  "dumbbellBasis": "per_hand"
+                }
+              }
+            ]
+          },
+          {
+            "id": "day-back-b",
+            "name": "背 B",
+            "focus": "back",
+            "round": "B",
+            "kind": "train",
+            "warmups": [
+              {
+                "id": "w-back-1",
+                "name": "跪姿肘撑肩胛控制",
+                "en": "KNEELING SCAPULAR",
+                "unit": "breath",
+                "targetText": "2 组 × 约 10 次呼吸"
+              }
+            ],
+            "exercises": [
+              {
+                "id": "ex-bb-4",
+                "exerciseId": "lib-straight-arm-pulldown",
+                "name": "绳索直臂下拉",
+                "en": "STRAIGHT-ARM PULLDOWN",
+                "restSec": 90,
+                "note": "不是必须完成，按当天状态决定是否增加。",
+                "target": {
+                  "kind": "straight",
+                  "sets": 0,
+                  "setsMax": 2,
+                  "repsMin": 12,
+                  "repsMax": 15,
+                  "weightMode": "external",
+                  "suggestedWeightKg": null
+                }
+              },
+              {
+                "id": "ex-bb-7",
+                "exerciseId": "lib-hammer-curl",
+                "name": "哑铃锤式弯举",
+                "en": "HAMMER CURL",
+                "restSec": 90,
+                "target": {
+                  "kind": "straight",
+                  "sets": 2,
+                  "setsMax": 2,
+                  "repsMin": 12,
+                  "repsMax": 15,
+                  "weightMode": "external",
+                  "suggestedWeightKg": null,
+                  "dumbbellBasis": "per_hand"
+                }
+              }
+            ]
+          },
+          {
+            "id": "day-legs-a",
+            "name": "腿 A",
+            "focus": "legs",
+            "round": "A",
+            "kind": "train",
+            "warmups": [
+              {
+                "id": "w-legs-1",
+                "name": "跑步机坡走",
+                "en": "INCLINE WALK",
+                "unit": "time",
+                "targetText": "5–8 分钟"
+              }
+            ],
+            "exercises": [
+              {
+                "id": "ex-lateral",
+                "exerciseId": "lib-lateral-raise",
+                "name": "哑铃侧平举",
+                "en": "DB LATERAL RAISE",
+                "restSec": 180,
+                "note": "三轮 = 三个正式大组；阶段间休 10–30 秒，轮间至少 3 分钟。侧平举专项热身不计入正式组。",
+                "target": {
+                  "kind": "dropSet",
+                  "rounds": 3,
+                  "weightMode": "external",
+                  "dumbbellBasis": "per_hand",
+                  "restInSec": 20,
+                  "restAfterSec": 180,
+                  "stages": [
+                    {
+                      "label": "第一阶段",
+                      "weightKg": 7.5,
+                      "repsMin": 10,
+                      "repsMax": 16,
+                      "toFailure": false,
+                      "targetText": "7.5 kg · 10–16 次"
+                    },
+                    {
+                      "label": "第二阶段",
+                      "weightKg": 5,
+                      "repsMin": 10,
+                      "repsMax": 16,
+                      "toFailure": false,
+                      "targetText": "5 kg · 10–16 次"
+                    },
+                    {
+                      "label": "第三阶段",
+                      "weightKg": 5,
+                      "repsMin": null,
+                      "repsMax": null,
+                      "toFailure": true,
+                      "targetText": "5 kg · 技术性力竭"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "id": "day-rest-1",
+            "name": "恢复",
+            "focus": "chest",
+            "round": "A",
+            "kind": "rest",
+            "restNote": "睡眠 · 步行 · 放松，不做抗阻训练。",
+            "warmups": [],
+            "exercises": []
+          }
+        ]
+      }
+    ],
+    "sessions": [
+      {
+        "id": "synthetic-v1-target-and-zero",
+        "planId": "synthetic-compat-plan-v1",
+        "planName": "合成兼容样本：旧力量计划",
+        "day": {
+          "dayId": "day-chest-a",
+          "dayName": "胸 A",
+          "focus": "chest",
+          "round": "A",
+          "partText": "胸 A"
+        },
+        "cycleIndexAtStart": 1,
+        "targetSetsAtStart": 8,
+        "startedAt": 1792720800000,
+        "endedAt": 1792722000000,
+        "status": "completed",
+        "pausedMs": 60000,
+        "pausedAt": null,
+        "warmups": [
+          {
+            "id": "w-chest-1",
+            "name": "弹力带水平拉开",
+            "unit": "reps",
+            "targetText": "2 × 10–15",
+            "done": true
+          }
+        ],
+        "exercises": [
+          {
+            "id": "sex-mvlboflh-8xt7dc",
+            "exerciseId": "lib-chest-dip",
+            "planExerciseId": "ex-ca-1",
+            "name": "双杠臂屈伸",
+            "en": "CHEST DIP",
+            "restSec": 150,
+            "target": {
+              "kind": "straight",
+              "sets": 3,
+              "setsMax": 3,
+              "repsMin": 6,
+              "repsMax": 10,
+              "weightMode": "bodyweight_plus",
+              "suggestedWeightKg": null
+            },
+            "status": "pending",
+            "groups": [
+              {
+                "index": 1,
+                "stageCount": 1
+              },
+              {
+                "index": 2,
+                "stageCount": 1
+              },
+              {
+                "index": 3,
+                "stageCount": 1
+              }
+            ],
+            "sets": [
+              {
+                "id": "set-mvlboflh-x2lfp4",
+                "roundIndex": 1,
+                "stageIndex": 1,
+                "reps": 0,
+                "weightKg": 0,
+                "status": "done",
+                "note": "合成：实际零次和零负重，不是未填"
+              },
+              {
+                "id": "set-mvlboflh-z72ysk",
+                "roundIndex": 2,
+                "stageIndex": 1,
+                "reps": 10,
+                "weightKg": 20,
+                "status": "done"
+              },
+              {
+                "id": "set-mvlboflh-jen64g",
+                "roundIndex": 3,
+                "stageIndex": 1,
+                "reps": 10,
+                "weightKg": 20,
+                "status": "done"
+              }
+            ],
+            "note": ""
+          },
+          {
+            "id": "sex-mvlboflh-46bg8g",
+            "exerciseId": "lib-barbell-bench",
+            "planExerciseId": "ex-ca-2",
+            "name": "自由杠铃卧推",
+            "en": "BARBELL BENCH PRESS",
+            "restSec": 180,
+            "target": {
+              "kind": "straight",
+              "sets": 3,
+              "setsMax": 3,
+              "repsMin": 6,
+              "repsMax": 10,
+              "weightMode": "external",
+              "suggestedWeightKg": null
+            },
+            "status": "pending",
+            "groups": [
+              {
+                "index": 1,
+                "stageCount": 1
+              },
+              {
+                "index": 2,
+                "stageCount": 1
+              },
+              {
+                "index": 3,
+                "stageCount": 1
+              }
+            ],
+            "sets": [
+              {
+                "id": "set-mvlboflh-lroxse",
+                "roundIndex": 1,
+                "stageIndex": 1,
+                "reps": 10,
+                "weightKg": 20,
+                "status": "done"
+              },
+              {
+                "id": "set-mvlboflh-h1jhu9",
+                "roundIndex": 2,
+                "stageIndex": 1,
+                "reps": 10,
+                "weightKg": 20,
+                "status": "done"
+              },
+              {
+                "id": "set-mvlboflh-a6v56a",
+                "roundIndex": 3,
+                "stageIndex": 1,
+                "reps": 10,
+                "weightKg": 20,
+                "status": "done"
+              }
+            ],
+            "note": ""
+          },
+          {
+            "id": "sex-mvlboflh-zsfwsi",
+            "exerciseId": "lib-overhead-db-ext",
+            "planExerciseId": "ex-ca-7",
+            "name": "哑铃颈后臂屈伸",
+            "en": "OVERHEAD DB EXTENSION",
+            "restSec": 90,
+            "target": {
+              "kind": "straight",
+              "sets": 2,
+              "setsMax": 2,
+              "repsMin": 10,
+              "repsMax": 15,
+              "weightMode": "external",
+              "suggestedWeightKg": null,
+              "dumbbellBasis": "per_hand"
+            },
+            "status": "pending",
+            "groups": [
+              {
+                "index": 1,
+                "stageCount": 1
+              },
+              {
+                "index": 2,
+                "stageCount": 1
+              },
+              {
+                "index": 3,
+                "stageCount": 1
+              }
+            ],
+            "sets": [
+              {
+                "id": "set-mvlboflh-w6p7o8",
+                "roundIndex": 1,
+                "stageIndex": 1,
+                "reps": 10,
+                "weightKg": 7.5,
+                "status": "done"
+              },
+              {
+                "id": "set-mvlboflh-huwzwg",
+                "roundIndex": 2,
+                "stageIndex": 1,
+                "reps": 10,
+                "weightKg": 7.5,
+                "status": "done"
+              },
+              {
+                "id": "set-mvlboflh-mkcr5p",
+                "roundIndex": 3,
+                "stageIndex": 1,
+                "reps": 10,
+                "weightKg": 7.5,
+                "status": "done"
+              }
+            ],
+            "note": ""
+          }
+        ],
+        "note": "合成记录：原目标分母与临时加组",
+        "revision": 7,
+        "advancedCycle": true,
+        "cycleIndexAfter": 2
+      },
+      {
+        "id": "synthetic-v1-empty-groups-active",
+        "planId": "synthetic-compat-plan-v1",
+        "planName": "合成兼容样本：旧力量计划",
+        "day": {
+          "dayId": "day-back-b",
+          "dayName": "背 B",
+          "focus": "back",
+          "round": "B",
+          "partText": "背 B"
+        },
+        "cycleIndexAtStart": 1,
+        "targetSetsAtStart": 2,
+        "startedAt": 1792807200000,
+        "endedAt": null,
+        "status": "active",
+        "pausedMs": 0,
+        "pausedAt": 1792807290000,
+        "warmups": [
+          {
+            "id": "w-back-1",
+            "name": "跪姿肘撑肩胛控制",
+            "unit": "breath",
+            "targetText": "2 组 × 约 10 次呼吸",
+            "done": true
+          }
+        ],
+        "exercises": [
+          {
+            "id": "sex-mvlboflh-eg7oho",
+            "exerciseId": "lib-straight-arm-pulldown",
+            "planExerciseId": "ex-bb-4",
+            "name": "绳索直臂下拉",
+            "en": "STRAIGHT-ARM PULLDOWN",
+            "restSec": 90,
+            "target": {
+              "kind": "straight",
+              "sets": 0,
+              "setsMax": 2,
+              "repsMin": 12,
+              "repsMax": 15,
+              "weightMode": "external",
+              "suggestedWeightKg": null
+            },
+            "status": "pending",
+            "groups": [],
+            "sets": [],
+            "note": ""
+          },
+          {
+            "id": "sex-mvlboflh-xjz3uy",
+            "exerciseId": "lib-hammer-curl",
+            "planExerciseId": "ex-bb-7",
+            "name": "哑铃锤式弯举",
+            "en": "HAMMER CURL",
+            "restSec": 90,
+            "target": {
+              "kind": "straight",
+              "sets": 2,
+              "setsMax": 2,
+              "repsMin": 12,
+              "repsMax": 15,
+              "weightMode": "external",
+              "suggestedWeightKg": null,
+              "dumbbellBasis": "per_hand"
+            },
+            "status": "pending",
+            "groups": [
+              {
+                "index": 1,
+                "stageCount": 1
+              },
+              {
+                "index": 2,
+                "stageCount": 1
+              }
+            ],
+            "sets": [
+              {
+                "id": "set-mvlboflh-iu3ut5",
+                "roundIndex": 1,
+                "stageIndex": 1,
+                "reps": null,
+                "weightKg": 0,
+                "status": "partial",
+                "note": "合成：重量单填且为零，次数仍未填"
+              },
+              {
+                "id": "set-mvlboflh-ae2oul",
+                "roundIndex": 2,
+                "stageIndex": 1,
+                "reps": null,
+                "weightKg": null,
+                "status": "blank"
+              }
+            ],
+            "note": ""
+          }
+        ],
+        "note": "合成进行中记录：合法可选零组与暂停",
+        "revision": 3
+      },
+      {
+        "id": "synthetic-v1-drop-partial",
+        "planId": "synthetic-compat-plan-v1",
+        "planName": "合成兼容样本：旧力量计划",
+        "day": {
+          "dayId": "day-legs-a",
+          "dayName": "腿 A",
+          "focus": "legs",
+          "round": "A",
+          "partText": "腿 A"
+        },
+        "cycleIndexAtStart": 1,
+        "targetSetsAtStart": 3,
+        "startedAt": 1792893600000,
+        "endedAt": 1792894200000,
+        "status": "completed",
+        "pausedMs": 0,
+        "pausedAt": null,
+        "warmups": [
+          {
+            "id": "w-legs-1",
+            "name": "跑步机坡走",
+            "unit": "time",
+            "targetText": "5–8 分钟",
+            "done": true
+          }
+        ],
+        "exercises": [
+          {
+            "id": "sex-mvlboflh-xqzclg",
+            "exerciseId": "lib-lateral-raise",
+            "planExerciseId": "ex-lateral",
+            "name": "哑铃侧平举",
+            "en": "DB LATERAL RAISE",
+            "restSec": 180,
+            "target": {
+              "kind": "dropSet",
+              "rounds": 3,
+              "weightMode": "external",
+              "dumbbellBasis": "per_hand",
+              "restInSec": 20,
+              "restAfterSec": 180,
+              "stages": [
+                {
+                  "label": "第一阶段",
+                  "weightKg": 7.5,
+                  "repsMin": 10,
+                  "repsMax": 16,
+                  "toFailure": false,
+                  "targetText": "7.5 kg · 10–16 次"
+                },
+                {
+                  "label": "第二阶段",
+                  "weightKg": 5,
+                  "repsMin": 10,
+                  "repsMax": 16,
+                  "toFailure": false,
+                  "targetText": "5 kg · 10–16 次"
+                },
+                {
+                  "label": "第三阶段",
+                  "weightKg": 5,
+                  "repsMin": null,
+                  "repsMax": null,
+                  "toFailure": true,
+                  "targetText": "5 kg · 技术性力竭"
+                }
+              ]
+            },
+            "status": "pending",
+            "groups": [
+              {
+                "index": 1,
+                "stageCount": 3
+              },
+              {
+                "index": 2,
+                "stageCount": 3
+              },
+              {
+                "index": 3,
+                "stageCount": 3
+              }
+            ],
+            "sets": [
+              {
+                "id": "set-mvlboflh-ernjq8",
+                "roundIndex": 1,
+                "stageIndex": 1,
+                "reps": 12,
+                "weightKg": 7.5,
+                "status": "done"
+              },
+              {
+                "id": "set-mvlboflh-lthdql",
+                "roundIndex": 1,
+                "stageIndex": 2,
+                "reps": 12,
+                "weightKg": 5,
+                "status": "done"
+              },
+              {
+                "id": "set-mvlboflh-bjx2s9",
+                "roundIndex": 1,
+                "stageIndex": 3,
+                "reps": 0,
+                "weightKg": 5,
+                "status": "done",
+                "toFailure": true
+              },
+              {
+                "id": "set-mvlboflh-k7ljku",
+                "roundIndex": 2,
+                "stageIndex": 1,
+                "reps": 12,
+                "weightKg": 7.5,
+                "status": "done",
+                "note": "合成：这一轮仅部分阶段完成"
+              },
+              {
+                "id": "set-mvlboflh-gizk9l",
+                "roundIndex": 2,
+                "stageIndex": 2,
+                "reps": null,
+                "weightKg": 5,
+                "status": "partial",
+                "note": "合成：阶段缺次数"
+              },
+              {
+                "id": "set-mvlboflh-lnlity",
+                "roundIndex": 2,
+                "stageIndex": 3,
+                "reps": null,
+                "weightKg": null,
+                "status": "blank",
+                "toFailure": true
+              },
+              {
+                "id": "set-mvlboflh-fwwikd",
+                "roundIndex": 3,
+                "stageIndex": 1,
+                "reps": null,
+                "weightKg": null,
+                "status": "blank"
+              },
+              {
+                "id": "set-mvlboflh-t0t5f6",
+                "roundIndex": 3,
+                "stageIndex": 2,
+                "reps": null,
+                "weightKg": null,
+                "status": "blank"
+              },
+              {
+                "id": "set-mvlboflh-vhjgts",
+                "roundIndex": 3,
+                "stageIndex": 3,
+                "reps": null,
+                "weightKg": null,
+                "status": "blank",
+                "toFailure": true
+              }
+            ],
+            "note": ""
+          }
+        ],
+        "note": "合成：递减结构和每手计重",
+        "revision": 11,
+        "advancedCycle": false,
+        "cycleIndexAfter": 1
+      },
+      {
+        "id": "synthetic-v1-migrated-sparse",
+        "planId": "synthetic-compat-plan-v1",
+        "planName": "合成兼容样本：旧力量计划",
+        "day": {
+          "dayId": "day-chest-a",
+          "dayName": "胸 A",
+          "focus": "chest",
+          "round": "A",
+          "partText": "胸 A"
+        },
+        "cycleIndexAtStart": 1,
+        "startedAt": 1792634400000,
+        "endedAt": 1792634700000,
+        "status": "completed",
+        "pausedMs": 0,
+        "pausedAt": null,
+        "warmups": [
+          {
+            "id": "w-chest-1",
+            "name": "弹力带水平拉开",
+            "unit": "reps",
+            "targetText": "2 × 10–15",
+            "done": false
+          }
+        ],
+        "exercises": [
+          {
+            "id": "sex-mvlbofli-7t0wc2",
+            "exerciseId": "lib-chest-dip",
+            "planExerciseId": "ex-ca-1",
+            "name": "双杠臂屈伸",
+            "en": "CHEST DIP",
+            "restSec": 150,
+            "target": {
+              "kind": "straight",
+              "sets": 3,
+              "setsMax": 3,
+              "repsMin": 6,
+              "repsMax": 10,
+              "weightMode": "bodyweight_plus",
+              "suggestedWeightKg": null
+            },
+            "status": "pending",
+            "sets": [
+              {
+                "id": "set-mvlbofli-wtiupl",
+                "roundIndex": 1,
+                "stageIndex": 1,
+                "reps": 10,
+                "weightKg": 0,
+                "status": "done"
+              },
+              {
+                "id": "set-mvlbofli-r24u29",
+                "roundIndex": 3,
+                "stageIndex": 1,
+                "reps": 10,
+                "weightKg": 0,
+                "status": "done"
+              },
+              {
+                "id": "set-mvlbofli-ofso26",
+                "roundIndex": 4,
+                "stageIndex": 1,
+                "reps": 10,
+                "weightKg": 0,
+                "status": "done"
+              }
+            ],
+            "note": "",
+            "groups": [
+              {
+                "index": 1,
+                "stageCount": 1
+              },
+              {
+                "index": 3,
+                "stageCount": 1
+              },
+              {
+                "index": 4,
+                "stageCount": 1
+              }
+            ]
+          }
+        ],
+        "note": "合成：真实历史v2构造器→加组→删第2组→v1迁移",
+        "revision": 0,
+        "targetSetsAtStart": 3
+      }
+    ],
+    "settings": [
+      {
+        "key": "app",
+        "theme": "dark",
+        "currentPlanId": "synthetic-compat-plan-v1",
+        "lastExportAt": null,
+        "lastBackupPromptAt": null,
+        "seenVersion": "0.1.2"
+      }
+    ]
+  }
+}

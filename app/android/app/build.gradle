@@ -7,12 +7,12 @@ android {
         applicationId "app.motion.personal"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        // 版本身份：0.1.2 / versionCode 3。
-        // 0.1.1（versionCode 2）是上一版；之后每个可安装的更新版本必须递增
+        // 版本身份：0.1.7 / versionCode 8（第5阶段本地测试候选；问题二、三源码已接受）。
+        // 0.1.5（versionCode 6）是上一版；每个可安装的更新版本必须递增
         // versionCode，不能降级；applicationId 固定为 app.motion.personal，
         // 不因测试版本更换包名（同包名才能覆盖安装并保住 IndexedDB 数据）。
-        versionCode 3
-        versionName "0.1.2"
+        versionCode 8
+        versionName "0.1.7"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.

@@ -2,12 +2,13 @@
    所有写入都走 IndexedDB 事务；失败会抛 StorageError 由 UI 显示「未保存」，
    绝不在失败后假装成功。 */
 
-import { idbDelete, idbGet, idbGetAll, idbPut, idbReplaceAll, StorageError } from './idb';
+import { idbDelete, idbGet, idbGetAll, idbPut, idbReplaceAll, openDb, StorageError } from './idb';
 import { createV32Plan } from '../domain/presets/v32';
 import { validateDataDeep } from './validate';
 import { detectLegacyShape, deriveGroupsFrom, migrateLegacyData, validateLegacyShape } from './migrate';
 import { exerciseIdFromName, resolveExerciseId } from '../domain/identity';
 import { targetGroupsOf } from '../domain/session';
+import { findV1Contraband, isSupportedBackupVersion } from './backupCompat';
 import type { GroupPlan, Plan, Session, SessionExercise } from '../domain/types';
 
 export interface AppSettings {
@@ -56,15 +57,145 @@ export async function deletePlan(id: string): Promise<void> {
   await idbDelete('plans', id);
 }
 
+/**
+ * **删除计划 + 清理恰好匹配的 current**，在**同一笔本地事务**内完成
+ * （B3/G5-R5 产品裁决）。
+ *
+ * ── 被修复的真实失败 ─────────────────────────────────────────
+ * 旧流程：先 `deletePlan` 成功 → 再 `setCurrentPlan`（独立 IDB 写）。
+ * 若第二步失败（Codex 注入 settings.put abort），结果是：
+ * plans 已无 A，settings.currentPlanId 仍指向 A —— **悬空引用**，
+ * UI 只能弹 toast 让用户自己重选。
+ *
+ * ── 现在的语义 ────────────────────────────────────────────────
+ * `plans` 与 `settings` 在**同一个 IndexedDB**，因此可以在**一个 readwrite
+ * 事务**里同时做两件事：事务 abort 则**两者一起回滚**，不会出现半完成。
+ *
+ * @param id 要删除的计划 id
+ * @param decideFallback 读**最新** settings 后决定新的 current
+ *        （`null` 表示没有其它计划）；返回 `undefined` 表示"不需要改 current"
+ *        （即被删的不是当前训练计划 → 不动，避免覆盖并发已选的其他 current）
+ */
+export function atomicDeletePlanWithCurrent(
+  id: string,
+  decideFallback: (currentPlanId: string | null, remainingPlanIds: string[]) => string | null | undefined,
+): Promise<{ ok: boolean; newCurrentPlanId?: string | null; reason?: string }> {
+  return openDb().then(
+    (db) =>
+      new Promise((resolve) => {
+        let settled = false;
+        const done = (r: { ok: boolean; newCurrentPlanId?: string | null; reason?: string }) => {
+          if (!settled) {
+            settled = true;
+            resolve(r);
+          }
+        };
+        let t: IDBTransaction;
+        try {
+          // 同一事务覆盖两个 store：任一失败 → 整体 abort 回滚
+          t = db.transaction(['plans', 'settings'], 'readwrite');
+        } catch (err) {
+          done({ ok: false, reason: err instanceof Error ? err.message : '事务开启失败' });
+          return;
+        }
+        /**
+         * B4/G5-R2：**成功只在 `transaction.oncomplete` 结算**。
+         *
+         * 旧实现在 `request.onsuccess` 就 `resolve({ok:true})` —— 但 request success
+         * **不是 commit**：之后仍可能 abort（Codex 真实注入 settings.put
+         * request-success 后 abort，数据确实整体回滚，却误报"已删除并回退"）。
+         *
+         * 现在：request 回调只**记录候选结果**，真正的 resolve 由 oncomplete 触发。
+         */
+        let candidate: { newCurrentPlanId?: string | null } | null = null;
+        t.oncomplete = () => {
+          if (candidate) {
+            done({ ok: true, newCurrentPlanId: candidate.newCurrentPlanId });
+          } else {
+            // 完成但无候选（异常路径）：如实失败
+            done({ ok: false, reason: 'no-candidate' });
+          }
+        };
+        t.onabort = () => done({ ok: false, reason: 'transaction-aborted' });
+        t.onerror = () => done({ ok: false, reason: t.error?.message ?? '事务失败' });
+
+        const planStore = t.objectStore('plans');
+        const settingsStore = t.objectStore('settings');
+
+        const allReq = planStore.getAll();
+        allReq.onerror = () => done({ ok: false, reason: allReq.error?.message ?? '读取计划失败' });
+        allReq.onsuccess = () => {
+          const all = (allReq.result ?? []) as Plan[];
+          if (!all.some((p) => p.id === id)) {
+            // 计划已不存在：不写任何东西，如实返回
+            t.abort();
+            done({ ok: false, reason: 'plan-not-found' });
+            return;
+          }
+          const remaining = all.filter((p) => p.id !== id).map((p) => p.id);
+
+          // 在**同一事务**内读最新 settings（避免用陈旧内存覆盖并发已选）
+          const stReq = settingsStore.get('app');
+          stReq.onerror = () => done({ ok: false, reason: stReq.error?.message ?? '读取设置失败' });
+          stReq.onsuccess = () => {
+            const row = (stReq.result ?? {}) as AppSettings & { key?: string };
+            const currentId = (row.currentPlanId ?? null) as string | null;
+            const decision = decideFallback(currentId, remaining);
+
+            const delReq = planStore.delete(id);
+            delReq.onerror = () => done({ ok: false, reason: delReq.error?.message ?? '删除失败' });
+            delReq.onsuccess = () => {
+              if (decision === undefined) {
+                // 不需要改 current：只删计划
+                candidate = { newCurrentPlanId: currentId };
+                return;
+              }
+              const nextSettings = {
+                ...DEFAULT_SETTINGS,
+                ...row,
+                currentPlanId: decision,
+                key: 'app' as const,
+              };
+              const putReq = settingsStore.put(nextSettings);
+              putReq.onerror = () => done({ ok: false, reason: putReq.error?.message ?? '设置写入失败' });
+              putReq.onsuccess = () => {
+                // 只记候选；成功要等 oncomplete
+                candidate = { newCurrentPlanId: decision };
+              };
+            };
+          };
+        };
+      }),
+  );
+}
+
 /* ── 训练实例 ─────────────────────────── */
+
+/**
+ * 读取层**无破坏性缺省**（第2阶段）。
+ *
+ * 直接覆盖升级（0.1.2 → 新版）不走 restore，`listSessions` 直接读 IDB，
+ * 因此所有读出口都必须补缺省，否则新代码强依赖新字段会崩。
+ * **只在内存补，不回写库、不重建、不删除旧数据。**
+ */
+export function normalizeSession(s: Session): Session {
+  return {
+    ...s,
+    kind: s.kind ?? 'strength',
+    origin: s.origin ?? 'plan',
+    cardio: s.cardio ?? [],
+    cardioPausedBySession: s.cardioPausedBySession ?? [],
+  };
+}
 
 export async function listSessions(): Promise<Session[]> {
   const all = await idbGetAll<Session>('sessions');
-  return all.sort((a, b) => b.startedAt - a.startedAt);
+  return all.map(normalizeSession).sort((a, b) => b.startedAt - a.startedAt);
 }
 
 export async function getSession(id: string): Promise<Session | undefined> {
-  return idbGet<Session>('sessions', id);
+  const s = await idbGet<Session>('sessions', id);
+  return s ? normalizeSession(s) : undefined;
 }
 
 export async function saveSession(session: Session): Promise<void> {
@@ -77,7 +208,10 @@ export async function deleteSession(id: string): Promise<void> {
 
 export async function findActiveSession(): Promise<Session | undefined> {
   const all = await idbGetAll<Session>('sessions');
-  return all.filter((s) => s.status === 'active').sort((a, b) => b.startedAt - a.startedAt)[0];
+  return all
+    .map(normalizeSession)
+    .filter((s) => s.status === 'active')
+    .sort((a, b) => b.startedAt - a.startedAt)[0];
 }
 
 /* ── 设置 ─────────────────────────────── */
@@ -122,7 +256,7 @@ export async function ensureSeed(): Promise<boolean> {
 /* ── 备份 / 恢复 ─────────────────────── */
 
 export const BACKUP_FORMAT = 'motion-training-backup';
-export const BACKUP_VERSION = 1;
+export const BACKUP_VERSION = 2;
 
 export interface BackupPayload {
   format: typeof BACKUP_FORMAT;
@@ -170,7 +304,13 @@ export type ValidateResult =
   | { ok: true; payload: BackupPayload; preview: RestorePreview; warnings: string[] }
   | { ok: false; error: string; issues?: Array<{ path: string; message: string }> };
 
-export const CURRENT_APP_VERSION = '1.0.0';
+/*
+ * 应用显示版本 + **新导出备份写入的 appVersion 元数据**（第5阶段候选）。
+ * 历史值曾是 Web 期 '1.0.0'；本轮与候选包 0.1.7 对齐，避免设置页与包版本矛盾。
+ * 旧备份里的 1.0.0 元数据仍按现有规则**只提示不拒绝**（validateBackup 的
+ * warnings：srcVersion !== currentAppVersion），冻结/历史文件不改。
+ */
+export const CURRENT_APP_VERSION = '0.1.7';
 
 export function validateBackup(raw: unknown, currentAppVersion = CURRENT_APP_VERSION): ValidateResult {
   if (typeof raw !== 'object' || raw === null) return { ok: false, error: '文件不是有效的 JSON 对象' };
@@ -179,12 +319,36 @@ export function validateBackup(raw: unknown, currentAppVersion = CURRENT_APP_VER
   if (typeof obj.version !== 'number' || !Number.isFinite(obj.version)) {
     return { ok: false, error: '备份文件缺少有效版本号' };
   }
-  if (obj.version > BACKUP_VERSION) {
-    return { ok: false, error: `备份版本 ${obj.version} 高于当前应用支持的 ${BACKUP_VERSION}，请先升级应用` };
+  // 版本按**明示支持的整数集合**判断；非法/未来版本不猜测读取
+  if (!isSupportedBackupVersion(obj.version)) {
+    if (obj.version > BACKUP_VERSION) {
+      return {
+        ok: false,
+        error: `备份版本 ${obj.version} 高于当前应用支持的 ${BACKUP_VERSION}，请先升级应用`,
+      };
+    }
+    return { ok: false, error: `不支持的备份版本 ${obj.version}` };
   }
   const data = obj.data;
   if (!data || typeof data !== 'object') {
     return { ok: false, error: '备份缺少 data 内容' };
+  }
+
+  /**
+   * v1 备份**只允许旧字段**。
+   * 夹带新结构（计划日类型/有氧目标、会话 kind/origin/cardio/restDate、
+   * 以及嵌套 cardio entry）必须明确拒绝，不能经已知字段重建后报成功。
+   */
+  if (obj.version === 1) {
+    const contraband = findV1Contraband(data);
+    if (contraband.length) {
+      const first = contraband[0];
+      return {
+        ok: false,
+        error: `v1 备份包含新版结构，已拒绝：${first.path} — ${first.message}`,
+        issues: contraband,
+      };
+    }
   }
 
   // ── 顶层元数据校验（R05）：appVersion / exportedAt / theme 必须是合法运行时类型 ──

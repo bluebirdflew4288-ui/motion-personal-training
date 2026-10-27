@@ -68,13 +68,26 @@ export interface PlanDay {
   id: string;
   /** 训练日名称，例如 胸 A */
   name: string;
-  /** 分部：胸 / 背 / 腿，用于贴纸选择与配色 */
-  focus: 'chest' | 'back' | 'legs';
-  round: 'A' | 'B';
-  kind: 'train' | 'rest';
+  /**
+   * 分部：胸 / 背 / 腿。
+   * 仅 `kind === 'train'`（力量日）适用；有氧/休息日不伪造该字段。
+   */
+  focus?: 'chest' | 'back' | 'legs';
+  /** A/B 轮。同样仅力量日适用。 */
+  round?: 'A' | 'B';
+  /**
+   * 日类型（三态）：
+   * · train  力量日（旧值，缺省）
+   * · cardio 计划内明确安排的有氧日
+   * · rest   休息日
+   * 旧数据只有 train/rest，原样合法，不做归一化改写。
+   */
+  kind: 'train' | 'cardio' | 'rest';
   restNote?: string;
   warmups: WarmupTarget[];
   exercises: PlanExercise[];
+  /** 计划内有氧目标（仅 kind==='cardio' 有意义）。只存目标/初始值，不含实际记录。 */
+  cardio?: PlanCardio[];
 }
 
 export interface Plan {
@@ -87,6 +100,78 @@ export interface Plan {
   createdAt: number;
   updatedAt: number;
   presetId?: string;
+}
+
+/* ── 有氧（第2阶段）───────────────────────── */
+
+/** 首版仅两个预设，不做自定义参数设计器 */
+export type CardioPreset = 'treadmill-incline' | 'stair-climber';
+
+/**
+ * 有氧参数。
+ *
+ * **按 preset 严格区分使用字段**（PHASE-2-APPROVAL §2）：
+ * · treadmill-incline：只用 speedKmh + inclinePct
+ * · stair-climber    ：只用 level
+ * 不适用的字段**缺省**（不写 undefined，也不写 null —— 新记录统一"缺省"这一种输出）。
+ */
+export interface CardioParams {
+  /** 坡走：速度 km/h（必填，有限数字） */
+  speedKmh?: number;
+  /** 坡走：坡度 %（必填，有限数字） */
+  inclinePct?: number;
+  /** 爬楼机：器械档位（必填，整数） */
+  level?: number;
+}
+
+/**
+ * 参数分段。
+ *
+ * 起止统一用**该 entry 从 0 开始的有效 elapsed 坐标**（毫秒），
+ * 不是 epoch 时间，也不是经 session 总暂停修正的墙钟。
+ */
+export interface CardioSegment {
+  id: string;
+  startElapsedMs: number;
+  /** null = 该段仍 open（仅 status==='running' 时允许） */
+  endElapsedMs: number | null;
+  params: CardioParams;
+}
+
+export type CardioStatus = 'pending' | 'running' | 'paused' | 'done';
+
+/**
+ * 一次训练里的一个有氧项目（entry）。
+ *
+ * 计时模型（唯一真源）：
+ * · `elapsedMs`：上次结算时已累计的**有效毫秒**，从 0 开始
+ * · `runningSinceAt`：运行时的**墙钟** Date.now() 锚点；未运行为 null
+ * · 当前有效时长 = elapsedMs + max(0, now - runningSinceAt)
+ * 不设第二套暂停累计量。
+ */
+export interface CardioEntry {
+  id: string;
+  preset: CardioPreset;
+  name: string;
+  /** 计划内来源的稳定 ID；临时为 null（不伪造计划身份） */
+  planCardioId: string | null;
+  /** 计划内目标快照（临时为 null）；改计划不影响它 */
+  target: CardioParams | null;
+  elapsedMs: number;
+  runningSinceAt: number | null;
+  status: CardioStatus;
+  currentParams: CardioParams;
+  segments: CardioSegment[];
+  note?: string;
+}
+
+/** 计划侧有氧目标（不可变目标快照来源） */
+export interface PlanCardio {
+  id: string;
+  preset: CardioPreset;
+  name: string;
+  target: CardioParams;
+  note?: string;
 }
 
 /* ── 训练实例 ─────────────────────────────── */
@@ -173,12 +258,22 @@ export interface SessionWarmup {
 export interface SessionSnapshotDay {
   dayId: string;
   dayName: string;
-  focus: 'chest' | 'back' | 'legs';
-  round: 'A' | 'B';
+  /** 仅力量训练快照适用；有氧/休息不伪造。旧数据已有值原样保留。 */
+  focus?: 'chest' | 'back' | 'legs';
+  round?: 'A' | 'B';
   partText: string;
 }
 
 export type SessionStatus = 'active' | 'completed' | 'discarded';
+
+/**
+ * 记录类型（三态）。缺省 = 'strength'（0.1.2 只可能产生力量记录）。
+ * 力量追加有氧仍是 'strength'，不设冗余 mixed 枚举。
+ */
+export type SessionKind = 'strength' | 'cardio' | 'rest';
+
+/** 来源：仅区分计划内 / 临时。缺省 = 'plan'。 */
+export type SessionOrigin = 'plan' | 'temporary';
 
 export interface Session {
   id: string;
@@ -213,6 +308,21 @@ export interface Session {
    * 旧数据没有该字段 → 视为 0（迁移补齐）。
    */
   revision?: number;
+
+  /* ── 第2阶段扩展（全部可选；旧数据缺省即合法）── */
+  /** 记录类型。缺省 = 'strength' */
+  kind?: SessionKind;
+  /** 来源。缺省 = 'plan' */
+  origin?: SessionOrigin;
+  /** 有氧项目（力量追加或独立有氧共用同一结构）。缺省 = [] */
+  cardio?: CardioEntry[];
+  /** 完全休息：本地日期 'YYYY-MM-DD'，创建时固定。仅 kind==='rest' 时存在 */
+  restDate?: string;
+  /**
+   * 因**整次训练暂停**而被动停住的有氧 entry id。
+   * 恢复训练时只恢复这些；不误开用户手动暂停的有氧。缺省 = []
+   */
+  cardioPausedBySession?: string[];
 }
 
 /* ── 统计口径 ─────────────────────────────── */
@@ -240,6 +350,8 @@ export interface SessionSummary {
   /** 总时长（减去暂停） */
   durationMs: number;
   totalSets: number;
+  /** 有氧有效总时长（从 entries 派生；与 durationMs 分别计算、不相加） */
+  cardioMs: number;
 }
 
 /** 单个动作的完成状态（与汇总使用同一判定来源） */

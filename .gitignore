@@ -61,6 +61,13 @@ verify-v*/
 verify-android*/
 verify-plan-*/
 verify-zero-byte/
+# 第3阶段施工者自查产物（真实 Chrome harness：profile/截图/results JSON 留在本机，不入库）
+app/verify-self/
+
+# 本机阶段验收与 profile/原始证据：保留在磁盘，不入库
+/verify-expansion/
+/verify-feedback/
+/app/verify-feedback/
 
 # ── 本地服务信息 ──
 LAN-INFO*.txt
@@ -94,11 +101,15 @@ _rollback/v2-snapshot-20261021b/*
 # ── 本项目 git 元数据目录（gitdir，自身不能入库）──
 .git-motion/
 
-# ── 仅本地保留：历史 APK 旧版本（0.1.2 是当前唯一推荐包，已入库）──
+# ── 仅本地保留：失败/中间 APK（0.1.7 当前用户测试包可入库，0.1.2 已跟踪）──
 # 不写 *.apk 通配，避免把未来新版本包一起忽略。
 /apk/MOTION-0.1.0-debug.apk
 /apk/MOTION-0.1.0-release.apk
 /apk/MOTION-0.1.1-release.apk
+/apk/MOTION-0.1.3-release.apk
+/apk/MOTION-0.1.4-release.apk
+/apk/MOTION-0.1.5-release.apk
+/apk/MOTION-0.1.6-release.apk
 
 # ── 仅本地保留：历史验收/返工报告（按文件名精确列出，不用 *.md 通配）──
 /Android交付报告.md
