@@ -77,8 +77,10 @@ public final class RestIngressDeadlineTest {
         check("合法墙钟毫秒 → 解析成功", parsed != null && parsed == soon);
         Long parsedStr = RestArgs.parseDeadlineAtMsOrNull(String.valueOf(soon));
         check("数字字符串 → 解析成功", parsedStr != null && parsedStr == soon);
-        Long parsedInt = RestArgs.parseDeadlineAtMsOrNull((int) soon);
-        check("Integer 形态 → 解析成功", parsedInt != null);
+        int positiveInt = (int) (soon & 0x7fffffffL);
+        if (positiveInt <= 0) positiveInt = 60_000;
+        Long parsedInt = RestArgs.parseDeadlineAtMsOrNull(positiveInt);
+        check("Integer 形态 → 解析成功", parsedInt != null && parsedInt == (long) positiveInt);
         Long parsedDouble = RestArgs.parseDeadlineAtMsOrNull((double) soon);
         check("Double 形态 → 解析成功", parsedDouble != null && parsedDouble == soon);
     }

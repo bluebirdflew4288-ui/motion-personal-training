@@ -25,7 +25,11 @@ import puppeteer from 'puppeteer-core';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CHROME = process.env.MOTION_CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const STAMP = new Date().toISOString().replace(/[:.]/g, '-');
-const OUTDIR = path.join(ROOT, 'verify-self/feedback-b4r2', STAMP);
+const OUTDIR = process.env.MOTION_UI_EVIDENCE_DIR
+  ? (process.env.MOTION_UI_EVIDENCE_DIR.endsWith('feedback-b4r2')
+      ? path.resolve(process.env.MOTION_UI_EVIDENCE_DIR)
+      : path.resolve(process.env.MOTION_UI_EVIDENCE_DIR, 'feedback-b4r2'))
+  : path.join(ROOT, 'verify-self/feedback-b4r2', STAMP);
 mkdirSync(OUTDIR, { recursive: true });
 
 const results = [];
@@ -80,10 +84,12 @@ function srcHash() {
 }
 const hashBefore = srcHash();
 
-const browser = await puppeteer.launch({
-  executablePath: CHROME, headless: 'new',
-  args: ['--no-sandbox', '--user-data-dir=' + path.join(OUTDIR, 'chrome-profile')],
-});
+let browser;
+try {
+  browser = await puppeteer.launch({
+    executablePath: CHROME, headless: true,
+    args: ['--no-sandbox', '--user-data-dir=' + path.join(OUTDIR, 'chrome-profile')],
+  });
 const page = await browser.newPage();
 const pageErrors = [];
 page.on('pageerror', (e) => pageErrors.push(String(e)));
@@ -158,10 +164,41 @@ const snap0 = await page.evaluate(() => window.__R2_SNAPSHOT__());
 record('seed.plan-created', Array.isArray(snap0.plans) && snap0.plans.length > 0,
   `plans=${snap0.plans?.length ?? 0}`);
 
+// Permanent fixture: training A is explicitly persisted and differs from newly created managed B.
+// Use the real IndexedDB transaction, then reload the actual Provider; no mocked store callback.
+const managedPlanB = await page.$eval('#manage-plan-select', (el) => el.value);
+const trainingPlanA = snap0.plans.find((p) => p.id !== managedPlanB)?.id;
+if (!trainingPlanA || !managedPlanB || trainingPlanA === managedPlanB) {
+  throw new Error('Fixture requires distinct existing training plan A and new managed plan B');
+}
+await page.evaluate(({ a, b }) => new Promise((resolve, reject) => {
+  const open = indexedDB.open('motion-training', 1);
+  open.onerror = () => reject(open.error);
+  open.onsuccess = () => {
+    const db = open.result;
+    const tx = db.transaction('settings', 'readwrite');
+    const store = tx.objectStore('settings');
+    const get = store.get('app');
+    get.onsuccess = () => store.put({ ...(get.result ?? {}), key: 'app', currentPlanId: a });
+    tx.oncomplete = () => { db.close(); window.location.hash = '#/plans?plan=' + encodeURIComponent(b); resolve(); };
+    tx.onerror = () => { db.close(); reject(tx.error); };
+    tx.onabort = () => { db.close(); reject(tx.error ?? new Error('Training fixture transaction aborted')); };
+  };
+}), { a: trainingPlanA, b: managedPlanB });
+await page.reload({ waitUntil: 'networkidle0' });
+await page.waitForSelector('#manage-plan-select');
+await wait(300);
+const explicitFixture = await page.evaluate(() => window.__R2_SNAPSHOT__());
+const managedAfterFixtureReload = await page.$eval('#manage-plan-select', (el) => el.value);
+record('seed.explicit-training-A-managed-B',
+  explicitFixture.settings?.currentPlanId === trainingPlanA && managedAfterFixtureReload === managedPlanB && trainingPlanA !== managedPlanB,
+  `trainingA=${trainingPlanA}; managedB=${managedPlanB}; DB=${explicitFixture.settings?.currentPlanId}; select=${managedAfterFixtureReload}`);
+
+
 /* ── 进入计划管理页（含递减组动作）── */
 async function gotoManage() {
   await page.evaluate(() => { window.location.hash = '#/plans'; });
-  await wait(700);
+  await wait(1200);
 }
 await gotoManage();
 
@@ -317,7 +354,12 @@ if (dropEditorOpened) {
 
 /* ── 缺口 3：Back/Forward 历史完整性 ── */
 await gotoManage();
-const histBefore = await page.evaluate(() => ({ len: window.history.length, hash: window.location.hash }));
+const histBefore = await page.evaluate(() => ({
+  len: window.history.length,
+  hash: window.location.hash,
+  managedPlanId: document.querySelector('#manage-plan-select')?.value ?? null,
+}));
+const snapBeforeBack = await page.evaluate(() => window.__R2_SNAPSHOT__());
 // 制造一次真实前进（进计划编辑）
 await clickByText('编辑动作');
 await wait(800);
@@ -329,15 +371,30 @@ record('history.entered-new-page', histMid.hash !== histBefore.hash,
 await page.goBack().catch(() => {});
 await wait(900);
 const histBack = await page.evaluate(() => ({ hash: window.location.hash, len: window.history.length }));
-record('history.back-returns', histBack.hash === histBefore.hash,
-  `back 后=${histBack.hash}（期望 ${histBefore.hash}）`);
+const snapAfterBack = await page.evaluate(() => window.__R2_SNAPSHOT__());
+const [actualBackPath, actualBackQuery] = histBack.hash.replace(/^#/, '').split('?');
+const actualBackPlanId = new URLSearchParams(actualBackQuery ?? '').get('plan');
+const backToManageOk =
+  actualBackPath === '/plans' &&
+  histBefore.managedPlanId !== null &&
+  actualBackPlanId === histBefore.managedPlanId &&
+  histBefore.managedPlanId === managedPlanB &&
+  snapBeforeBack.settings?.currentPlanId === trainingPlanA &&
+  snapAfterBack.settings?.currentPlanId === trainingPlanA;
+record('history.back-returns', backToManageOk,
+  `back 后=${histBack.hash}; expectedManagedPlanId=${histBefore.managedPlanId}; actualPlanId=${actualBackPlanId}; before=${histBefore.hash}`);
 
 // 真实 Forward
 await page.goForward().catch(() => {});
 await wait(900);
 const histFwd = await page.evaluate(() => ({ hash: window.location.hash, len: window.history.length }));
-record('history.forward-returns', histFwd.hash === histMid.hash,
-  `forward 后=${histFwd.hash}（期望 ${histMid.hash}）`);
+const snapAfterFwd = await page.evaluate(() => window.__R2_SNAPSHOT__());
+const currentPlanUnchanged =
+  snapBeforeBack.settings?.currentPlanId === trainingPlanA &&
+  snapAfterBack.settings?.currentPlanId === trainingPlanA &&
+  snapAfterFwd.settings?.currentPlanId === trainingPlanA;
+record('history.forward-returns', histFwd.hash === histMid.hash && histMid.hash.split('/')[2] === managedPlanB && currentPlanUnchanged,
+  `forward 后=${histFwd.hash}（期望 ${histMid.hash}）; currentPlanId 保持=${currentPlanUnchanged}`);
 
 /* ── 收尾 ── */
 const hashAfter = srcHash();
@@ -345,12 +402,18 @@ record('source.stable', hashBefore === hashAfter,
   `before=${hashBefore.slice(0, 12)} after=${hashAfter.slice(0, 12)}`);
 record('no.page-errors', pageErrors.length === 0, pageErrors.slice(0, 2).join(' | ') || '无异常');
 
-writeFileSync(path.join(OUTDIR, 'RESULTS.json'),
-  JSON.stringify({ stamp: STAMP, hashBefore, hashAfter, pageErrors, results }, null, 2));
-await page.screenshot({ path: path.join(OUTDIR, 'final.png'), fullPage: true }).catch(() => {});
-
-await browser.close();
-await new Promise((r) => server.close(r));
+  writeFileSync(path.join(OUTDIR, 'RESULTS.json'),
+    JSON.stringify({ stamp: STAMP, hashBefore, hashAfter, pageErrors, results }, null, 2));
+  await page.screenshot({ path: path.join(OUTDIR, 'final.png'), fullPage: true }).catch(() => {});
+} finally {
+  if (browser) {
+    try { await browser.close(); } catch {}
+  }
+  if (server) {
+    try { server.closeAllConnections?.(); } catch {}
+    try { await new Promise((r) => server.close(r)); } catch {}
+  }
+}
 
 const failed = results.filter((r) => !r.ok);
 console.log(`\n=== ${results.length - failed.length}/${results.length} PASS ===`);

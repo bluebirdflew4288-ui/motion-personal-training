@@ -1,5 +1,11 @@
+import { resolve, isAbsolute, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
+
+const APP_DIR = dirname(fileURLToPath(import.meta.url));
+const rawOutDir = process.env.MOTION_OUT_DIR || 'dist-web';
+const outDir = isAbsolute(rawOutDir) ? rawOutDir : resolve(APP_DIR, rawOutDir);
 
 /**
  * 两个构建目标：
@@ -21,8 +27,8 @@ export default defineConfig({
   },
   build: {
     target: 'es2020',
-    // 返工期间：修复版输出到独立目录，避免覆盖正在服务的 dist（v1）
-    outDir: process.env.MOTION_OUT_DIR || 'dist-v3',
+    // 默认输出到 dist-web；支持相对 APP 根或绝对路径（含中文/空格）
+    outDir,
     emptyOutDir: true,
     assetsInlineLimit: 0,
     rollupOptions: {

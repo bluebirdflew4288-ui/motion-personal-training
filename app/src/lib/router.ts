@@ -70,6 +70,9 @@ function readIdx(state: unknown): number | null {
  */
 let currentIdx: number | null = null;
 
+/** navigate/back 合成派发 hashchange 期间的标记：监听器只需同步视图，不再二次过门禁 */
+let selfDispatch = false;
+
 /**
  * 下一个 push 条目应有的序号 = **当前物理位置 + 1**。
  *
@@ -125,6 +128,17 @@ if (typeof window !== 'undefined') {
  * @returns true = 本次事件由调用者负责恢复；false = 已被别的订阅者处理
  */
 let lastRestoreEvent: unknown = null;
+
+/**
+ * 同一次原生 hashchange 事件在多个订阅者间共享决策状态。
+ *
+ * App 与 Plans 各自调用 useRoute()，同一个真实的浏览器 hashchange 事件会依次触发
+ * 两个监听器。首个监听器执行门禁与历史位置判定，若放行则更新 currentHash 并同步 route；
+ * 第二个监听器检测到同一事件 token 后，直接同步自己的有效 route，不再因 targetHash === currentHash
+ * 误判为回位弹跳而跳过自己的 setRoute。
+ */
+let currentEventToken: unknown = null;
+let currentEventAllowed = false;
 
 export function claimHistoryRestore(event: unknown): boolean {
   if (event === lastRestoreEvent) return false;
@@ -224,29 +238,53 @@ export function useRoute(): Route {
   useEffect(() => {
     const onChange = (event: Event) => {
       /**
-       * **B3/G5-R3：浏览器 Back/Forward 也必须过门禁**。
+       * **B3/G5-R3：浏览器 Back/Forward/锚点 Tab 也必须过门禁**。
        *
-       * 旧实现只让 `navigate()` 检查守卫；用户按真实浏览器 Back
-       * （或 hashchange 由历史栈触发）时直接 setRoute，脏视图被卸载 → 草稿丢失。
-       * Codex 真实 CUA 确证：配置页轮数 4 未保存，Tab.back 跳管理页，重进恢复 3。
+       * 旧实现只让 `navigate()` 检查守卫；用户按真实浏览器 Back/Forward
+       * （或锚点 hashchange）时直接 setRoute，脏视图被卸载 → 草稿丢失。
        *
        * 现在的处理：
-       *   · 若守卫阻止 → 用 history.go 把**位置**送回原条目（不改任何记录 URL），
-       *     → 不卸载当前视图，也不破坏历史栈的前后关系；
-       *   · 允许时正常更新 route 与快照。
+       *   · 若本次是 router 自己合成的 hashchange（navigate 已过门禁）→ 只同步视图；
+       *   · 若目标 hash 等于**已生效** hash（restoreEffectivePosition 的 go 回弹）→ 忽略，避免自激；
+       *   · 否则把**本次真实移动的方向/步数**（incomingIdx-currentIdx）作为 intent 交给守卫：
+       *       - 阻止 → 用 history.go 把位置送回原条目（不改任何记录 URL），确认后按 intent 继续；
+       *       - 允许 → 正常更新 route 与快照。
        */
+      if (selfDispatch) {
+        setRoute(parse());
+        return;
+      }
+      const eventToken = event && typeof event === 'object' ? event : null;
+      if (eventToken && eventToken === currentEventToken) {
+        if (currentEventAllowed) {
+          setRoute(parse());
+        }
+        return;
+      }
+      currentEventToken = eventToken;
+      currentEventAllowed = false;
+
+      const targetHash = window.location.hash;
+      // 回位弹跳：目标就是当前已生效 hash → 是我们自己 go 回来的事件，忽略以免重复回滚
+      if (targetHash === currentHash) return;
+      const incomingIdx = readIdx(window.history.state);
+      // 真实方向：incomingIdx - currentIdx（Forward 为 +1，Back 为 -1）；未知时保守按后退一步
+      const moveDelta =
+        currentIdx !== null && incomingIdx !== null ? incomingIdx - currentIdx : null;
+      blockedNavigation = { kind: 'pop', delta: moveDelta ?? -1, targetHash };
       if (isLeaveBlocked()) {
         restoreEffectivePosition(readIdx(window.history.state), event);
         return;
       }
-      const idx = readIdx(window.history.state);
-      if (idx !== null) {
+      blockedNavigation = null;
+      if (incomingIdx !== null) {
         // 允许的 POP：位置跟着目标条目走（这可能比 currentIdx 小 = 真的后退）
-        currentIdx = idx;
+        currentIdx = incomingIdx;
       } else {
         seedCurrentIdx();
       }
-      currentHash = window.location.hash;
+      currentHash = targetHash;
+      currentEventAllowed = true;
       setRoute(parse());
     };
     // 首次挂载同步快照，避免初值不一致导致误回滚
@@ -259,22 +297,30 @@ export function useRoute(): Route {
 }
 
 /**
- * 离页门禁（B2/G5-R3）。
+ * 一次「导航尝试」的意图（B2/G5-R3 的窄机制）。
  *
- * ── 为什么需要 ────────────────────────────────────────────────
- * 旧 `navigate` 直接改 hash，任何页面都能在草稿未保存时被卸载。
- * Codex 真实 CUA 确证：管理页有未保存草稿时点"编辑训练日"直接导航丢草稿；
- * 递减组轮数改了没保存，点"‹计划"无提示返回，草稿丢失。
+ * <p>关键区别：这是**本次同步调用**的意图，不是可跨轮次重放的 pending 全局状态。
+ * router 在每次 `navigate` / `back` / 真实 `hashchange` 尝试时生成一个**新的** intent
+ * 交给守卫；需要弹「保存 / 放弃 / 留下」的页面（如历史纠错）把它存进**本页**确认弹层，
+ * 决定后据此续上**本次**导航。取消/失败只是丢弃本页弹层，不会污染下一次。
  *
- * ── 语义 ──────────────────────────────────────────────────────
- * 注册的守卫返回 `true` 表示"**允许**离开"，`false` 表示"阻止"。
- * 任一守卫阻止则不导航。守卫由页面在挂载时注册、卸载时注销。
- * 这是**局部可审查**的机制，不是全 App 草稿框架。
+ * · `nav`          —— 一次 navigate(path, replace)；
+ * · `pop`          —— 浏览器 Back/Forward 触发的真实 hashchange；
+ *                     `delta` 是浏览器本次真实移动的步数（Forward +1 / Back -1），
+ *                     确认后 `history.go(delta)` 可继续到原目标，而不是一律后退。
+ * · `back`         —— 一次程序化 back(fallback)；
+ * · `native-back`  —— 原生返回键（由 nativeBack 门禁处理）。
  */
-export type LeaveGuard = () => boolean;
+export type BlockedNavigation =
+  | { kind: 'nav'; path: string; replace?: boolean }
+  | { kind: 'pop'; delta: number; targetHash: string }
+  | { kind: 'back'; fallback?: string }
+  | { kind: 'native-back' };
+
+export type LeaveGuard = (intent: BlockedNavigation | null) => boolean;
 const leaveGuards = new Set<LeaveGuard>();
 
-/** 注册离页守卫，返回注销函数 */
+/** 注册离页守卫，返回注销函数。守卫从参数拿到**本次**导航意图（可为 null）。 */
 export function registerLeaveGuard(guard: LeaveGuard): () => void {
   leaveGuards.add(guard);
   return () => {
@@ -282,11 +328,11 @@ export function registerLeaveGuard(guard: LeaveGuard): () => void {
   };
 }
 
-/** 当前是否有守卫阻止离开（供 UI 提示用） */
+/** 当前是否有守卫阻止离开（把本次 intent 交给守卫，供 UI 记录/提示用） */
 export function isLeaveBlocked(): boolean {
   for (const g of leaveGuards) {
     try {
-      if (!g()) return true;
+      if (!g(blockedNavigation)) return true;
     } catch {
       // 守卫抛错按阻止处理（保守）
       return true;
@@ -295,12 +341,32 @@ export function isLeaveBlocked(): boolean {
   return false;
 }
 
+/**
+ * **仅本次同步调用**的导航意图。
+ *
+ * 每次尝试前由 navigate/back/onChange 覆盖写入，成功放行后清空、被拦时保留给
+ * 同步执行的守卫读取。它不是跨轮次重放的 pending 状态；页面不再依赖它续导航。
+ */
+let blockedNavigation: BlockedNavigation | null = null;
+
+/** router 自己合成派发 hashchange：navigate 已完成门禁与序号维护，监听器只需同步视图 */
+function dispatchSyntheticHashChange(): void {
+  selfDispatch = true;
+  try {
+    window.dispatchEvent(new HashChangeEvent('hashchange'));
+  } finally {
+    selfDispatch = false;
+  }
+}
+
 export function navigate(path: string, replace = false): void {
   /**
    * 统一门禁：所有导航（管理 select、进日编辑、返回、主导航）都过这里。
-   * 被阻止时**不导航**，也不清任何状态 —— 由调用方决定是否提示。
+   * 被阻止时**不导航**；本次意图经 blockedNavigation 传给守卫，页面据此确认后续上。
    */
+  blockedNavigation = { kind: 'nav', path, replace };
   if (isLeaveBlocked()) return;
+  blockedNavigation = null;
   const target = `#${path}`;
   seedCurrentIdx();
   if (replace) {
@@ -313,19 +379,12 @@ export function navigate(path: string, replace = false): void {
     }
     // 门禁已放行，同步快照后再广播，避免监听器把它当"未生效"回滚
     currentHash = target;
-    window.dispatchEvent(new HashChangeEvent('hashchange'));
+    dispatchSyntheticHashChange();
   } else if (window.location.hash !== target) {
     /**
      * B4-R3 closure：push 一条**带序号**的记录。
-     *
-     * 用 pushState 而不是 `location.hash =` 才能把序号一起写入；
-     * 两者都会产生真实历史条目，浏览器 Back/Forward 行为一致。
-     * pushState 不会自动触发 hashchange，因此这里显式广播（与 replace 路径同构）。
-     */
-    /**
-     * 关键（B4-R3 closure · N05 修补）：序号是**物理位置** = 当前位置 + 1。
-     * 绝不能用"全局唯一递增号"——一旦浏览器截断 forward 分支，
-     * 两者就会分叉，`history.go(delta)` 也就不再等于真实步数。
+     * 序号是**物理位置** = 当前位置 + 1（一旦浏览器截断 forward 分支，
+     * 全局唯一递增号会与物理位置分叉，`history.go(delta)` 就不再等于真实步数）。
      */
     const nextIdx = nextPushIdx(currentIdx);
     currentIdx = nextIdx;
@@ -335,7 +394,7 @@ export function navigate(path: string, replace = false): void {
       window.history.pushState(null, '', target);
     }
     currentHash = target;
-    window.dispatchEvent(new HashChangeEvent('hashchange'));
+    dispatchSyntheticHashChange();
   }
 }
 
@@ -346,7 +405,9 @@ export function navigate(path: string, replace = false): void {
  * 否则"‹计划"之类的返回按钮仍能在脏视图下丢草稿。
  */
 export function back(fallback = '/'): void {
+  blockedNavigation = { kind: 'back', fallback };
   if (isLeaveBlocked()) return;
+  blockedNavigation = null;
   if (window.history.length > 1) window.history.back();
   else navigate(fallback, true);
 }

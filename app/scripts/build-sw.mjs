@@ -5,12 +5,13 @@
    · 数据库升级不在 SW 里做，避免打断进行中的训练 */
 
 import { readdirSync, statSync, writeFileSync } from 'node:fs';
-import { join, relative, sep } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-// 路径里含中文/空格时必须先解码 file URL，否则 readdir 会拿到百分号编码路径
-const OUT_DIR = process.env.MOTION_OUT_DIR || 'dist-v3';
-const DIST = fileURLToPath(new URL(`../${OUT_DIR}/`, import.meta.url));
+// 路径支持相对 APP 根或绝对路径，且不经由 new URL 以免对中文/空格/绝对路径产生百分号编码或解析错误
+const APP_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const OUT_DIR = process.env.MOTION_OUT_DIR || 'dist-web';
+const DIST = isAbsolute(OUT_DIR) ? resolve(OUT_DIR) : resolve(APP_DIR, OUT_DIR);
 const VERSION = process.env.SW_VERSION || String(Date.now());
 
 function walk(dir, out = []) {

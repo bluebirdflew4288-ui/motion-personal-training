@@ -1,0 +1,97 @@
+name: CI Check
+
+'on':
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Typecheck, Unit Tests, JVM Tests, DOM Regression & Web Builds
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Set up Java 21 (Temurin)
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install dependencies (fresh npm ci)
+        run: |
+          npm ci
+
+      - name: Security audit check (all & production)
+        run: |
+          mkdir -p "${RUNNER_TEMP}/audit"
+          prod_status=0
+          npm audit --omit=dev --json > "${RUNNER_TEMP}/audit/audit-prod.json" || prod_status=$?
+          all_status=0
+          npm audit --json > "${RUNNER_TEMP}/audit/audit-all.json" || all_status=$?
+          AUDIT_PROD_STATUS="$prod_status" AUDIT_ALL_STATUS="$all_status" node -e '
+            const fs = require("node:fs");
+            const read = (name, statusText) => {
+              const status = Number(statusText);
+              const body = fs.readFileSync(`${process.env.RUNNER_TEMP}/audit/audit-${name}.json`, "utf8");
+              if (status !== 0 && status !== 1) throw new Error(`${name}: npm audit operational failure (exit ${status})`);
+              const report = JSON.parse(body);
+              if (report.error) throw new Error(`${name}: npm audit returned an error report`);
+              const counts = report.metadata?.vulnerabilities;
+              for (const key of ["info", "low", "moderate", "high", "critical", "total"]) {
+                if (!Number.isSafeInteger(counts?.[key]) || counts[key] < 0) throw new Error(`${name}: invalid vulnerabilities.${key}`);
+              }
+              if (counts.total !== counts.info + counts.low + counts.moderate + counts.high + counts.critical) {
+                throw new Error(`${name}: inconsistent vulnerability counts`);
+              }
+              if (status === 1 && counts.total === 0) throw new Error(`${name}: exit 1 without vulnerabilities`);
+              return counts;
+            };
+            const prod = read("prod", process.env.AUDIT_PROD_STATUS);
+            const all = read("all", process.env.AUDIT_ALL_STATUS);
+            console.log("Production audit vulnerabilities:", prod);
+            console.log("Full audit vulnerabilities:", all);
+            if (prod.total > 0 || all.high > 0 || all.critical > 0) process.exit(1);
+          '
+
+      - name: Locate and verify Chrome on runner
+        run: |
+          CHROME_BIN=$(which google-chrome || which chromium-browser || which chromium || true)
+          if [ -z "$CHROME_BIN" ] || [ ! -x "$CHROME_BIN" ]; then
+            echo "::error::Chrome or Chromium binary not found on runner"
+            exit 1
+          fi
+          echo "MOTION_CHROME_PATH=$CHROME_BIN" >> "$GITHUB_ENV"
+          echo "Located Chrome binary at: $CHROME_BIN"
+          "$CHROME_BIN" --version
+
+      - name: Run unified check (Typecheck, Unit tests, JVM tests, DOM regression)
+        env:
+          MOTION_UI_EVIDENCE_DIR: ${{ runner.temp }}/evidence/dom-regression
+          MOTION_NATIVE_TEST_OUT: ${{ runner.temp }}/native-out
+        run: |
+          npm run check
+
+      - name: Build Web assets (default dist-web with SW)
+        run: |
+          npm run build
+          test -f dist-web/index.html || { echo "dist-web/index.html missing"; exit 1; }
+          test -f dist-web/sw.js || { echo "dist-web/sw.js missing"; exit 1; }
+
+      - name: Build Android Web assets (dist-android without SW)
+        run: |
+          npm run build:android
+          test -f dist-android/index.html || { echo "dist-android/index.html missing"; exit 1; }
+          test ! -f dist-android/sw.js || { echo "sw.js unexpectedly found in dist-android"; exit 1; }

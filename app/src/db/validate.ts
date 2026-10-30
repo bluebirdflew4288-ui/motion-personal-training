@@ -35,6 +35,7 @@ import {
   MAX_EXERCISES,
   MAX_LOGGED_REPS,
   MAX_PLANS,
+  MAX_PLAN_NAME,
   MAX_REPS,
   MAX_REST,
   MAX_ROUNDS,
@@ -72,6 +73,14 @@ function firstIssues(list: ValidationIssue[], n: number): ValidationIssue[] {
 
 class Ctx {
   issues: ValidationIssue[] = [];
+  /**
+   * `Plan.name` / `Session.planName` 两个**显示名称字段**的读取上限。
+   *
+   * <p>默认 = `MAX_PLAN_NAME`（严格，用于任何非全量备份读取的调用）。
+   * 仅当 `validateDataDeep` 收到显式的 legacy 兼容策略时（见 {@link validateDataDeep}），
+   * 才放宽到 {@link MAX_LEGACY_PLAN_NAME}。**只影响这两个字段**，其它文本字段仍用各自上限。
+   */
+  planNameMax: number = MAX_PLAN_NAME;
   add(path: string, message: string) {
     this.issues.push({ path, message });
     return false;
@@ -396,7 +405,7 @@ function validatePlan(c: Ctx, v: unknown, path: string): Plan | null {
 
   return {
     id: str(c, v.id, `${path}.id`, { max: 120 }),
-    name: str(c, v.name, `${path}.name`, { max: 200 }),
+    name: str(c, v.name, `${path}.name`, { max: c.planNameMax }),
     days,
     cursor: Math.min(cursor, Math.max(0, days.length - 1)),
     createdAt: timestamp(c, v.createdAt, `${path}.createdAt`) ?? Date.now(),
@@ -648,7 +657,7 @@ function validateSession(c: Ctx, v: unknown, path: string): Session | null {
   return {
     id: str(c, v.id, `${path}.id`, { max: 120 }),
     planId: str(c, v.planId, `${path}.planId`, { max: 120 }),
-    planName: str(c, v.planName, `${path}.planName`, { max: 200 }),
+    planName: str(c, v.planName, `${path}.planName`, { max: c.planNameMax }),
     day: {
       dayId: str(c, day.dayId, `${path}.day.dayId`, { max: 120 }),
       dayName: str(c, day.dayName, `${path}.day.dayName`, { max: 100 }),
@@ -717,8 +726,21 @@ export interface ValidatedData {
   settings: unknown[];
 }
 
-export function validateDataDeep(data: unknown): DeepValidation<ValidatedData> {
+export interface DeepValidateOptions {
+  /**
+   * 仅对 `Plan.name` 与 `Session.planName` 两个旧显示名称字段生效的 reader 兼容上限。
+   *
+   * <p>由**受支持的全量备份解析入口**（`validateBackup`，含恢复前快照）显式传入
+   * `MAX_LEGACY_PLAN_NAME`。不传时保持严格 `MAX_PLAN_NAME`，避免全局放宽。
+   */
+  legacyPlanNameMax?: number;
+}
+
+export function validateDataDeep(data: unknown, opts: DeepValidateOptions = {}): DeepValidation<ValidatedData> {
   const c = new Ctx();
+  if (opts.legacyPlanNameMax !== undefined) {
+    c.planNameMax = opts.legacyPlanNameMax;
+  }
   if (!isObj(data)) {
     return { ok: false, issues: [{ path: 'data', message: '备份缺少 data 对象' }] };
   }
@@ -774,6 +796,26 @@ export function validateDataDeep(data: unknown): DeepValidation<ValidatedData> {
   if (c.failed) return { ok: false, issues: firstIssues(c.issues, 40) };
 
   const warnings: string[] = [];
+  /**
+   * 旧长名称兼容提示：仅在 reader 放宽到 >MAX_PLAN_NAME 时产生；
+   * 普通名称不产生任何「legacy」误报。历史快照与当前计划分别说明，避免误导。
+   */
+  if (c.planNameMax > MAX_PLAN_NAME) {
+    const legacyPlanCount = plans.filter((p) => p.name.length > MAX_PLAN_NAME).length;
+    const legacySessionCount = sessions.filter((s) => s.planName.length > MAX_PLAN_NAME).length;
+    if (legacyPlanCount) {
+      warnings.push(
+        `备份包含 ${legacyPlanCount} 个旧计划名称超过 ${MAX_PLAN_NAME} 字（将按原文完整保留、不截断；` +
+          `如需继续编辑该计划，请在计划页显式改名到 ${MAX_PLAN_NAME} 字以内）`,
+      );
+    }
+    if (legacySessionCount) {
+      warnings.push(
+        `备份包含 ${legacySessionCount} 条历史记录的计划名称超过 ${MAX_PLAN_NAME} 字` +
+          `（历史快照按原文保留，无需、也无法通过修改当前计划来修复）`,
+      );
+    }
+  }
   const actives = sessions.filter((s) => s.status === 'active');
   if (actives.length > 1) warnings.push(`备份包含 ${actives.length} 个未结束训练，导入后将逐条处理`);
   else if (actives.length === 1) warnings.push('备份包含 1 个未结束训练，恢复后可继续记录');

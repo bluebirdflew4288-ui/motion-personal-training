@@ -1,12 +1,17 @@
 #!/usr/bin/env node
 /* MOTION · Android 打包流水线（一条命令可复现）。
    ── 步骤 ────────────────────────────────────────────────────
-     1. 用 MOTION_TARGET=android 构建到 **dist-android**（不覆盖 dist / dist-v2…dist-v8）
+     0. 前置静态自检与门禁（必须在任何 dist/public 清理或写入前通过）：
+        a. ANDROID_HOME / ANDROID_SDK_ROOT 存在性与有效性校验
+        b. TypeScript 类型检查（tsc）
+        c. 全量单元测试（npm run test）
+        d. 纯 JVM 原生 I/O 测试（npm run android:test:java）
+        任何一项失败立即中止退出，绝不继续进行构建、清理或 cap sync。
+     1. 用 MOTION_TARGET=android 构建到 **dist-android**（不覆盖 dist-web / 历史 dist）
      2. 清除 exFAT / Finder 产生的 AppleDouble（`._*`）与 .DS_Store
-        —— 这些文件会让 aapt2 把 `._drawable` 当成资源目录并直接失败
-        （真实报错：'.../packageDebugResources/._drawable' is not a directory）
      3. npx cap sync android（把 dist-android 复制进 APK 的 assets/public）
      4. 静态自检：APK 资源里必须是最新构建、且 capacitor 配置无远程 server.url
+        （任何自检失败立即中止退出，绝不继续执行 Gradle）
      5. Gradle 构建 debug / release（release 有签名配置才签）
 
    用法：
@@ -26,7 +31,6 @@ import { fileURLToPath } from 'node:url';
 const APP_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const DIST = join(APP_DIR, 'dist-android');
 const ANDROID_DIR = join(APP_DIR, 'android');
-const wantRelease = process.argv.includes('--release');
 
 /**
  * 与 android/build.gradle 完全一致的构建目录指纹。
@@ -46,18 +50,18 @@ export function motionProjectKey(androidDir) {
 
 const log = (m) => console.log(`\n▶ ${m}`);
 const ok = (m) => console.log(`  ✔ ${m}`);
-const fail = (m) => {
-  console.error(`  ✘ ${m}`);
-  process.exitCode = 1;
-};
 
-function run(cmd, args, opts = {}) {
+function defaultRun(cmd, args, opts = {}) {
   console.log(`  $ ${cmd} ${args.join(' ')}`);
-  return execFileSync(cmd, args, { cwd: opts.cwd ?? APP_DIR, stdio: 'inherit', env: { ...process.env, ...opts.env } });
+  return execFileSync(cmd, args, {
+    cwd: opts.cwd ?? APP_DIR,
+    stdio: 'inherit',
+    env: { ...process.env, ...opts.env },
+  });
 }
 
 /** 递归删除 AppleDouble（._*）与 .DS_Store —— 只删这些元数据文件，不碰任何源码 */
-function stripAppleDouble(root) {
+export function stripAppleDouble(root) {
   let removed = 0;
   const walk = (dir) => {
     for (const name of readdirSync(dir)) {
@@ -86,110 +90,191 @@ function stripAppleDouble(root) {
   return removed;
 }
 
-// ── 1. Web 构建（android 目标）──────────────────────────────
-// 注意：Capacitor 用**稳定的本地 origin**（https://localhost 由 WebView 内部拦截映射到
-// 应用自带 assets），不是 file://。IndexedDB / localStorage 都挂在这个稳定 origin 下，
-// 因此覆盖安装后数据仍在；这也正是不能依赖 http://192.168.* 或开发端口的原因。
-log('1/5 构建 dist-android（MOTION_TARGET=android）');
-run('npx', ['vite', 'build'], {
-  env: { MOTION_TARGET: 'android', MOTION_OUT_DIR: 'dist-android' },
-});
-if (!existsSync(join(DIST, 'index.html'))) {
-  fail('dist-android/index.html 不存在，构建失败');
-  process.exit(1);
-}
-ok(`dist-android 已生成（${readdirSync(join(DIST, 'assets')).length} 个 asset 文件）`);
-
-// 原生包不注册 SW：构建脚本也不再生成 sw.js（build-sw.mjs 属 web 目标）
-if (existsSync(join(DIST, 'sw.js'))) {
-  fail('dist-android 里出现了 sw.js —— 原生包不应有 Service Worker');
-} else {
-  ok('dist-android 无 sw.js（原生包不注册 Service Worker，符合要求 A）');
-}
-
-// ── 2. 清 AppleDouble ──────────────────────────────────────
-log('2/5 清理 exFAT/Finder 元数据（._* / .DS_Store）');
-const removedDist = stripAppleDouble(DIST);
-const removedAndroid = stripAppleDouble(ANDROID_DIR);
-ok(`dist-android 清理 ${removedDist} 个，android/ 清理 ${removedAndroid} 个`);
-
-// ── 3. cap sync ────────────────────────────────────────────
-log('3/5 npx cap sync android');
-run('npx', ['cap', 'sync', 'android']);
-// cap sync 自己也可能引入 AppleDouble（写入时触发 Finder）
-const removedAfterSync = stripAppleDouble(ANDROID_DIR);
-if (removedAfterSync) ok(`cap sync 后再清理 ${removedAfterSync} 个元数据文件`);
-
-// ── 4. 静态自检 ────────────────────────────────────────────
-log('4/5 静态自检（打包资源 = 本次构建，且无远程 server.url）');
-const assetsPublic = join(ANDROID_DIR, 'app/src/main/assets/public');
-if (!existsSync(join(assetsPublic, 'index.html'))) {
-  fail('android/app/src/main/assets/public/index.html 不存在（cap sync 未生效）');
-} else {
-  // 4a. 打包进 APK 的 index.js 名必须与实际构建产物一致
-  const builtHtml = readFileSync(join(DIST, 'index.html'), 'utf8');
-  const packedHtml = readFileSync(join(assetsPublic, 'index.html'), 'utf8');
-  const builtScript = /assets\/(index-[A-Za-z0-9_-]+\.js)/.exec(builtHtml)?.[1];
-  const packedScript = /assets\/(index-[A-Za-z0-9_-]+\.js)/.exec(packedHtml)?.[1];
-  if (!builtScript) fail('dist-android/index.html 里找不到入口脚本');
-  else if (builtScript !== packedScript) fail(`APK 资源与本次构建不一致：${builtScript} vs ${packedScript}`);
-  else ok(`APK 内的入口脚本就是本次构建产物：${builtScript}`);
-
-  // 4b. 打包资源里不得含远程 server.url / LAN 地址
-  const cfg = readFileSync(join(APP_DIR, 'capacitor.config.ts'), 'utf8');
-  if (/server\s*:/.test(cfg) && /url\s*:/.test(cfg)) fail('capacitor.config 里出现 server.url —— 禁止远程加载');
-  else ok('capacitor.config 无 server.url');
-
-  // 4c. 打包后的 HTML/JS 不含 http(s) 外链引用（字体/样式全本地）
-  const remoteRefs = [...packedHtml.matchAll(/https?:\/\/[^\s"')]+/g)].map((m) => m[0]);
-  if (remoteRefs.length) fail(`打包 HTML 里仍有远程引用：${remoteRefs.join(', ')}`);
-  else ok('打包 HTML 无远程 URL 引用');
-}
-
-// ── 5. Gradle 构建 ─────────────────────────────────────────
-log('5/5 Gradle 构建');
-const sdk = process.env.ANDROID_HOME || process.env.ANDROID_SDK_ROOT;
-if (!sdk || !existsSync(sdk)) {
-  fail('未设置 ANDROID_HOME / ANDROID_SDK_ROOT，或路径不存在');
-  process.exit(1);
-}
-ok(`ANDROID_HOME=${sdk}`);
-
-const gradlew = join(ANDROID_DIR, 'gradlew');
-run(gradlew, [':app:assembleDebug', '--no-daemon'], { cwd: ANDROID_DIR, env: { ANDROID_HOME: sdk, ANDROID_SDK_ROOT: sdk } });
-ok('assembleDebug 完成');
-
-if (wantRelease) {
-  const signingDir = process.env.MOTION_SIGNING_DIR || join(process.env.HOME ?? '', '.motion-android-signing');
-  if (existsSync(join(signingDir, 'keystore.properties'))) {
-    ok('检测到签名配置，构建已签名 release');
-  } else {
-    console.log('  · 未发现签名配置（' + signingDir + '/keystore.properties），release 将未签名');
+/**
+ * 校验 Android SDK 环境变量与目录存在性（纯校验边界）
+ */
+export function resolveAndroidSdk(env = process.env, existsFn = existsSync) {
+  const sdk = env.ANDROID_HOME || env.ANDROID_SDK_ROOT;
+  if (!sdk || !existsFn(sdk)) {
+    return { ok: false, error: '未设置 ANDROID_HOME / ANDROID_SDK_ROOT，或路径不存在' };
   }
-  run(gradlew, [':app:assembleRelease', '--no-daemon'], { cwd: ANDROID_DIR, env: { ANDROID_HOME: sdk, ANDROID_SDK_ROOT: sdk } });
-  ok('assembleRelease 完成');
+  return { ok: true, path: sdk };
 }
 
-// ── 输出位置 ───────────────────────────────────────────────
-log('产物位置');
-// buildDir 已被重定向到 APFS（见 android/build.gradle），产物路径随之改变。
-// 目录名必须用同一个指纹，否则同名项目的 APK 会互相覆盖 / 脚本找不到自己的产物。
-const buildRoot =
-  process.env.MOTION_ANDROID_BUILD_DIR || join(process.env.HOME ?? '', '.motion-android-build');
-const projectKey = motionProjectKey(ANDROID_DIR);
-// Gradle 的 project.path 为 ':' 时用 '_root'，为 ':app' 时替换 ':' 得到 '_app'
-// ——必须与 android/build.gradle 的 buildDir 规则逐字一致，否则找不到产物。
-const appOut = join(buildRoot, projectKey, '_app/outputs/apk');
-console.log(`\n  构建目录指纹: ${projectKey}`);
-for (const [label, p] of [
-  ['debug', join(appOut, 'debug/app-debug.apk')],
-  ['release(unsigned)', join(appOut, 'release/app-release-unsigned.apk')],
-  ['release(signed)', join(appOut, 'release/app-release.apk')],
-]) {
-  if (existsSync(p)) console.log(`  ${label}: ${p}`);
+/**
+ * 校验打包前后静态资源与配置安全契约（纯校验边界）
+ */
+export function validateStaticAssets({ builtHtml, packedHtml, capacitorConfigContent }) {
+  const errors = [];
+  const builtScript = /assets\/(index-[A-Za-z0-9_-]+\.js)/.exec(builtHtml || '')?.[1];
+  const packedScript = /assets\/(index-[A-Za-z0-9_-]+\.js)/.exec(packedHtml || '')?.[1];
+
+  if (!builtScript) {
+    errors.push('dist-android/index.html 里找不到入口脚本');
+  } else if (builtScript !== packedScript) {
+    errors.push(`APK 资源与本次构建不一致：${builtScript} vs ${packedScript}`);
+  }
+
+  if (/server\s*:/.test(capacitorConfigContent || '') && /url\s*:/.test(capacitorConfigContent || '')) {
+    errors.push('capacitor.config 里出现 server.url —— 禁止远程加载');
+  }
+
+  const remoteRefs = [...(packedHtml || '').matchAll(/https?:\/\/[^\s"')]+/g)].map((m) => m[0]);
+  if (remoteRefs.length) {
+    errors.push(`打包 HTML 里仍有远程引用：${remoteRefs.join(', ')}`);
+  }
+
+  return {
+    ok: errors.length === 0,
+    errors,
+    builtScript: builtScript || null,
+    packedScript: packedScript || null,
+  };
 }
-if (process.exitCode) {
-  console.error('\n构建过程中有失败项，见上面的 ✘');
-} else {
+
+/**
+ * 前置门禁编排：按严格顺序执行 SDK 检查 → 类型检查 → 单元测试 → 纯 JVM 测试
+ * 任何一步失败立即退出，不进入任何写入或清理流程
+ */
+export function runPreflightGate({ env = process.env, existsFn = existsSync, runFn = defaultRun } = {}) {
+  log('0/5 前置门禁：Android SDK 路径存在性核查');
+  const sdkCheck = resolveAndroidSdk(env, existsFn);
+  if (!sdkCheck.ok) {
+    throw new Error(sdkCheck.error);
+  }
+  ok(`ANDROID_HOME=${sdkCheck.path}`);
+
+  log('0/5 前置门禁：TypeScript 类型检查（typecheck）');
+  runFn('npm', ['run', 'typecheck']);
+  ok('类型检查通过');
+
+  log('0/5 前置门禁：全量单元测试（unit test）');
+  runFn('npm', ['run', 'test']);
+  ok('单元测试通过');
+
+  log('0/5 前置门禁：纯 JVM 原生 I/O 测试（android:test:java）');
+  runFn('npm', ['run', 'android:test:java']);
+  ok('纯 JVM 测试通过');
+
+  return { sdk: sdkCheck.path };
+}
+
+/**
+ * 完整打包编排流程，便于在受控 fixture 下测试异常退出语义
+ */
+export function executeAndroidBuild({
+  env = process.env,
+  argv = process.argv,
+  existsFn = existsSync,
+  runFn = defaultRun,
+  readFn = readFileSync,
+  stripFn = stripAppleDouble,
+  appDir = APP_DIR,
+} = {}) {
+  const wantRelease = argv.includes('--release');
+  const distDir = join(appDir, 'dist-android');
+  const androidDir = join(appDir, 'android');
+
+  // 0. 前置门禁（在任何 dist/public 清理或写入前）
+  const { sdk } = runPreflightGate({ env, existsFn, runFn });
+
+  // 1. Web 构建（android 目标）
+  log('1/5 构建 dist-android（MOTION_TARGET=android）');
+  runFn('npx', ['vite', 'build'], {
+    env: { MOTION_TARGET: 'android', MOTION_OUT_DIR: 'dist-android' },
+  });
+
+  const distHtmlPath = join(distDir, 'index.html');
+  if (!existsFn(distHtmlPath)) {
+    throw new Error('dist-android/index.html 不存在，构建失败');
+  }
+  if (existsFn(join(distDir, 'sw.js'))) {
+    throw new Error('dist-android 里出现了 sw.js —— 原生包不应有 Service Worker');
+  }
+  ok('dist-android 已生成，且无 sw.js');
+
+  // 2. 清 AppleDouble
+  log('2/5 清理 exFAT/Finder 元数据（._* / .DS_Store）');
+  const removedDist = stripFn(distDir);
+  const removedAndroid = stripFn(androidDir);
+  ok(`dist-android 清理 ${removedDist} 个，android/ 清理 ${removedAndroid} 个`);
+
+  // 3. cap sync
+  log('3/5 npx cap sync android');
+  runFn('npx', ['cap', 'sync', 'android']);
+  const removedAfterSync = stripFn(androidDir);
+  if (removedAfterSync) ok(`cap sync 后再清理 ${removedAfterSync} 个元数据文件`);
+
+  // 4. 静态自检（所有静态自检失败立即中止，不能继续 Gradle）
+  log('4/5 静态自检（打包资源 = 本次构建，且无远程 server.url）');
+  const assetsPublic = join(androidDir, 'app/src/main/assets/public');
+  const packedHtmlPath = join(assetsPublic, 'index.html');
+  if (!existsFn(packedHtmlPath)) {
+    throw new Error('android/app/src/main/assets/public/index.html 不存在（cap sync 未生效）');
+  }
+
+  const builtHtml = readFn(distHtmlPath, 'utf8');
+  const packedHtml = readFn(packedHtmlPath, 'utf8');
+  const cfg = readFn(join(appDir, 'capacitor.config.ts'), 'utf8');
+
+  const checkResult = validateStaticAssets({
+    builtHtml,
+    packedHtml,
+    capacitorConfigContent: cfg,
+  });
+  if (!checkResult.ok) {
+    throw new Error(`静态自检失败：\n${checkResult.errors.map((e) => '  ✘ ' + e).join('\n')}`);
+  }
+  ok(`APK 内的入口脚本就是本次构建产物：${checkResult.builtScript}`);
+  ok('capacitor.config 无 server.url');
+  ok('打包 HTML 无远程 URL 引用');
+
+  // 5. Gradle 构建
+  log('5/5 Gradle 构建');
+  const gradlew = join(androidDir, 'gradlew');
+  runFn(gradlew, [':app:assembleDebug', '--no-daemon'], {
+    cwd: androidDir,
+    env: { ANDROID_HOME: sdk, ANDROID_SDK_ROOT: sdk },
+  });
+  ok('assembleDebug 完成');
+
+  if (wantRelease) {
+    const signingDir = env.MOTION_SIGNING_DIR || join(env.HOME ?? '', '.motion-android-signing');
+    if (existsFn(join(signingDir, 'keystore.properties'))) {
+      ok('检测到签名配置，构建已签名 release');
+    } else {
+      console.log('  · 未发现签名配置（' + signingDir + '/keystore.properties），release 将未签名');
+    }
+    runFn(gradlew, [':app:assembleRelease', '--no-daemon'], {
+      cwd: androidDir,
+      env: { ANDROID_HOME: sdk, ANDROID_SDK_ROOT: sdk },
+    });
+    ok('assembleRelease 完成');
+  }
+
+  // 产物位置
+  log('产物位置');
+  const buildRoot = env.MOTION_ANDROID_BUILD_DIR || join(env.HOME ?? '', '.motion-android-build');
+  const projectKey = motionProjectKey(androidDir);
+  const appOut = join(buildRoot, projectKey, '_app/outputs/apk');
+  console.log(`\n  构建目录指纹: ${projectKey}`);
+  for (const [label, p] of [
+    ['debug', join(appOut, 'debug/app-debug.apk')],
+    ['release(unsigned)', join(appOut, 'release/app-release-unsigned.apk')],
+    ['release(signed)', join(appOut, 'release/app-release.apk')],
+  ]) {
+    if (existsFn(p)) console.log(`  ${label}: ${p}`);
+  }
   console.log('\n完成。');
+}
+
+// 生产执行入口（无绕过安全门禁的生产开关）
+const isMain = process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1]);
+if (isMain) {
+  try {
+    executeAndroidBuild();
+  } catch (err) {
+    console.error(`\n  ✘ ${err.message}`);
+    process.exit(1);
+  }
 }

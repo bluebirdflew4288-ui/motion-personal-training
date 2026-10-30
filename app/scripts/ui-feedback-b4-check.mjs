@@ -24,7 +24,9 @@ import puppeteer from 'puppeteer-core';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CHROME = process.env.MOTION_CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const STAMP = new Date().toISOString().replace(/[:.]/g, '-');
-const OUTDIR = path.join(ROOT, 'verify-self/feedback-b4', STAMP);
+const OUTDIR = process.env.MOTION_UI_EVIDENCE_DIR
+  ? path.resolve(process.env.MOTION_UI_EVIDENCE_DIR)
+  : path.join(ROOT, 'verify-self/feedback-b4', STAMP);
 mkdirSync(OUTDIR, { recursive: true });
 
 const results = [];
@@ -96,11 +98,13 @@ function srcHash() {
 }
 const hashBefore = srcHash();
 
-const browser = await puppeteer.launch({
-  executablePath: CHROME,
-  headless: 'new',
-  args: ['--no-sandbox', '--user-data-dir=' + path.join(OUTDIR, 'chrome-profile')],
-});
+let browser;
+try {
+  browser = await puppeteer.launch({
+    executablePath: CHROME,
+    headless: true,
+    args: ['--no-sandbox', '--user-data-dir=' + path.join(OUTDIR, 'chrome-profile')],
+  });
 const page = await browser.newPage();
 const pageErrors = [];
 page.on('pageerror', (e) => pageErrors.push(String(e)));
@@ -546,14 +550,19 @@ const hashAfter = srcHash();
 record('source.stable', hashBefore === hashAfter, `before=${hashBefore.slice(0, 12)} after=${hashAfter.slice(0, 12)}`);
 record('no.page-errors', pageErrors.length === 0, pageErrors.slice(0, 2).join(' | ') || '无异常');
 
-writeFileSync(
-  path.join(OUTDIR, 'RESULTS.json'),
-  JSON.stringify({ stamp: STAMP, hashBefore, hashAfter, pageErrors, results }, null, 2),
-);
-await page.screenshot({ path: path.join(OUTDIR, 'final.png'), fullPage: true }).catch(() => {});
-
-await browser.close();
-await new Promise((r) => server.close(r));
+  writeFileSync(
+    path.join(OUTDIR, 'RESULTS.json'),
+    JSON.stringify({ stamp: STAMP, hashBefore, hashAfter, pageErrors, results }, null, 2),
+  );
+  await page.screenshot({ path: path.join(OUTDIR, 'final.png'), fullPage: true }).catch(() => {});
+} finally {
+  if (browser) {
+    try { await browser.close(); } catch {}
+  }
+  if (server) {
+    try { await new Promise((r) => server.close(r)); } catch {}
+  }
+}
 
 const failed = results.filter((r) => !r.ok);
 console.log(`\n=== ${results.length - failed.length}/${results.length} PASS ===`);

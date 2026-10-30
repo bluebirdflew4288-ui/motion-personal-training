@@ -16,7 +16,9 @@ import puppeteer from 'puppeteer-core';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CHROME = process.env.MOTION_CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
-const OUTDIR = path.join(ROOT, 'verify-self/ui-template-import');
+const OUTDIR = process.env.MOTION_UI_EVIDENCE_DIR
+  ? path.resolve(process.env.MOTION_UI_EVIDENCE_DIR)
+  : path.join(ROOT, 'verify-self/ui-template-import');
 mkdirSync(OUTDIR, { recursive: true });
 
 function demand(cond, msg, extra) {
@@ -88,13 +90,16 @@ function srcHash() {
 }
 const hashBefore = srcHash();
 
-const browser = await puppeteer.launch({
-  executablePath: CHROME,
-  headless: 'new',
-  args: ['--no-sandbox', '--user-data-dir=' + path.join(OUTDIR, 'chrome-profile')],
-});
-const results = [];
-let pageError = null;
+let browser;
+let failed = 0;
+try {
+  browser = await puppeteer.launch({
+    executablePath: CHROME,
+    headless: true,
+    args: ['--no-sandbox', '--user-data-dir=' + path.join(OUTDIR, 'chrome-profile')],
+  });
+  const results = [];
+  let pageError = null;
 
 async function readPlans() {
   return page.evaluate(
@@ -513,18 +518,23 @@ await caseIt('ui-g1-confirm-in-flight-stays-stable', async () => {
   await closeAllSheets();
 });
 
-demand(pageError === null, `真实页面出现 JS 错误：${pageError}`);
-const hashAfter = srcHash();
-demand(hashBefore === hashAfter, '执行期间源码发生变化，结果无效');
+  demand(pageError === null, `真实页面出现 JS 错误：${pageError}`);
+  const hashAfter = srcHash();
+  demand(hashBefore === hashAfter, '执行期间源码发生变化，结果无效');
 
-writeFileSync(
-  path.join(OUTDIR, 'results.json'),
-  JSON.stringify({ at: new Date().toISOString(), srcHash: hashBefore, results, pageError }, null, 2),
-);
-const failed = results.filter((r) => !r.pass).length;
-console.log(`RESULT ${results.length - failed}/${results.length} PASS; ${failed} FAIL`);
-console.log('Evidence:', path.join(OUTDIR, 'results.json'));
-
-await browser.close();
-server.close();
+  writeFileSync(
+    path.join(OUTDIR, 'results.json'),
+    JSON.stringify({ at: new Date().toISOString(), srcHash: hashBefore, results, pageError }, null, 2),
+  );
+  failed = results.filter((r) => !r.pass).length;
+  console.log(`RESULT ${results.length - failed}/${results.length} PASS; ${failed} FAIL`);
+  console.log('Evidence:', path.join(OUTDIR, 'results.json'));
+} finally {
+  if (browser) {
+    try { await browser.close(); } catch {}
+  }
+  if (server) {
+    try { server.close(); } catch {}
+  }
+}
 process.exit(failed ? 1 : 0);

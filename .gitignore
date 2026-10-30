@@ -13,6 +13,7 @@ app/android/native-test/out/
 
 # ── Web 构建产物（历史版本全部不入库）──
 app/dist/
+app/dist-web/
 app/dist-v*/
 app/dist-android/
 app/dist-baseline-*/
@@ -81,6 +82,7 @@ LAN-INFO*.txt
 # ── 测试产物 ──
 test-results/
 coverage/
+**/chrome-profile/
 
 # ── 例外：历史迁移测试的真实依赖（必须入库，否则克隆后断链）──
 # app/test/v4-backup.test.ts 与 v5-migrate-delete.test.ts 会动态 import

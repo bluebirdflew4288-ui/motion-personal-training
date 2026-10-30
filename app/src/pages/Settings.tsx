@@ -9,7 +9,6 @@ import { Confirm } from '../ui/Confirm';
 import {
   BACKUP_VERSION,
   CURRENT_APP_VERSION,
-  buildBackup,
   getPreRestoreSnapshot,
   restoreBackup,
   snapshotBeforeRestore,
@@ -18,7 +17,6 @@ import {
   type RestorePreview,
 } from '../db/repo';
 import {
-  exportBackup,
   fileSizeLabel,
   parseJsonText,
   pickBackupViaNative,
@@ -26,6 +24,7 @@ import {
   usesNativeFileUi,
   type ExportOutcome,
 } from '../lib/backupFile';
+import { coordinateBackupExport } from '../lib/backupCoordinator';
 import { fmtDateWithWeek, fmtTime } from '../lib/format';
 import {
   installRestoredExportHandler,
@@ -474,40 +473,12 @@ export function SettingsPage() {
     exportingRef.current = true;
     setExporting(true);
     try {
-      // 打包完成后再记录导出时间：备份文件自身也带上这个时间
-      const payload = payloadInput ?? (await buildBackup(APP_VERSION));
-      const result = await exportBackup(payload);
-
-      if (result.ok) {
-        // 文件已经真实写出（原生 close 后回读过长度与摘要）。
-        // 接下来只是更新「最近备份时间」这个本地记录 —— 两者必须分开处理：
-        //   · 记录成功 → 正常成功提示
-        //   · 记录失败 → 明确「文件已写入，但时间没记上」，
-        //     **不得**把已成功的文件回报成「导出失败」，也不能产生 unhandled rejection。
-        // 返回值始终是真实的文件保存结果（ok:true），不因本地记录失败而反转。
-        try {
-          await patchSettings({ lastExportAt: payload.exportedAt });
-          pushToast(
-            opts?.label ? `${opts.label}已导出 ${result.filename}` : `已导出 ${result.filename}`,
-          );
-        } catch (recordErr) {
-          const msg = recordErr instanceof Error ? recordErr.message : String(recordErr);
-          pushToast(
-            `文件已写入${result.filename ? ' ' + result.filename : ''}${
-              typeof result.bytes === 'number' ? `（${result.bytes} 字节）` : ''
-            }，但本地「最近备份」时间没记上：${msg}`,
-            'error',
-          );
-        }
-        return result;
-      }
-      if (result.cancelled) {
-        // 用户取消：什么都不改，也不提示“已导出”
-        pushToast('已取消导出，没有写入任何文件。');
-        return result;
-      }
-      pushToast(`导出失败：${result.error}`, 'error');
-      return result;
+      return await coordinateBackupExport({
+        payloadInput,
+        opts,
+        patchSettings,
+        pushToast,
+      });
     } catch (err) {
       const message = err instanceof Error ? err.message : '导出失败';
       pushToast(`导出失败：${message}`, 'error');

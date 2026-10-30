@@ -7,7 +7,7 @@
 
 import { createServer } from 'node:http';
 import { createReadStream, existsSync, statSync } from 'node:fs';
-import { extname, join, normalize, resolve, sep, dirname } from 'node:path';
+import { extname, isAbsolute, join, normalize, resolve, sep, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { networkInterfaces } from 'node:os';
 
@@ -19,7 +19,8 @@ const getArg = (name, fallback) => {
 
 const PORT = Number(getArg('port', process.env.PORT || 5199));
 const APP_DIR = dirname(fileURLToPath(import.meta.url)).replace(/[\\/]scripts$/, '');
-const DIST = resolve(APP_DIR, getArg('dist', 'dist'));
+const rawDist = getArg('dist', process.env.MOTION_OUT_DIR || 'dist-web');
+const DIST = isAbsolute(rawDist) ? resolve(rawDist) : resolve(APP_DIR, rawDist);
 const APP_ROOT = APP_DIR;
 const INDEX = join(DIST, 'index.html');
 
@@ -45,15 +46,51 @@ if (!existsSync(INDEX)) {
   process.exit(1);
 }
 
+/** 畸形百分号编码（如 /%ZZ）的哨兵。decodeURIComponent 会抛 URIError */
+const BAD_PATH = Symbol('bad-url-path');
+
 /** 只允许访问 DIST 内的文件 */
 function safeResolve(urlPath) {
-  const decoded = decodeURIComponent(urlPath.split('?')[0].split('#')[0]);
+  let decoded;
+  try {
+    decoded = decodeURIComponent(urlPath.split('?')[0].split('#')[0]);
+  } catch {
+    // 单个畸形 URL 绝不能抛出未捕获 URIError 让整个预览服务退出（item 6）
+    return BAD_PATH;
+  }
+  // 拒绝 NUL 等控制字符，避免底层文件 API 抛错
+  if (decoded.includes('\0')) return BAD_PATH;
   const target = normalize(join(DIST, decoded));
   if (!target.startsWith(DIST + sep) && target !== DIST) return null;
   return target;
 }
 
-const server = createServer((req, res) => {
+/**
+ * 把文件流接到响应：**读取流错误不得终止进程**（item 6）。
+ *
+ * 关键：等文件真正 open 成功后才写 200 头。这样「打开失败」（如无读权限）
+ * 能在头发送前返回干净的 500；已开始传输后出错才只能销毁该响应，
+ * 两者都只影响这一个请求，进程与健康检查不受影响。
+ */
+function streamFile(res, filePath, headers) {
+  const stream = createReadStream(filePath);
+  let opened = false;
+  stream.once('open', () => {
+    opened = true;
+    if (!res.headersSent) res.writeHead(200, headers);
+    stream.pipe(res);
+  });
+  stream.on('error', () => {
+    if (!opened && !res.headersSent) {
+      res.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' });
+      res.end('读取文件失败');
+    } else {
+      res.destroy();
+    }
+  });
+}
+
+function handleRequest(req, res) {
   const urlPath = (req.url ?? '/').split('?')[0];
 
   if (urlPath === '/__health') {
@@ -63,24 +100,34 @@ const server = createServer((req, res) => {
   }
 
   let filePath = safeResolve(urlPath);
+  if (filePath === BAD_PATH) {
+    res.writeHead(400, { 'content-type': 'text/plain; charset=utf-8' });
+    res.end('Bad Request');
+    return;
+  }
   if (!filePath) {
     res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' });
     res.end('Forbidden');
     return;
   }
 
-  if (existsSync(filePath) && statSync(filePath).isDirectory()) {
+  let isDir = false;
+  try {
+    isDir = existsSync(filePath) && statSync(filePath).isDirectory();
+  } catch {
+    isDir = false;
+  }
+  if (isDir) {
     filePath = join(filePath, 'index.html');
   }
 
   if (!existsSync(filePath)) {
     // SPA 回退：仅对无扩展名的导航请求返回 index.html
     if (!extname(urlPath)) {
-      res.writeHead(200, {
+      streamFile(res, INDEX, {
         'content-type': MIME['.html'],
         'cache-control': 'no-cache',
       });
-      createReadStream(INDEX).pipe(res);
       return;
     }
     res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
@@ -90,17 +137,32 @@ const server = createServer((req, res) => {
 
   const ext = extname(filePath).toLowerCase();
   const isHashed = /-[a-z0-9]{8,}\./i.test(filePath);
-  res.writeHead(200, {
+  const headers = {
     'content-type': MIME[ext] ?? 'application/octet-stream',
     'cache-control': isHashed ? 'public, max-age=31536000, immutable' : 'no-cache',
     // 允许 SW 在局域网 HTTP 下也工作？——不设置任何降低安全性的头
-  });
+  };
 
   if (req.method === 'HEAD') {
+    res.writeHead(200, headers);
     res.end();
     return;
   }
-  createReadStream(filePath).pipe(res);
+  streamFile(res, filePath, headers);
+}
+
+const server = createServer((req, res) => {
+  try {
+    handleRequest(req, res);
+  } catch {
+    // 兜底：任何同步异常只让当前请求失败，进程继续服务健康检查
+    if (!res.headersSent) {
+      res.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' });
+      res.end('Internal Server Error');
+    } else {
+      res.destroy();
+    }
+  }
 });
 
 function lanAddresses() {

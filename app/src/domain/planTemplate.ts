@@ -17,6 +17,7 @@ import {
   MAX_DAYS,
   MAX_EXERCISES,
   MAX_INCLINE_PCT,
+  MAX_PLAN_NAME,
   MAX_REPS,
   MAX_REST,
   MAX_REST_IN_SEC,
@@ -562,7 +563,8 @@ function parsePlanRoot(c: TCtx, root: Record<string, unknown>): Plan | null {
     return null;
   }
   rejectUnknown(c, root.plan, ['name', 'days'], 'plan');
-  const name = reqStr(c, root.plan.name, 'plan.name', 100);
+  // 模板是「新输入」，与新建/重命名/savePlan 共用 MAX_PLAN_NAME（200），不放宽成 legacy 读取上限。
+  const name = reqStr(c, root.plan.name, 'plan.name', MAX_PLAN_NAME);
   if (!Array.isArray(root.plan.days)) {
     c.add('plan.days', '缺少训练日数组');
     return null;

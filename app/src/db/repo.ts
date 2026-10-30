@@ -3,6 +3,7 @@
    绝不在失败后假装成功。 */
 
 import { idbDelete, idbGet, idbGetAll, idbPut, idbReplaceAll, openDb, StorageError } from './idb';
+import { MAX_LEGACY_PLAN_NAME, MAX_PLAN_NAME } from '../domain/limits';
 import { createV32Plan } from '../domain/presets/v32';
 import { validateDataDeep } from './validate';
 import { detectLegacyShape, deriveGroupsFrom, migrateLegacyData, validateLegacyShape } from './migrate';
@@ -48,6 +49,18 @@ export async function getPlan(id: string): Promise<Plan | undefined> {
 }
 
 export async function savePlan(plan: Plan): Promise<Plan> {
+  /**
+   * 保存入口统一约束计划名称长度（与备份校验共用 MAX_PLAN_NAME）。
+   *
+   * <p>超限**明确拒绝**（抛 StorageError，不写库、原数据不变），
+   * 绝不静默截断把用户输入改短。新建 / 重命名 / 复制都要经过这里，
+   * 从而无法再生成「应用能建、备份恢复不了」的数据。
+   */
+  if (typeof plan.name === 'string' && plan.name.length > MAX_PLAN_NAME) {
+    throw new StorageError(
+      `计划名称最多 ${MAX_PLAN_NAME} 个字符，当前 ${plan.name.length} 个字，已拒绝保存`,
+    );
+  }
   const next = { ...plan, updatedAt: Date.now() };
   await idbPut('plans', next);
   return next;
@@ -222,10 +235,55 @@ export async function loadSettings(): Promise<AppSettings> {
 }
 
 export async function saveSettings(patch: Partial<AppSettings>): Promise<AppSettings> {
-  const current = await loadSettings();
-  const next = { ...current, ...patch, key: 'app' as const };
-  await idbPut('settings', next);
-  return next;
+  const requested = { ...patch };
+  return openDb().then((db) => new Promise<AppSettings>((resolve, reject) => {
+    let settled = false;
+    let candidate: AppSettings | undefined;
+    const fail = (cause: unknown) => {
+      if (settled) return;
+      settled = true;
+      reject(cause instanceof StorageError ? cause : new StorageError('设置未保存，原设置未改变', cause));
+    };
+    let transaction: IDBTransaction;
+    try {
+      // 读最新值与合并写入共用事务，避免覆盖并发补丁或删除计划后的 current。
+      transaction = db.transaction('settings', 'readwrite');
+    } catch (err) {
+      fail(err);
+      return;
+    }
+    const abort = (cause: unknown) => {
+      try { transaction.abort(); } catch { /* transaction may already be aborted */ }
+      fail(cause);
+    };
+    transaction.oncomplete = () => {
+      if (settled) return;
+      if (!candidate) {
+        fail(new StorageError('设置事务完成但没有产生保存结果'));
+        return;
+      }
+      settled = true;
+      resolve(candidate);
+    };
+    transaction.onerror = () => fail(transaction.error);
+    transaction.onabort = () => fail(transaction.error);
+    try {
+      const store = transaction.objectStore('settings');
+      const request = store.get('app');
+      request.onsuccess = () => {
+        try {
+          const current = { ...DEFAULT_SETTINGS, ...((request.result as AppSettings | undefined) ?? {}) };
+          const next: AppSettings = { ...current, ...requested, key: 'app' };
+          store.put(next);
+          candidate = next; // request success 仍可能随后 abort；只在 oncomplete 返回成功。
+        } catch (err) {
+          abort(err);
+        }
+      };
+    } catch (err) {
+      abort(err);
+    }
+  }));
 }
 
 /* ── 元信息（锁、版本）───────────────── */
@@ -242,10 +300,21 @@ export async function setMeta(key: string, value: unknown): Promise<void> {
 /* ── 首次启动 ─────────────────────────── */
 
 /** 首次启动写入 V3.2 预设；已有计划时不动。返回是否初始化过。 */
+/**
+ * 首次启动初始化。
+ *
+ * <p>item 5：用初始化标记 `seeded` 严格区分「从未初始化」与「用户主动清空」：
+ *   · 已 `seeded` → **永不**再注入预设（删掉最后一个计划、或恢复合法空备份后，
+ *     后续每次启动都保持为空，尊重用户选择）；
+ *   · 未 `seeded` → 首次启动：无计划才写入 V3.2；已有计划（老库缺标记）只补标记，
+ *     不重复注入、不覆盖用户数据。
+ *
+ * @returns 本次是否**执行了初始化流程**（首次启动或缺标记补写）。
+ */
 export async function ensureSeed(): Promise<boolean> {
-  const meta = await getMeta<boolean>('seeded');
+  const seeded = await getMeta<boolean>('seeded');
+  if (seeded) return false;
   const plans = await listPlans();
-  if (meta && plans.length) return false;
   if (!plans.length) {
     await savePlan(createV32Plan());
   }
@@ -306,11 +375,11 @@ export type ValidateResult =
 
 /*
  * 应用显示版本 + **新导出备份写入的 appVersion 元数据**（第5阶段候选）。
- * 历史值曾是 Web 期 '1.0.0'；本轮与候选包 0.1.7 对齐，避免设置页与包版本矛盾。
+ * 历史值曾是 Web 期 '1.0.0'；本轮与候选包 0.1.8 对齐，避免设置页与包版本矛盾。
  * 旧备份里的 1.0.0 元数据仍按现有规则**只提示不拒绝**（validateBackup 的
  * warnings：srcVersion !== currentAppVersion），冻结/历史文件不改。
  */
-export const CURRENT_APP_VERSION = '0.1.7';
+export const CURRENT_APP_VERSION = '0.1.8';
 
 export function validateBackup(raw: unknown, currentAppVersion = CURRENT_APP_VERSION): ValidateResult {
   if (typeof raw !== 'object' || raw === null) return { ok: false, error: '文件不是有效的 JSON 对象' };
@@ -410,7 +479,10 @@ export function validateBackup(raw: unknown, currentAppVersion = CURRENT_APP_VER
   }
 
   // ── 完整深度校验：任何结构损坏都在这里被拒绝，不触碰数据库 ──
-  const deep = validateDataDeep(workingData);
+  // 注意：这是「受支持的全量备份」读取入口，对 Plan.name / Session.planName
+  // 这两个旧显示名称字段采用有限 legacy 兼容（≤MAX_LEGACY_PLAN_NAME，原文保留）；
+  // 其它字段/版本/身份/数量约束仍严格，新写入路径（savePlan 等）仍只接受 200。
+  const deep = validateDataDeep(workingData, { legacyPlanNameMax: MAX_LEGACY_PLAN_NAME });
   if (!deep.ok) {
     const first = deep.issues[0];
     return {

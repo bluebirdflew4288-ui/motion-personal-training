@@ -11,7 +11,9 @@ import { fileURLToPath } from 'node:url';
 
 const APP_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const TEST_DIR = join(APP_DIR, 'android/native-test');
-const OUT = join(TEST_DIR, 'out');
+const OUT = process.env.MOTION_NATIVE_TEST_OUT
+  ? resolve(process.env.MOTION_NATIVE_TEST_OUT)
+  : join(TEST_DIR, 'out');
 const PLUGIN_DIR = join(APP_DIR, 'android/app/src/main/java/app/motion/personal/plugins');
 
 const SOURCES = [

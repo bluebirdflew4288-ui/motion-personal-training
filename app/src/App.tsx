@@ -68,7 +68,8 @@ function Routes() {
      */
     body = <SessionPage key={parts[1]} sessionId={parts[1]} />;
   } else if (parts[0] === 'history' && parts[1]) {
-    body = <HistoryDetailPage id={parts[1]} />;
+    // 以记录 id 作 key：A→B 切换一定重新挂载，绝不把 A 的草稿/错误显示在 B 上
+    body = <HistoryDetailPage key={parts[1]} id={parts[1]} />;
   } else if (parts[0] === 'history') {
     body = <HistoryPage />;
   } else if (parts[0] === 'stats') {

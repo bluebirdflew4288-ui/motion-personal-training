@@ -215,15 +215,12 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
   const patchSettings = useCallback(
     async (patch: Partial<AppSettings>) => {
-      setSettings((s) => ({ ...s, ...patch }));
-      try {
-        const saved = await persistSettings(patch);
-        setSettings(saved);
-      } catch (err) {
-        pushToast(err instanceof Error ? `设置未保存：${err.message}` : '设置未保存', 'error');
-      }
+      const requested = { ...patch };
+      await persistSettings(requested);
+      // 只合并已提交的本次字段，保留并发 UI 更新；失败由调用方给出上下文提示。
+      setSettings((s) => ({ ...s, ...requested, key: 'app' }));
     },
-    [pushToast],
+    [],
   );
 
   const refreshSettings = useCallback(async () => {

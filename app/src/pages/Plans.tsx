@@ -31,6 +31,8 @@ import {
   MAX_CARDIO_ENTRIES,
   MAX_EXERCISES,
   MAX_INCLINE_PCT,
+  MAX_LEGACY_PLAN_NAME,
+  MAX_PLAN_NAME,
   MAX_REPS,
   MAX_SPEED_KMH,
   MAX_STRAIGHT_SETS,
@@ -339,6 +341,24 @@ export function PlansPage() {
   }
 
   /**
+   * 新建计划名称归一化 + 长度校验（与备份校验共用 MAX_PLAN_NAME）。
+   *
+   * <p>空白输入回退到 fallback；超限则**明确拒绝**（返回 null、提示原因），
+   * 由调用方在写库前中止，保证「原数据不变」。不截断、不写假成功。
+   */
+  function resolveNewPlanName(fallback: string): string | null {
+    const name = newName.trim() || fallback;
+    if (name.length > MAX_PLAN_NAME) {
+      pushToast(
+        `计划名称最多 ${MAX_PLAN_NAME} 个字符（当前 ${name.length}），未创建。`,
+        'error',
+      );
+      return null;
+    }
+    return name;
+  }
+
+  /**
    * 按**稳定 planId** 取当前计划（v0.1.1 L01-reliability）。
    *
    * 为什么不能直接用渲染闭包里的 `plan` 对象：
@@ -577,8 +597,23 @@ export function PlansPage() {
                 style={{ minHeight: 44, fontSize: 17, fontWeight: 600, border: '1px solid transparent', background: 'transparent', paddingLeft: 0 }}
                 value={plan.name}
                 ariaLabel="计划名称"
-                maxLength={200}
-                onCommit={(next) => save(renamePlan(currentPlan(plan.id), next))}
+                maxLength={MAX_PLAN_NAME}
+                onCommit={(next) => {
+                  /**
+                   * 计划名称与备份校验共用 200 字上限（item 1）。
+                   * 超限**明确拒绝并提示**（DraftTextField 收到 false 会保留草稿、
+                   * 显示「未保存，可重试」），绝不静默截断或假报已保存。
+                   */
+                  const trimmed = next.trim() || plan.name;
+                  if (trimmed.length > MAX_PLAN_NAME) {
+                    pushToast(
+                      `计划名称最多 ${MAX_PLAN_NAME} 个字符（当前 ${trimmed.length}），未保存。`,
+                      'error',
+                    );
+                    return false;
+                  }
+                  return save(renamePlan(currentPlan(plan.id), next));
+                }}
                 /* G5-R1：按稳定 fieldId 聚合，避免被其他干净字段覆盖 */
                 onDirtyChange={fieldDirtyHandler(`plan-name:${plan.id}`)}
                 onSavingChange={fieldSavingHandler(`plan-name:${plan.id}`)}
@@ -588,6 +623,25 @@ export function PlansPage() {
                 {plan.days.length} 天 · {plan.days.filter((d) => d.kind === 'train').length} 个训练日 · 循环位置{' '}
                 {plan.cursor + 1}
               </div>
+              {plan.name.length > MAX_PLAN_NAME ? (
+                <div
+                  role="alert"
+                  style={{
+                    marginTop: 8,
+                    padding: '8px 10px',
+                    fontSize: 12.5,
+                    lineHeight: 1.6,
+                    color: 'var(--brick)',
+                    borderLeft: '3px solid var(--brick)',
+                    background: 'var(--paper-3)',
+                  }}
+                >
+                  该计划名称超过 {MAX_PLAN_NAME} 个字符（当前 {plan.name.length} 字，历史遗留）。
+                  备份/恢复会按原文完整保留该名称，不会截断，也不会因此拒绝整份文件；
+                  若超过 {MAX_LEGACY_PLAN_NAME} 字则无法导出。如需继续编辑该计划，
+                  请在名称框显式改名到 {MAX_PLAN_NAME} 字以内；历史记录中的旧名称无需修改。
+                </div>
+              ) : null}
             </div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 4, flex: 'none' }}>
               <button
@@ -653,6 +707,7 @@ export function PlansPage() {
             className="input"
             value={newName}
             placeholder="例如：三分化训练计划 V3.2"
+            maxLength={MAX_PLAN_NAME}
             onChange={(e) => setNewName(e.target.value)}
           />
         </div>
@@ -661,8 +716,10 @@ export function PlansPage() {
             className="btn btn-primary"
             onClick={async () => {
               const plan = createV32Plan();
+              const resolvedName = resolveNewPlanName(plan.name);
+              if (resolvedName === null) return; // 超限：明确拒绝，弹层与输入保留
               const newId = `plan-${Date.now()}`;
-              const ok = await save({ ...plan, name: newName.trim() || plan.name, id: newId });
+              const ok = await save({ ...plan, name: resolvedName, id: newId });
               if (!ok) return; // 失败保留弹层与输入，可重试
               setNewName('');
               setNewOpen(false);
@@ -698,9 +755,11 @@ export function PlansPage() {
             onClick={async () => {
               const now = Date.now();
               // 空白计划 = 一个空训练日，动作与热身都为空（审计 R2-08）
+              const resolvedName = resolveNewPlanName('空白计划');
+              if (resolvedName === null) return; // 超限：明确拒绝，弹层与输入保留
               const blank: Plan = {
                 id: `plan-${now}`,
-                name: newName.trim() || '空白计划',
+                name: resolvedName,
                 cursor: 0,
                 createdAt: now,
                 updatedAt: now,

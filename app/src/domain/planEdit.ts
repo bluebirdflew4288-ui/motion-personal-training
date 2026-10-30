@@ -3,18 +3,48 @@
 
 import type { Plan, PlanDay, PlanExercise, ExerciseTarget } from './types';
 import { newId } from './session';
-import { MAX_DAYS, MAX_EXERCISES } from './limits';
+import { MAX_DAYS, MAX_EXERCISES, MAX_PLAN_NAME } from './limits';
 
-export function renamePlan(plan: Plan, name: string): Plan {
-  return { ...plan, name: name.trim() || plan.name };
+/** 计划名称是否在备份/恢复可接受的范围内（与 validate.ts 的 200 上限一致） */
+export function isPlanNameWithinLimit(name: string): boolean {
+  return name.length <= MAX_PLAN_NAME;
 }
 
+/** 规范化的计划名称；trim 后为空时保留原名。超限**不截断**，由调用方明确拒绝。 */
+export function normalizePlanName(plan: Plan, name: string): string {
+  return name.trim() || plan.name;
+}
+
+/**
+ * 重命名计划。
+ *
+ * <p>超限时**明确拒绝**（返回原计划，数据不变），绝不静默截断把用户输入改短。
+ * 调用方应先用 {@link normalizePlanName} 取规范化结果并提示长度问题，
+ * 避免把「被拒绝」误报成「已保存」。
+ */
+export function renamePlan(plan: Plan, name: string): Plan {
+  const next = normalizePlanName(plan, name);
+  if (!isPlanNameWithinLimit(next)) return plan;
+  return { ...plan, name: next };
+}
+
+/**
+ * 复制计划。
+ *
+ * <p>为后缀**预留长度**：基名按 `MAX_PLAN_NAME - 后缀长度` 截断，
+ * 保证复制结果始终 ≤ 200 字、可被自身备份恢复；
+ * 只截断**复制出来的新计划**，绝不改动源计划或历史字节。
+ */
 export function clonePlan(plan: Plan, nameSuffix = '副本'): Plan {
   const now = Date.now();
+  const suffix = ` ${nameSuffix}`;
+  const room = Math.max(0, MAX_PLAN_NAME - suffix.length);
+  const base = plan.name.slice(0, room);
+  const copiedName = `${base}${suffix}`.slice(0, MAX_PLAN_NAME);
   return {
     ...structuredClone(plan),
     id: newId('plan'),
-    name: `${plan.name} ${nameSuffix}`,
+    name: copiedName,
     cursor: 0,
     createdAt: now,
     updatedAt: now,

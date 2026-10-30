@@ -570,6 +570,24 @@ export function useRestTimer(
     const needVerify = snap.generation === null || snap.generation === undefined;
 
     if (decision.kind === 'resume-running') {
+      /**
+       * item 4（REVIEW-5）：**先同步初始化内存实时状态，再异步核对原生身份**。
+       *
+       * <p>旧实现只恢复 React 显示状态（setEndsAt/setToken），liveStateRef 仍为
+       * 初始的 endsAt=null，而 pause()/adjust() 都从 liveStateRef 读值并命中 null
+       * 守卫 → 恢复后暂停、加减全部失效。Web 没有原生 generation，这个窗口是
+       * **永久性**的（真实 start → reload → pause 已复现）。
+       *
+       * <p>这里在启动任何异步核对之前就把 liveStateRef 设成快照的真实运行态；
+       * 异步 adoptVerified 只负责补充/核实 generation，不改变归属与取消门禁：
+       * 未知代次仍走 pendingCancel 的按身份补取消，绝不靠全清原生提醒掩盖。
+       */
+      liveStateRef.current = {
+        token: snap.token,
+        status: 'running',
+        endsAt: decision.endsAt,
+        pausedRemaining: null,
+      };
       if (needVerify) {
         void controller.adoptVerified(snap.token).then((r) => {
           /**

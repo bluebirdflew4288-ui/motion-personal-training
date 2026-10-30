@@ -1,9 +1,16 @@
 /* 历史：按日期浏览 → 详情 → 纠正误录 / 删除。
    示例数据不会混进真实记录：这里只读 IndexedDB 里 status='completed' 的记录。 */
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useStore } from '../store';
-import { navigate } from '../lib/router';
+import {
+  back,
+  navigate,
+  registerLeaveGuard,
+  type BlockedNavigation,
+} from '../lib/router';
+import { handleBackIntent, registerPageLeaveGuard } from '../lib/nativeBack';
+import { Sheet } from '../ui/Sheet';
 import { fmtDateWithWeek, fmtDuration, fmtTime, fmtWeight } from '../lib/format';
 import type { Session, SessionSet } from '../domain/types';
 import { isSetLogged, summarizeSession, withSet } from '../domain/session';
@@ -187,34 +194,143 @@ export function HistoryPage() {
 export function HistoryDetailPage({ id }: { id: string }) {
   const { sessions, refreshSessions, pushToast, saveHistorySession } = useStore();
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const deletingRef = useRef(false);
   const session = sessions.find((s) => s.id === id);
 
   /** 编辑草稿：编辑期间不动正式历史，保存才写库（审计任务 H） */
   const [draft, setDraft] = useState<Session | null>(null);
   const [saving, setSaving] = useState(false);
+  /** 离页守卫弹层：**本次**被拦下的导航意图（保存 / 放弃 / 留下 三选一） */
+  const [leavePrompt, setLeavePrompt] = useState<BlockedNavigation | null>(null);
+  /** 保存并离开进行中：避免重复点击/重复导航 */
+  const [leaveBusy, setLeaveBusy] = useState(false);
+  /** 进入纠错时的原始字节快照：用于判断草稿是否 dirty（dirty 时不许静默离页） */
+  const baselineRef = useRef<string>('');
+  /**
+   * 草稿的**同步镜像**：guard 与保存读取它，而不是可能滞后一拍的 React state。
+   * 这正是「合法 raw 的 blur 提交 与 dirty effect 竞态」导致离页丢 25 的修复点。
+   */
+  const draftRef = useRef<Session | null>(null);
+  /** 保存中的同步镜像（不要用渲染期 state 覆盖它，否则会重现竞态） */
+  const savingRef = useRef(false);
   /** 进入纠错时的记录版本：保存必须带它，冲突时不覆盖别人（V3-01） */
   const [draftRevision, setDraftRevision] = useState<number>(0);
   /**
    * 单元格级校验状态：任一非法则禁止保存（R01）。
-   * V3-04：这套状态必须跟草稿同生命周期 ——
-   * 取消/重新进入纠错时要清空，否则子输入已卸载、父级还记着旧错误，
-   * 保存按钮会一直是 disabled（审查 I04）。
+   * V3-04：这套状态必须跟草稿同生命周期 —— 取消/重新进入纠错时要清空。
    */
   const [cellErrors, setCellErrors] = useState<Record<string, boolean>>({});
-  const setCellValid = (key: string, ok: boolean) =>
-    setCellErrors((prev) => {
-      if (ok) {
-        if (!(key in prev)) return prev;
-        const next = { ...prev };
-        delete next[key];
-        return next;
-      }
-      if (prev[key]) return prev;
-      return { ...prev, [key]: true };
-    });
+  /** 已提交字段的非法错误（同步镜像，guard 读取） */
+  const cellErrorsRef = useRef<Record<string, boolean>>({});
+  /**
+   * 每个数值单元的 raw 状态（同步镜像）：
+   *   dirty = 文本与最近提交值不同（合法未提交 / 非法 / 空 / 未完）；
+   *   valid = 当前文本可解析为合法值。
+   * 让「还没 blur 提交」的 raw 也能被离页守卫看到，避免被静默丢弃。
+   */
+  const rawStateRef = useRef<Map<string, { dirty: boolean; valid: boolean }>>(new Map());
+
+  /**
+   * 重置草稿与离页相关的所有页面级状态（同步 ref + React state）。
+   * 成功保存、丢弃草稿、取消编辑、以及数据库删除确认成功后统一复用，避免状态漏清。
+   */
+  const resetDraftState = () => {
+    cellErrorsRef.current = {};
+    rawStateRef.current.clear();
+    draftRef.current = null;
+    baselineRef.current = '';
+    setDraft(null);
+    setCellErrors({});
+    setLeavePrompt(null);
+    setLeaveBusy(false);
+  };
+
+  const setCellValid = (key: string, ok: boolean) => {
+    const prev = cellErrorsRef.current;
+    if (ok) {
+      if (!(key in prev)) return;
+      const next = { ...prev };
+      delete next[key];
+      cellErrorsRef.current = next;
+      setCellErrors(next);
+    } else {
+      if (prev[key]) return;
+      const next = { ...prev, [key]: true };
+      cellErrorsRef.current = next;
+      setCellErrors(next);
+    }
+  };
+  const setCellRaw = (key: string, dirty: boolean, valid: boolean) => {
+    const prev = rawStateRef.current.get(key);
+    if (prev && prev.dirty === dirty && prev.valid === valid) return;
+    rawStateRef.current.set(key, { dirty, valid });
+  };
   const hasCellErrors = Object.keys(cellErrors).length > 0;
   const editing = draft !== null;
   const view = draft ?? session;
+
+  /**
+   * **同步**判断当前是否不可安全离页（全部读 ref，不看可能滞后的 React state）：
+   *   · 记录不存在（已删除或初始不存在）：绝不挂不可见守卫，允许直接退出；
+   *   · 保存中；
+   *   · 草稿已提交内容与进入纠错时不同（dirty）；
+   *   · 任一数值单元已提交但非法；
+   *   · 任一数值单元有未提交 raw（合法或非法）。
+   * 未改或改回原值时全部为假 → 允许干净离页。
+   */
+  const isUnsafeNow = (): boolean => {
+    if (!session) return false;
+    if (savingRef.current) return true;
+    const d = draftRef.current;
+    if (!d) return false;
+    if (JSON.stringify(d) !== baselineRef.current) return true;
+    if (Object.keys(cellErrorsRef.current).length > 0) return true;
+    for (const s of rawStateRef.current.values()) if (s.dirty || !s.valid) return true;
+    return false;
+  };
+
+  /** 当前是否有非法 raw（「保存并离开」必须拒绝：不能把非法输入当已保存） */
+  const hasInvalidRawNow = (): boolean => {
+    if (Object.keys(cellErrorsRef.current).length > 0) return true;
+    for (const s of rawStateRef.current.values()) if (!s.valid) return true;
+    return false;
+  };
+
+  /** 若记录已从外部或前置事务中删除，及时重置残留草稿，不挂不可见守卫、不保存孤儿草稿 */
+  useEffect(() => {
+    if (!session && draftRef.current !== null) {
+      resetDraftState();
+    }
+  }, [session]);
+
+  /**
+   * 路由离页门禁（复用 router.registerLeaveGuard）：覆盖底部 Tab、页内返回、
+   * 统计跳转、浏览器 Back/Forward。守卫从参数拿到**本次**导航意图并存入本页弹层，
+   * 取消/失败只清本页弹层，不会污染下一次。
+   */
+  useEffect(() => {
+    return registerLeaveGuard((intent) => {
+      if (!isUnsafeNow()) return true;
+      setLeavePrompt(intent ?? { kind: 'back' });
+      return false;
+    });
+    // isUnsafeNow 只读稳定 ref，无需依赖
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /**
+   * 原生返回门禁（复用 nativeBack.registerPageLeaveGuard）：语义与路由门禁一致。
+   */
+  useEffect(() => {
+    registerPageLeaveGuard(() => {
+      if (!isUnsafeNow()) return true;
+      setLeavePrompt({ kind: 'native-back' });
+      return false;
+    });
+    return () => registerPageLeaveGuard(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   if (!session) {
     return (
@@ -230,58 +346,153 @@ export function HistoryDetailPage({ id }: { id: string }) {
     );
   }
 
-  /** 更新草稿里的某个组（不写库） */
+  /** 更新草稿里的某个组（不写库）。同步更新 draftRef，保证 blur→click 的守卫读到本次修改。 */
   const updateDraftSet = (exId: string, setId: string, patch: Partial<SessionSet>) => {
-    setDraft((d) => (d ? withSet(d, exId, setId, patch) : d));
+    const d = draftRef.current;
+    if (!d) return;
+    const next = withSet(d, exId, setId, patch);
+    draftRef.current = next;
+    setDraft(next);
   };
 
-  /** 保存草稿 → 正式历史；统计与上次表现随后刷新（V3-01：受约束入口 + revision 冲突保护） */
-  const saveDraft = async () => {
-    if (!draft) return;
+  /** 保存草稿 → 正式历史；返回 true=已写库。失败保留草稿不丢输入。
+   *  （V3-01：受约束入口 + revision 冲突保护） */
+  const saveDraft = async (): Promise<boolean> => {
+    // 先把仍聚焦的合法 raw 输入 blur 提交掉，避免「还没 blur 就点保存」把新值丢成旧值
+    if (typeof document !== 'undefined') {
+      const ae = document.activeElement;
+      if (ae instanceof HTMLElement && ae.tagName === 'INPUT') ae.blur();
+    }
+    await Promise.resolve();
+    const d = draftRef.current;
+    if (!d) return false;
+    // 非法 raw / 已提交非法：一律阻止保存，保留可修正输入（不把旧值当保存值）
+    if (hasInvalidRawNow()) {
+      pushToast('有未完成或不合法的数字输入，已阻止保存。请先修正。', 'error');
+      return false;
+    }
     // R01：保存前统一校验所有数值，NaN/Infinity/负数/非整数一律拒绝
-    for (const ex of draft.exercises) {
+    for (const ex of d.exercises) {
       for (const st of ex.sets) {
         if (st.reps !== null && (!Number.isFinite(st.reps) || st.reps < 0 || !Number.isInteger(st.reps))) {
           pushToast(`「${ex.name}」有一组的次数不是合法整数，已阻止保存。`, 'error');
-          return;
+          return false;
         }
         if (st.weightKg !== null && (!Number.isFinite(st.weightKg) || st.weightKg < 0)) {
           pushToast(`「${ex.name}」有一组的重量不是合法数值，已阻止保存。`, 'error');
-          return;
+          return false;
         }
       }
     }
     setSaving(true);
+    savingRef.current = true;
     try {
-      const r = await saveHistorySession({ ...draft, revision: draftRevision }, draftRevision);
+      const r = await saveHistorySession({ ...d, revision: draftRevision }, draftRevision);
       if (!r.ok) {
         // 冲突时保留草稿，让用户自己决定是否放弃重来（不静默覆盖、不丢输入）
         pushToast(r.message, 'error');
-        return;
+        return false;
       }
       await refreshSessions();
-      // 成功保存 → 草稿与错误一起清空
-      setDraft(null);
-      setCellErrors({});
+      // 成功保存 → 草稿与各类错误/raw 一起清空
+      resetDraftState();
       pushToast('已保存修改，统计已更新。');
+      return true;
     } catch (err) {
       pushToast(err instanceof Error ? `保存失败：${err.message}` : '保存失败', 'error');
+      return false;
     } finally {
       setSaving(false);
+      savingRef.current = false;
     }
   };
 
-  /** 进入纠错：克隆当前记录 + 记录版本 + 清空上一次残留的字段错误 */
+  /** 进入纠错：克隆当前记录 + 记录版本 + 清空上一次残留的字段错误/raw。 */
   const startEditing = () => {
+    cellErrorsRef.current = {};
     setCellErrors({});
+    rawStateRef.current.clear();
     setDraftRevision(revisionOf(session));
-    setDraft(structuredClone(session));
+    // 记录进入纠错时的原始字节：用于 dirty 判定
+    baselineRef.current = JSON.stringify(session);
+    const clone = structuredClone(session);
+    draftRef.current = clone;
+    setDraft(clone);
   };
 
-  /** 取消纠错：丢弃草稿并清空字段错误，重新进入时不会残留 disabled（审查 I04） */
+  /** 取消纠错：丢弃草稿并清空字段错误/raw，重新进入时不会残留 disabled（审查 I04） */
   const cancelEditing = () => {
-    setCellErrors({});
-    setDraft(null);
+    resetDraftState();
+  };
+
+  /** 页内导航（返回历史 / 统计 / 动作表现）：直接交给 router 门禁。
+   *  脏/保存中时门禁会把**本次**意图传进守卫并弹三选一，不静默丢草稿。 */
+  const requestLeaveNav = (target: string) => {
+    navigate(target);
+  };
+
+  /** 真正执行**本次**被拦下的导航（路由 / 浏览器 POP / 原生 Back）。 */
+  const performLeave = (intent: BlockedNavigation | null) => {
+    if (!intent) return;
+    if (intent.kind === 'nav') {
+      navigate(intent.path, intent.replace);
+      return;
+    }
+    if (intent.kind === 'native-back') {
+      // 跳过我们自己的弹层（仍在返回栈里），直接走页面级守卫后的导航
+      void handleBackIntent({ handleLayer: false });
+      return;
+    }
+    if (intent.kind === 'pop') {
+      // 用户确认后继续浏览器原本的方向（Forward 继续向前，Back 继续后退）
+      try {
+        window.history.go(intent.delta);
+      } catch {
+        /* 忽略：极端环境无 history */
+      }
+      return;
+    }
+    // 'back'：程序化后退
+    back(intent.fallback);
+  };
+
+  /** 选择「放弃修改并离开」：丢弃草稿后继续**本次**导航（不重放旧意图）。 */
+  const discardAndLeave = async () => {
+    if (leaveBusy) return;
+    const intent = leavePrompt;
+    setLeaveBusy(true);
+    try {
+      resetDraftState();
+      // 等一拍让引用状态稳定后继续导航
+      await Promise.resolve();
+      performLeave(intent);
+    } finally {
+      setLeaveBusy(false);
+    }
+  };
+
+  /** 选择「保存修改并离开」：保存成功才离开；失败/非法保留草稿、留在本页。 */
+  const saveAndLeave = async () => {
+    if (leaveBusy) return;
+    if (hasInvalidRawNow()) {
+      // 非法 raw：拒绝保存并离开，保留可修正输入
+      pushToast('有未完成或不合法的数字输入，不能保存并离开；请先修正或选择「放弃修改并离开」。', 'error');
+      return;
+    }
+    const intent = leavePrompt;
+    setLeaveBusy(true);
+    try {
+      const ok = await saveDraft();
+      if (!ok) {
+        // 保存失败/冲突：草稿保留，不离页（明确提示已由 saveDraft 给出）
+        setLeavePrompt(null);
+        return;
+      }
+      setLeavePrompt(null);
+      performLeave(intent);
+    } finally {
+      setLeaveBusy(false);
+    }
   };
 
   const sum = summarizeSession(view!, view!.endedAt ?? Date.now());
@@ -292,11 +503,19 @@ export function HistoryDetailPage({ id }: { id: string }) {
   return (
     <main className="page page-top page-bottom-space">
       <header style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-        <button className="btn btn-ghost btn-sm" onClick={() => navigate('/history')}>
+        <button className="btn btn-ghost btn-sm" onClick={() => requestLeaveNav('/history')}>
           ‹ 历史
         </button>
         <div style={{ flex: 1 }} />
-        <button className="btn btn-ghost btn-sm" style={{ color: 'var(--brick)' }} onClick={() => setConfirmDelete(true)}>
+        <button
+          className="btn btn-ghost btn-sm"
+          style={{ color: 'var(--brick)' }}
+          disabled={saving || deleting}
+          onClick={() => {
+            if (savingRef.current || saving || deletingRef.current || deleting) return;
+            setConfirmDelete(true);
+          }}
+        >
           删除
         </button>
       </header>
@@ -551,6 +770,7 @@ export function HistoryDetailPage({ id }: { id: string }) {
                           width={74}
                           ariaLabel={`${ex.name} 第 ${st.roundIndex} 轮 阶段 ${st.stageIndex} 次数`}
                           onValidityChange={(ok) => setCellValid(`${st.id}:reps`, ok)}
+                          onDraftState={(dirty, valid) => setCellRaw(`${st.id}:reps`, dirty, valid)}
                           onCommit={(v) => updateDraftSet(ex.id, st.id, { reps: v })}
                         />
                       </label>
@@ -564,6 +784,7 @@ export function HistoryDetailPage({ id }: { id: string }) {
                           unit="kg"
                           ariaLabel={`${ex.name} 第 ${st.roundIndex} 轮 阶段 ${st.stageIndex} 重量`}
                           onValidityChange={(ok) => setCellValid(`${st.id}:weight`, ok)}
+                          onDraftState={(dirty, valid) => setCellRaw(`${st.id}:weight`, dirty, valid)}
                           onCommit={(v) => updateDraftSet(ex.id, st.id, { weightKg: v })}
                         />
                       </label>
@@ -627,7 +848,13 @@ export function HistoryDetailPage({ id }: { id: string }) {
             value={view!.note}
             aria-label="训练备注"
             placeholder="训练备注"
-            onChange={(e) => setDraft((d) => (d ? { ...d, note: e.target.value } : d))}
+            onChange={(e) => {
+              const d = draftRef.current;
+              if (!d) return;
+              const next = { ...d, note: e.target.value };
+              draftRef.current = next;
+              setDraft(next);
+            }}
           />
         ) : (
           <p style={{ fontSize: 14, color: session.note ? 'var(--ink-2)' : 'var(--ink-4)', marginTop: 6 }}>
@@ -637,7 +864,7 @@ export function HistoryDetailPage({ id }: { id: string }) {
       </section>
 
       <div style={{ marginTop: 20, display: 'flex', gap: 8 }}>
-        <button className="btn btn-ghost" style={{ flex: 1 }} onClick={() => navigate('/stats')}>
+        <button className="btn btn-ghost" style={{ flex: 1 }} onClick={() => requestLeaveNav('/stats')}>
           查看统计
         </button>
         <button
@@ -646,13 +873,55 @@ export function HistoryDetailPage({ id }: { id: string }) {
           onClick={() => {
             const first = activeExercises[0];
             // 用动作身份而不是计划条目：跨 A/B 也能看到同一动作的历史
-            if (first) navigate(`/stats?exercise=${encodeURIComponent(first.exerciseId)}`);
-            else navigate('/stats');
+            if (first) requestLeaveNav(`/stats?exercise=${encodeURIComponent(first.exerciseId)}`);
+            else requestLeaveNav('/stats');
           }}
         >
           动作表现
         </button>
       </div>
+
+      {/*
+        item 3：历史纠错的离页确认（复用 router / nativeBack 门禁）。
+        未保存（dirty）或保存中时，任何离页（底部 Tab、页内返回、统计跳转、
+        浏览器/原生 Back）都会先到这里：保存并离开 / 放弃修改并离开 / 留在此页。
+        保存失败保留草稿留在本页；保存成功后直接续上原导航，不会再弹一次。
+      */}
+      <Sheet
+        open={leavePrompt !== null}
+        title="离开前确认"
+        onClose={() => {
+          if (!leaveBusy) setLeavePrompt(null);
+        }}
+        footer={
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            <button
+              className="btn btn-primary"
+              disabled={saving || leaveBusy || hasCellErrors}
+              onClick={() => void saveAndLeave()}
+            >
+              {leaveBusy ? '保存中…' : '保存修改并离开'}
+            </button>
+            <button
+              className="btn btn-ghost"
+              style={{ color: 'var(--brick)' }}
+              disabled={saving || leaveBusy}
+              onClick={() => void discardAndLeave()}
+            >
+              放弃修改并离开
+            </button>
+            <button className="btn btn-ghost" disabled={leaveBusy} onClick={() => setLeavePrompt(null)}>
+              留在此页
+            </button>
+          </div>
+        }
+      >
+        <p style={{ margin: 0, fontSize: 14, lineHeight: 1.65, color: 'var(--ink-2)' }}>
+          {saving
+            ? '正在保存修改，请稍候……保存完成后可再选择离开。'
+            : '当前记录还有未保存的修改。要保存后离开、放弃修改后离开，还是留在此页？'}
+        </p>
+      </Sheet>
 
       <Confirm
         open={confirmDelete}
@@ -664,8 +933,17 @@ export function HistoryDetailPage({ id }: { id: string }) {
         }
         confirmText="删除"
         danger
-        onCancel={() => setConfirmDelete(false)}
+        busy={deleting || saving}
+        onCancel={() => {
+          if (!deleting) setConfirmDelete(false);
+        }}
         onConfirm={async () => {
+          if (savingRef.current || saving || deletingRef.current || deleting) {
+            pushToast('正在保存中，请稍后再操作', 'error');
+            return;
+          }
+          setDeleting(true);
+          deletingRef.current = true;
           try {
             /**
              * G2：撤销完全休息必须走**受约束事务入口**（atomicDeleteRest），
@@ -679,15 +957,17 @@ export function HistoryDetailPage({ id }: { id: string }) {
                 restDate: session.restDate ?? '',
               });
               if (!r.ok) {
-                // 等待事务真实结果：失败不关窗、不假报已撤销
+                // 等待事务真实结果：失败不关窗、不假报已撤销、保留可重试草稿
                 pushToast(r.message, 'error');
                 return;
               }
             } else {
               await deleteSession(session.id);
             }
-            await refreshSessions();
+            // 只有数据库事务确认成功后，清理本页草稿/raw/errors/leave意图，使随后refresh和navigate可正常回到历史列表，后续Tab也可用
+            resetDraftState();
             setConfirmDelete(false);
+            await refreshSessions();
             pushToast(
               sessionKindOf(session) === 'rest'
                 ? '已撤销这条完全休息记录。'
@@ -695,7 +975,11 @@ export function HistoryDetailPage({ id }: { id: string }) {
             );
             navigate('/history');
           } catch (err) {
+            // 删除失败保持原草稿/raw/确认窗，解除故障后可重试
             pushToast(err instanceof Error ? `删除失败：${err.message}` : '删除失败', 'error');
+          } finally {
+            setDeleting(false);
+            deletingRef.current = false;
           }
         }}
       />

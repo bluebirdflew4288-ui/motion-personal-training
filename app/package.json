@@ -1,9 +1,12 @@
 {
   "name": "motion-training-app",
   "private": true,
-  "version": "0.1.7",
+  "version": "0.1.8",
   "type": "module",
   "description": "MOTION — 个人训练工作区（离线优先的本地训练记录 Web App）",
+  "engines": {
+    "node": ">=22.12.0"
+  },
   "scripts": {
     "dev": "vite --host 0.0.0.0",
     "build": "tsc -b && vite build && node scripts/build-sw.mjs",
@@ -11,6 +14,9 @@
     "serve": "node scripts/serve.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:dom": "node scripts/ui-dom-regression.mjs",
+    "test:b4r2": "node scripts/ui-feedback-b4r2-check.mjs",
+    "check": "npm run typecheck && npm run test && npm run android:test:java && npm run test:dom && npm run test:b4r2",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "serve:v2": "node scripts/serve.mjs --dist dist-v2 --port 5299",
     "build:v1": "MOTION_OUT_DIR=dist npm run build",
@@ -26,7 +32,7 @@
     "serve:v7": "node scripts/serve.mjs --dist dist-v7 --port 5799",
     "build:v8": "MOTION_OUT_DIR=dist-v8 npm run build",
     "serve:v8": "node scripts/serve.mjs --dist dist-v8 --port 5899",
-    "build:android": "MOTION_TARGET=android MOTION_OUT_DIR=dist-android vite build",
+    "build:android": "tsc -b && MOTION_TARGET=android MOTION_OUT_DIR=\"${MOTION_OUT_DIR:-dist-android}\" vite build",
     "android:sync": "npx cap sync android",
     "android:apk": "node scripts/build-android.mjs",
     "android:apk:release": "node scripts/build-android.mjs --release",
@@ -46,10 +52,15 @@
     "@types/react-dom": "19.2.1",
     "@vitejs/plugin-react": "5.2.0",
     "fake-indexeddb": "6.2.6",
-    "puppeteer-core": "^23.11.1",
+    "puppeteer-core": "25.16.0",
     "qrcode": "1.5.4",
     "typescript": "5.9.3",
     "vite": "7.3.7",
-    "vitest": "3.2.4"
+    "vitest": "4.1.12"
+  },
+  "overrides": {
+    "@capacitor/cli": {
+      "xcode": "4.0.0"
+    }
   }
 }

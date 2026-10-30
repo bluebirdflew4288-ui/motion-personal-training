@@ -1,6 +1,11 @@
 node_modules
 dist
+dist-web
+dist-android
+dist-v*
 *.local
 .DS_Store
 ._*
 test-results
+chrome-profile/
+**/chrome-profile/

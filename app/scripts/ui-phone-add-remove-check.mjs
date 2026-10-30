@@ -38,12 +38,10 @@ import puppeteer from 'puppeteer-core';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CHROME = process.env.MOTION_CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
-const EV_ROOT = path.resolve(
-  process.env.MOTION_UI_EVIDENCE_DIR ||
-    path.join(ROOT, 'verify-feedback/phone-add-remove-20261027'),
-);
 const STAMP = new Date().toISOString().replace(/[:.]/g, '-');
-const OUTDIR = path.join(EV_ROOT, 'runs', STAMP);
+const OUTDIR = process.env.MOTION_UI_EVIDENCE_DIR
+  ? path.resolve(process.env.MOTION_UI_EVIDENCE_DIR)
+  : path.join(ROOT, 'verify-feedback/phone-add-remove-20261027/runs', STAMP);
 mkdirSync(OUTDIR, { recursive: true });
 
 const results = [];
@@ -124,11 +122,13 @@ function srcHash() {
 }
 const hashBefore = srcHash();
 
-const browser = await puppeteer.launch({
-  executablePath: CHROME,
-  headless: 'new',
-  args: ['--no-sandbox', '--user-data-dir=' + path.join(OUTDIR, 'chrome-profile')],
-});
+let browser;
+try {
+  browser = await puppeteer.launch({
+    executablePath: CHROME,
+    headless: true,
+    args: ['--no-sandbox', '--user-data-dir=' + path.join(OUTDIR, 'chrome-profile')],
+  });
 const page = await browser.newPage();
 const pageErrors = [];
 page.on('pageerror', (e) => pageErrors.push(String(e)));
@@ -1101,7 +1101,7 @@ record('settings.reachable', /导出/.test(settingsText), `textLen=${settingsTex
 // 真实点击导出（web 路径：Blob + a[download]）
 const downloadDir = path.join(OUTDIR, 'downloads');
 mkdirSync(downloadDir, { recursive: true });
-const client = await page.target().createCDPSession();
+const client = await page.createCDPSession();
 await client.send('Browser.setDownloadBehavior', {
   behavior: 'allow',
   downloadPath: downloadDir,
@@ -1252,9 +1252,14 @@ writeFileSync(
     2,
   ),
 );
-
-await browser.close();
-await new Promise((r) => server.close(r));
+} finally {
+  if (browser) {
+    try { await browser.close(); } catch {}
+  }
+  if (server) {
+    try { await new Promise((r) => server.close(r)); } catch {}
+  }
+}
 
 const failed = results.filter((r) => !r.ok);
 console.log(`\n=== ${results.length - failed.length}/${results.length} PASS ===`);
