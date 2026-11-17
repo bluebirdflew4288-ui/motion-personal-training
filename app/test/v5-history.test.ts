@@ -9,7 +9,7 @@
        · Session.tsx lastByExercise 用 `map.has(key) continue` → 下次只说「1 组」；
        · stats.buildExerciseHistory 为这一次训练返回两条 entry；
        · listTrainedExercises 把一次训练算成 2 次。
-     fixture 用**真实领域函数** convertExerciseToDropSet 构造这条路径，不是手写数据。
+     fixture 直接构造历史 split 数据结构（旧自动拆卡生产算法已退役）。
 
    B（F-PARTIAL-GROUP-DISPLAY）：腿日哑铃侧平举 3 轮 × 3 阶段，每轮只完成阶段 1。
      旧 Stats.tsx 用 `Math.floor(3 行 / 3 阶段)` = 1 个完整大组 —— 凭空造出从未存在的大组。
@@ -26,14 +26,14 @@ import {
 } from '../src/domain/comparability';
 import { buildExerciseHistory, listTrainedExercises } from '../src/domain/stats';
 import {
-  convertExerciseToDropSet,
   createSession,
   hasReps,
   summarizeSession,
   withSet,
 } from '../src/domain/session';
 import { createV32Plan } from '../src/domain/presets/v32';
-import type { DropSetTarget, Session, SessionExercise } from '../src/domain/types';
+import { newId } from '../src/domain/session';
+import type { DropSetTarget, Session, SessionExercise, SessionSet } from '../src/domain/types';
 
 const NOW = 1_760_000_000_000;
 
@@ -84,54 +84,34 @@ function dropTarget(rounds: number, stageCount: number, weightMode: 'external' |
 /* ══ A：同动作中途转换后，片段必须聚合 ══════════════════════════ */
 
 /**
- * 审查 F-SPLIT-LAST 的真实路径：
- * 1. 胸 A 开始训练，双杠臂屈伸普通组第 1 组完成（40kg × 10）；
- * 2. 把剩余两组（真正未开始的）转成 3 阶段递减组；
- * 3. 后两轮每阶段 30kg × 8；
- * 4. 结束训练。
- * 用真实 convertExerciseToDropSet 构造，不做手写拼接。
+ * 历史 split 数据 fixture：直接构造同一次训练中普通片段 + 递减片段。
+ * 这里是历史读取/统计兼容数据，不是业务转换算法；生产已撤除自动拆卡。
  */
 function splitSession(): { session: Session; straight: SessionExercise; drop: SessionExercise } {
   const p = plan();
   let session = createSession(p, dayOf(p, '胸 A'), NOW);
   const dipId = findEx(session, '双杠臂屈伸').id;
-
-  // ① 普通组第 1 组完成 40kg × 10（bodyweight_plus 口径，weightKg 是外加负重）
   session = logSets(session, dipId, [{ roundIndex: 1, stageIndex: 1, reps: 10, weightKg: 40 }]);
-
-  // ② 把剩余两组转成 3 阶段递减组（真实领域函数：会插入第二个 SessionExercise）
-  const r = convertExerciseToDropSet(session, dipId, dropTarget(2, 3, 'bodyweight_plus'));
-  expect(r.converted).toBe(true);
-  session = r.session;
-
-  const sameName = session.exercises.filter((e) => e.name === '双杠臂屈伸');
-  // fixture 自证：同一次训练里确实有两个合法片段（同 exerciseId + 同口径）
-  expect(sameName).toHaveLength(2);
-  expect(sameName[0].target.kind).toBe('straight');
-  expect(sameName[1].target.kind).toBe('dropSet');
-  expect(sameName[0].exerciseId).toBe(sameName[1].exerciseId);
-  expect(modeOf(sameName[0])).toEqual(modeOf(sameName[1]));
-
-  // ③ 后两轮每阶段 30kg × 8
-  const dropId = sameName[1].id;
-  session = logSets(
-    session,
-    dropId,
-    Array.from({ length: 2 }, (_, ri) =>
-      Array.from({ length: 3 }, (_, si) => ({
-        roundIndex: ri + 1,
-        stageIndex: si + 1,
-        reps: 8,
-        weightKg: 30,
-      })),
-    ).flat(),
-  );
-
-  return {
-    session: finish(session),
-    straight: session.exercises.find((e) => e.target.kind === 'straight')!,
-    drop: session.exercises.find((e) => e.target.kind === 'dropSet')!,
+  const old = session.exercises.find((e) => e.id === dipId)!;
+  const kept: SessionExercise = {
+    ...old, status: 'done',
+    groups: old.groups.map((g) => ({ ...g, skipped: g.index !== 1 })),
+    sets: old.sets.filter((s) => s.roundIndex === 1),
+    note: '剩余部分已转为递减组',
   };
+  const target = dropTarget(2, 3, 'bodyweight_plus');
+  const groups = Array.from({ length: 2 }, (_, i) => ({ index: i + 1, stageCount: 3 }));
+  const sets: SessionSet[] = groups.flatMap((g) => target.stages.map((st, si) => ({
+    id: 'hist-' + g.index + '-' + (si + 1), roundIndex: g.index, stageIndex: si + 1,
+    reps: null, weightKg: null, status: 'blank' as const, ...(st.toFailure ? { toFailure: true } : {}),
+  })));
+  const fresh: SessionExercise = {
+    id: newId('sex'), exerciseId: old.exerciseId, planExerciseId: null, name: old.name, restSec: old.restSec,
+    target, status: 'pending', groups, sets, note: '承接未开始的 2 轮，改为递减组',
+  };
+  session = { ...session, exercises: session.exercises.flatMap((e) => e.id === dipId ? [kept, fresh] : [e]) };
+  session = logSets(session, fresh.id, Array.from({ length: 2 }, (_, ri) => Array.from({ length: 3 }, (_, si) => ({ roundIndex: ri + 1, stageIndex: si + 1, reps: 8, weightKg: 30 }))).flat());
+  return { session: finish(session), straight: session.exercises.find((e) => e.target.kind === 'straight')!, drop: session.exercises.find((e) => e.target.kind === 'dropSet')! };
 }
 
 describe('V4-04 A 同动作中途转换后片段聚合', () => {

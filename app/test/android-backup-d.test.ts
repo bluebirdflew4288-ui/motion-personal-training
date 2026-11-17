@@ -23,7 +23,7 @@ function payload(): BackupPayload {
     appVersion: '1.0.0',
     counts: { plans: 1, sessions: 2, activeSessions: 0 },
     data: { plans: [], sessions: [], settings: [] },
-  } as BackupPayload;
+  } as unknown as BackupPayload;
 }
 
 describe('D · 备份文件名与文本', () => {

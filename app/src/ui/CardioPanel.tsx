@@ -81,9 +81,11 @@ interface Props {
    * 登记 flush 时传函数，卸载时传 null。
    */
   registerFlush?: (entryId: string, flush: (() => boolean) | null) => void;
+  /** G3A2：父页注册“实时读取当前草稿签名”的 getter（队列执行时调用，不依赖重渲染） */
+  registerRawSignature?: (getter: (() => string | undefined) | null) => void;
 }
 
-export function CardioPanel({ entry, apply, disabled, pushToast, registerFlush }: Props) {
+export function CardioPanel({ entry, apply, disabled, pushToast, registerFlush, registerRawSignature }: Props) {
   const running = entry.status === 'running';
   const done = entry.status === 'done';
   const tick = useElapsedTick(running);
@@ -185,6 +187,34 @@ export function CardioPanel({ entry, apply, disabled, pushToast, registerFlush }
 
   const isTreadmill = entry.preset === 'treadmill-incline';
   const showParams = !done || draftPending;
+
+  /**
+   * G3A2：把**实时 getter** 交给父页（删除预览/队列执行时调用）。
+   *
+   * 不用 state 快照：子字段 raw 文本变化（7.→8.）不会触发 Panel 重渲染，
+   * 快照签名会过期。getter 每次现读注册字段原文 + 滑杆/草稿态，只读不 flush。
+   */
+  const sliderRef = useRef(slider);
+  sliderRef.current = slider;
+  const draftPendingRef = useRef(draftPending);
+  draftPendingRef.current = draftPending;
+  useEffect(() => {
+    if (!registerRawSignature) return undefined;
+    const getter = () => {
+      const exact = form.probeRawSignature();
+      const unsafe = [...form.unsafeFieldIds()].sort();
+      /**
+       * G3A2-FIX1：**pending slider** 也算未提交风险。
+       * 不能只在 exact/unsafe/draftPending 非空时才看滑杆 —— 用户拖了滑杆
+       * 但还没提交（或提交被草稿拦住）时，删除必须重新确认。
+       */
+      const sliderPending = !paramsEqual(sliderRef.current, entry.currentParams);
+      if (!exact && !unsafe.length && !draftPendingRef.current && !sliderPending) return undefined;
+      return JSON.stringify({ exact, unsafe, slider: sliderRef.current, draftPending: draftPendingRef.current });
+    };
+    registerRawSignature(getter);
+    return () => registerRawSignature(null);
+  }, [form, registerRawSignature]);
 
   /** 用 flushAll 的解析值 + 滑杆值合成候选参数（滑杆未提交也纳入） */
   const mergeDraftTo = (latest: CardioEntry, values: Record<string, number>): CardioParams => {
@@ -359,7 +389,7 @@ export function CardioPanel({ entry, apply, disabled, pushToast, registerFlush }
   const statusText = done ? '已完成' : running ? '进行中' : entry.status === 'paused' ? '已暂停' : '未开始';
 
   return (
-    <section className="slip" style={{ marginTop: 14 }}>
+    <section className="slip" data-testid={`cardio-panel-${entry.id}`}>
       <div style={{ padding: '12px 14px' }}>
         <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' }}>
           <span className="h-serif" style={{ fontSize: 17 }}>

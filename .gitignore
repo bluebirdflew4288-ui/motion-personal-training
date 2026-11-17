@@ -103,8 +103,8 @@ _rollback/v2-snapshot-20261021b/*
 # ── 本项目 git 元数据目录（gitdir，自身不能入库）──
 .git-motion/
 
-# ── 仅本地保留：失败/中间 APK（0.1.7 当前用户测试包可入库，0.1.2 已跟踪）──
-# 不写 *.apk 通配，避免把未来新版本包一起忽略。
+# ── 仅本地保留：失败/中间 APK（0.1.14 当前已真机确认包入库，0.1.2/0.1.7/0.1.8 已跟踪）──
+# 不写 *.apk 通配，避免把未来新版本包一起忽略；被忽略旧包完整保留在本机磁盘供回滚。
 /apk/MOTION-0.1.0-debug.apk
 /apk/MOTION-0.1.0-release.apk
 /apk/MOTION-0.1.1-release.apk
@@ -112,6 +112,11 @@ _rollback/v2-snapshot-20261021b/*
 /apk/MOTION-0.1.4-release.apk
 /apk/MOTION-0.1.5-release.apk
 /apk/MOTION-0.1.6-release.apk
+/apk/MOTION-0.1.9-release.apk
+/apk/MOTION-0.1.10-release.apk
+/apk/MOTION-0.1.11-release.apk
+/apk/MOTION-0.1.12-release.apk
+/apk/MOTION-0.1.13-release.apk
 
 # ── 仅本地保留：历史验收/返工报告（按文件名精确列出，不用 *.md 通配）──
 /Android交付报告.md

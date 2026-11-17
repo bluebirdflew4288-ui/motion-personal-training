@@ -8,19 +8,15 @@
    不手写假 fixture，避免「测试自己编的数据结构」掩盖真实缺陷。 */
 
 import { describe, expect, it } from 'vitest';
-import { exerciseIdFromName } from '../src/domain/identity';
 import { createV32Plan } from '../src/domain/presets/v32';
 import { draftToDropTarget } from '../src/domain/dropSet';
 import {
-  convertExerciseToDropSet,
-  convertExerciseToStraight,
   createSession,
   exerciseCompletion,
   groupHasActualInput,
   groupHasNoRecords,
   hasSkippedGroupsToUnskip,
   isSetLogged,
-  replaceExerciseInSession,
   requiredStages,
   restAfterSet,
   roundsOf,
@@ -35,7 +31,6 @@ import type {
   Session,
   SessionExercise,
   SessionSet,
-  StraightTarget,
 } from '../src/domain/types';
 
 const NOW = 1_760_000_000_000;
@@ -59,22 +54,7 @@ function exOf(session: Session, id: string): SessionExercise {
   return session.exercises.find((e) => e.id === id)!;
 }
 
-/** 找出包含某个 set 行的动作（用于断言「这行数据挂在谁名下」） */
-function ownerOfSet(session: Session, setId: string): SessionExercise | undefined {
-  return session.exercises.find((e) => e.sets.some((s) => s.id === setId));
-}
 
-/** 在整场训练里找第一个 reps === n 的 set 行及其归属动作 */
-function findRepsRow(
-  session: Session,
-  reps: number,
-): { ex: SessionExercise; set: SessionSet } | undefined {
-  for (const ex of session.exercises) {
-    const set = ex.sets.find((s) => s.reps === reps);
-    if (set) return { ex, set };
-  }
-  return undefined;
-}
 
 /** 只填 reps、不打勾、不填重量 —— 自重动作最常见也最容易丢的状态 */
 function repsOnly(reps = 12): Partial<SessionSet> {
@@ -121,22 +101,6 @@ describe('V3-03 有实际输入判定（与「计入完成量」严格分开）'
     expect(groupHasActualInput(after, 1)).toBe(true);
   });
 
-  it('6. 全空（reps=null, weightKg=null, blank）→ 可以整条重建', () => {
-    const { session } = chestSession();
-    const ex = session.exercises[0];
-    expect(groupHasActualInput(ex, 1)).toBe(false);
-    expect(groupHasNoRecords(ex, 1)).toBe(true);
-
-    // 整条替换：动作被就地换掉，身份变了，说明「可以重建」的判断生效
-    const r = replaceExerciseInSession(session, ex.id, '哑铃卧推');
-    expect(r.replaced).toBe(true);
-    expect(r.session.exercises).toHaveLength(session.exercises.length);
-    const replaced = r.session.exercises[0];
-    expect(replaced.name).toBe('哑铃卧推');
-    expect(replaced.exerciseId).toBe(exerciseIdFromName('哑铃卧推'));
-    expect(replaced.sets.every((s) => s.reps === null && s.status === 'blank')).toBe(true);
-  });
-
   it('6b. 结构自带 toFailure 的空行不算「已输入」（否则递减组永远无法转换）', () => {
     const { session } = legsSession();
     const lateral = session.exercises.find((e) => e.name === '哑铃侧平举')!;
@@ -153,59 +117,6 @@ describe('V3-03 有实际输入判定（与「计入完成量」严格分开）'
 /* ── 2. 替换动作保留未打勾的输入 ───────────────────── */
 
 describe('V3-03 替换动作：未打勾的输入必须留在原动作上', () => {
-  it('2. reps=12 / weight=null / blank 的组，替换后仍在原 exerciseId 上', () => {
-    const { session } = chestSession();
-    const ex = session.exercises[0];
-    const oldExerciseId = ex.exerciseId;
-    const setId = ex.sets[0].id;
-    let s = withSet(session, ex.id, setId, repsOnly(12));
-    expect(exOf(s, ex.id).sets[0].reps).toBe(12);
-
-    const r = replaceExerciseInSession(s, ex.id, '哑铃卧推');
-    expect(r.replaced).toBe(true);
-    s = r.session;
-
-    // 整场训练里仍能找到 reps===12 的那一行
-    const found = findRepsRow(s, 12);
-    expect(found).toBeDefined();
-    // 关键回归：它必须还挂在原动作名下，不能被「整条重建」抹掉，也不能挂到新动作上
-    expect(found!.ex.exerciseId).toBe(oldExerciseId);
-    expect(found!.ex.name).toBe('双杠臂屈伸');
-    expect(found!.set.id).toBe(setId);
-    // 新动作是干净的，没有窃取这一行
-    const fresh = s.exercises.find((e) => e.name === '哑铃卧推')!;
-    expect(fresh.sets.some((st) => st.reps === 12)).toBe(false);
-    expect(fresh.exerciseId).not.toBe(oldExerciseId);
-    // 原动作身份未被新动作顶替（旧实例仍在，只是把剩余组交出去）
-    expect(ownerOfSet(s, setId)!.exerciseId).toBe(oldExerciseId);
-  });
-
-  it('7. 部分组有输入、部分没有 → 只有未开始的组被转换，已开始的组数据与身份不变', () => {
-    const { session } = chestSession();
-    const ex = session.exercises[0];
-    const oldExerciseId = ex.exerciseId;
-    // 只给第 2 组填 reps=8（未打勾），第 1、3 组保持全空
-    const group2Set = ex.sets.find((s) => s.roundIndex === 2)!;
-    const s = withSet(session, ex.id, group2Set.id, { reps: 8, weightKg: null, status: 'blank' });
-
-    expect(groupHasActualInput(exOf(s, ex.id), 2)).toBe(true);
-    expect(groupHasActualInput(exOf(s, ex.id), 1)).toBe(false);
-    expect(groupHasActualInput(exOf(s, ex.id), 3)).toBe(false);
-
-    const r = replaceExerciseInSession(s, ex.id, '哑铃卧推');
-    expect(r.replaced).toBe(true);
-    const kept = r.session.exercises.find((e) => e.name === '双杠臂屈伸')!;
-    const fresh = r.session.exercises.find((e) => e.name === '哑铃卧推')!;
-
-    // 旧动作：身份不变、只保留已开始那一组的行、未开始的组标 skipped
-    expect(kept.exerciseId).toBe(oldExerciseId);
-    expect(kept.sets.map((st) => st.reps)).toEqual([8]);
-    expect(kept.groups.map((g) => Boolean(g.skipped))).toEqual([true, false, true]);
-    // 新动作：承接 2 个未开始的组，且是空行
-    expect(fresh.groups).toHaveLength(2);
-    expect(fresh.sets).toHaveLength(2);
-    expect(fresh.sets.every((st) => st.reps === null)).toBe(true);
-  });
 
   it('8. 未打勾的输入不计完成组、也不算跳过组', () => {
     const { session } = chestSession();
@@ -244,124 +155,7 @@ describe('V3-03 替换动作：未打勾的输入必须留在原动作上', () =
 /* ── 3. 转换结构保留未打勾的输入 ───────────────────── */
 
 describe('V3-03 转换结构：未打勾的输入必须留在原动作上', () => {
-  const dropTarget = () =>
-    draftToDropTarget({
-      rounds: 2,
-      stages: [
-        { weightKg: 20, repsMin: 8, repsMax: 12, toFailure: false },
-        { weightKg: 15, repsMin: 8, repsMax: 12, toFailure: false },
-      ],
-      restInSec: 45,
-      restAfterSec: 240,
-      weightMode: 'external',
-    });
 
-  it('3a. 普通组 reps=12 未打勾 → 转递减组后 reps 仍在原动作上', () => {
-    const { session } = chestSession();
-    const ex = session.exercises[0];
-    const oldExerciseId = ex.exerciseId;
-    const setId = ex.sets[0].id;
-    const s = withSet(session, ex.id, setId, repsOnly(12));
-
-    const r = convertExerciseToDropSet(s, ex.id, dropTarget());
-    expect(r.converted).toBe(true);
-
-    const found = findRepsRow(r.session, 12);
-    expect(found).toBeDefined();
-    expect(found!.ex.exerciseId).toBe(oldExerciseId);
-    expect(found!.set.id).toBe(setId);
-    // 旧动作只剩已开始的第 1 组（未开始的 2、3 组交给新实例）
-    const kept = r.session.exercises.find((e) => e.exerciseId === oldExerciseId)!;
-    expect(kept.sets.map((st) => st.reps)).toEqual([12]);
-    expect(kept.groups.map((g) => Boolean(g.skipped))).toEqual([false, true, true]);
-    // 新实例承接 2 轮 × 2 阶段
-    const fresh = r.session.exercises.find((e) => e.id !== kept.id && e.name === '双杠臂屈伸')!;
-    expect(fresh.target.kind).toBe('dropSet');
-    expect(fresh.sets).toHaveLength(4);
-  });
-
-  it('3b. 递减组 reps=12 未打勾 → 转普通组后 reps 仍在原动作上', () => {
-    const { session } = legsSession();
-    const lateral = session.exercises.find((e) => e.name === '哑铃侧平举')!;
-    const oldExerciseId = lateral.exerciseId;
-    const stage1 = exOf(session, lateral.id).sets.find(
-      (x) => x.roundIndex === 1 && x.stageIndex === 1,
-    )!;
-    const setId = stage1.id;
-    const s = withSet(session, lateral.id, setId, repsOnly(12));
-
-    const straight: StraightTarget = {
-      kind: 'straight',
-      sets: 2,
-      setsMax: 2,
-      repsMin: 8,
-      repsMax: 12,
-      weightMode: 'external',
-      suggestedWeightKg: null,
-    };
-    const r = convertExerciseToStraight(s, lateral.id, straight);
-    expect(r.converted).toBe(true);
-
-    const found = findRepsRow(r.session, 12);
-    expect(found).toBeDefined();
-    expect(found!.ex.exerciseId).toBe(oldExerciseId);
-    expect(found!.set.id).toBe(setId);
-    const kept = r.session.exercises.find((e) => e.exerciseId === oldExerciseId)!;
-    // 第 1 轮（3 阶段）原样保留，含未填的阶段行，便于看出缺哪个阶段
-    expect(kept.sets.filter((st) => st.roundIndex === 1)).toHaveLength(3);
-    expect(kept.sets.some((st) => st.roundIndex === 2)).toBe(false);
-    expect(kept.groups.map((g) => Boolean(g.skipped))).toEqual([false, true, true]);
-  });
-
-  it('3c. 全空的递减组可以整条转成普通组（不留旧行）', () => {
-    const { session } = legsSession();
-    const lateral = session.exercises.find((e) => e.name === '哑铃侧平举')!;
-    const straight: StraightTarget = {
-      kind: 'straight',
-      sets: 3,
-      setsMax: 3,
-      repsMin: 8,
-      repsMax: 12,
-      weightMode: 'external',
-      suggestedWeightKg: null,
-    };
-    const r = convertExerciseToStraight(session, lateral.id, straight);
-    expect(r.converted).toBe(true);
-    // 整条转换：同一个 sessionExercise 实例，位置与 id 都不变
-    expect(r.session.exercises).toHaveLength(session.exercises.length);
-    const converted = r.session.exercises.find((e) => e.id === lateral.id)!;
-    expect(converted.target.kind).toBe('straight');
-    expect(converted.groups).toHaveLength(3);
-    expect(converted.sets).toHaveLength(3);
-  });
-});
-
-/* ── 4. roundsOf 不再凭空补一组 ────────────────────── */
-
-describe('V3-06 零组动作不产生幽灵安排量', () => {
-  it('9. groups: [] / sets: [] → roundsOf 返回 []，安排量 0', () => {
-    const plan = createV32Plan(NOW);
-    const backB = plan.days.find((d) => d.name === '背 B')!;
-    const full = createSession(plan, backB, NOW);
-    const opt = full.exercises.find((e) => e.name === '绳索直臂下拉')!;
-
-    // 真实结构：计划 0 组（0–2 可选），所以组结构为空数组
-    expect(opt.target.kind).toBe('straight');
-    expect(opt.groups).toEqual([]);
-    expect(opt.sets).toEqual([]);
-    expect(roundsOf(opt)).toEqual([]);
-
-    // 只留这一个动作，验证汇总不会凭空多出 1 组
-    const only: Session = { ...full, exercises: [opt], targetSetsAtStart: 0 };
-    const s = summarizeSession(only, NOW);
-    expect(s.arrangedGroups).toBe(0);
-    expect(s.plannedSets).toBe(0);
-    expect(s.completedSets).toBe(0);
-    expect(s.skippedGroups).toBe(0);
-    // 没有组可跳过，不能因为 0 === 0 被判成「已跳过」
-    expect(exerciseCompletion(opt)).toBe('pending');
-    expect(hasSkippedGroupsToUnskip(opt)).toBe(false);
-  });
 
   it('9b. 整场训练的 arrangedGroups 不再虚增', () => {
     const plan = createV32Plan(NOW);

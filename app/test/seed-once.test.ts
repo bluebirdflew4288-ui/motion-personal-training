@@ -36,8 +36,8 @@ function emptyBackup(): BackupPayload {
     version: BACKUP_VERSION,
     exportedAt: NOW,
     appVersion: '0.1.7',
-    counts: { plans: 0, sessions: 0, activeSessions: 0 },
-    data: { plans: [], sessions: [], settings: [DEFAULT_SETTINGS] },
+    counts: { plans: 0, sessions: 0, activeSessions: 0, exerciseTemplates: 0 },
+    data: { plans: [], sessions: [], settings: [DEFAULT_SETTINGS], exerciseTemplates: [] },
   };
 }
 

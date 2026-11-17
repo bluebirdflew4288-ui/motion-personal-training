@@ -26,6 +26,11 @@ const SNAPSHOT_VERSION = 1;
 /** 允许恢复的最大时间跨度：2 小时。超过即视为陈旧，不再恢复。 */
 export const MAX_RESTORE_AGE_MS = 2 * 60 * 60 * 1000;
 
+export interface RestTimerSource {
+  sessionExerciseId: string;
+  setId?: string;
+}
+
 export interface RestTimerSnapshot {
   v: 1;
   /** 归属的训练实例 */
@@ -34,6 +39,8 @@ export interface RestTimerSnapshot {
   token: string;
   /** 原生代次（未知为 null） */
   generation: number | null;
+  /** 计时归属（G3A1；旧快照无此字段 → null=unknown） */
+  source?: RestTimerSource | null;
   /** 运行中：绝对结束时间戳；暂停时该字段无意义 */
   endsAt: number | null;
   /** 暂停时冻结的剩余毫秒；运行中为 null */
@@ -92,6 +99,7 @@ export function saveRestTimerSnapshot(snap: RestTimerSnapshotInput): void {
       v: SNAPSHOT_VERSION,
       savedAt: Date.now(),
       intentWatermark: 0,
+      source: snap.source ?? null,
       ...snap,
     };
     s.setItem(key(snap.sessionId), JSON.stringify(record));
@@ -196,10 +204,30 @@ export function loadRestTimerSnapshot(
       ? Math.floor(r.intentWatermark)
       : 0;
 
+  const rawSource = r.source;
+  let source: RestTimerSource | null = null;
+  if (rawSource !== undefined && rawSource !== null) {
+    if (typeof rawSource !== 'object' || Array.isArray(rawSource)) {
+      clearRestTimerSnapshot(sessionId);
+      return null;
+    }
+    const src = rawSource as { sessionExerciseId?: unknown; setId?: unknown };
+    if (typeof src.sessionExerciseId !== 'string' || src.sessionExerciseId.trim() === '') {
+      clearRestTimerSnapshot(sessionId);
+      return null;
+    }
+    if (src.setId !== undefined && typeof src.setId !== 'string') {
+      clearRestTimerSnapshot(sessionId);
+      return null;
+    }
+    source = { sessionExerciseId: src.sessionExerciseId, ...(src.setId !== undefined ? { setId: src.setId } : {}) };
+  }
+
   return {
     v: SNAPSHOT_VERSION,
     sessionId,
     token: r.token,
+    source,
     generation,
     intentWatermark,
     endsAt: typeof r.endsAt === 'number' && Number.isFinite(r.endsAt) ? r.endsAt : null,

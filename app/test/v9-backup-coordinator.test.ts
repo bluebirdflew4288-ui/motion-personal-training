@@ -18,7 +18,7 @@ function makeMockPayload(overrides?: Partial<BackupPayload>): BackupPayload {
     version: 1,
     appVersion: '0.1.7',
     exportedAt: NOW,
-    counts: { plans: 1, sessions: 0, activeSessions: 0 },
+    counts: { plans: 1, sessions: 0, activeSessions: 0, exerciseTemplates: 0 },
     data: {
       plans: [
         {
@@ -32,6 +32,7 @@ function makeMockPayload(overrides?: Partial<BackupPayload>): BackupPayload {
       ],
       sessions: [],
       settings: [],
+      exerciseTemplates: [],
     },
     ...overrides,
   };
@@ -77,6 +78,7 @@ describe('Backup coordinator bounded extraction behavior', () => {
           },
         ],
         settings: [],
+        exerciseTemplates: [],
       },
     });
 
@@ -154,6 +156,7 @@ describe('Backup coordinator bounded extraction behavior', () => {
         ],
         sessions: [],
         settings: [],
+        exerciseTemplates: [],
       },
     });
     const toasts: { msg: string; type?: string }[] = [];

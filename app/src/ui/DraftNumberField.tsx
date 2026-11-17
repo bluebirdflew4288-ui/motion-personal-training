@@ -17,14 +17,13 @@ import { useEffect, useRef, useState } from 'react';
 import type { DraftFieldHandle, DraftFormApi } from './draftForm';
 import { parseDraftNumber, shouldSyncExternal } from './draftForm';
 
-interface Props {
+interface BaseProps {
   label: string;
-  value: number;
-  onCommit: (v: number) => void | Promise<void>;
   min?: number;
   max?: number;
   integer?: boolean;
   unit?: string;
+  placeholder?: string;
   /** 自定义校验：返回错误消息则拒绝提交 */
   validate?: (v: number) => string | null;
   disabled?: boolean;
@@ -53,6 +52,12 @@ interface Props {
    * 让上层知道精确意图**晚于**此前的滑杆意图。
    */
   onInputIntent?: () => void;
+}
+
+interface NonNullableProps extends BaseProps {
+  nullable?: false;
+  value: number;
+  onCommit: (v: number) => void | Promise<void>;
   /**
    * B4/G3：**真实已持久值**（可选）。
    *
@@ -64,12 +69,26 @@ interface Props {
   persistedValue?: number;
 }
 
+interface NullableProps extends BaseProps {
+  nullable: true;
+  value: number | null;
+  onCommit: (v: number | null) => void | Promise<void>;
+  persistedValue?: number | null;
+}
+
+type Props = NonNullableProps | NullableProps;
+
 export interface ParsedDraft {
   ok: boolean;
   value: number | null;
   message: string | null;
 }
 
+const fmtDraft = (v: number | null | undefined): string =>
+  v === null || v === undefined ? '' : String(v);
+
+export function DraftNumberField(props: NonNullableProps): React.JSX.Element;
+export function DraftNumberField(props: NullableProps): React.JSX.Element;
 export function DraftNumberField({
   label,
   value,
@@ -77,7 +96,9 @@ export function DraftNumberField({
   min = 0,
   max = 9999,
   integer = true,
+  nullable = false,
   unit,
+  placeholder,
   validate,
   disabled,
   fieldId,
@@ -87,7 +108,7 @@ export function DraftNumberField({
   onInputIntent,
   persistedValue,
 }: Props) {
-  const [draft, setDraft] = useState(String(persistedValue !== undefined ? persistedValue : value));
+  const [draft, setDraft] = useState(fmtDraft(persistedValue !== undefined ? persistedValue : value));
   const [error, setError] = useState<string | null>(null);
   const [focused, setFocused] = useState(false);
   /** B2/G5-R5：IME 组合态也算不可卸载（组合中草稿可能与已提交值相同） */
@@ -100,7 +121,7 @@ export function DraftNumberField({
    */
   const errorRef = useRef<string | null>(null);
   errorRef.current = error;
-  const persistedRef = useRef(persistedValue !== undefined ? persistedValue : value);
+  const persistedRef = useRef<number | null>(persistedValue !== undefined ? persistedValue : value);
   persistedRef.current = persistedValue !== undefined ? persistedValue : value;
   /**
    * G5：上报不可卸载状态。
@@ -113,7 +134,7 @@ export function DraftNumberField({
      * 注意 `value` 可能是本地预览，判"未提交"必须用持久基准 persistedValue，
      * 否则滑杆预览变化会被当成用户未保存草稿（或反过来漏报）。
      */
-    const baseline = String(persistedValue !== undefined ? persistedValue : value);
+    const baseline = fmtDraft(persistedValue !== undefined ? persistedValue : value);
     const unsafe = composingRef.current || !!error || draft !== baseline || !parse(draft).ok;
     onDirtyChange?.(unsafe);
     /**
@@ -130,18 +151,18 @@ export function DraftNumberField({
     if (discardEpoch === undefined) return;
     composingRef.current = false;
     const fallbackVal = persistedValue !== undefined ? persistedValue : value;
-    setDraft(String(fallbackVal));
+    setDraft(fmtDraft(fallbackVal));
     setError(null);
     lastCommitted.current = fallbackVal;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [discardEpoch]);
-  const lastCommitted = useRef(persistedValue !== undefined ? persistedValue : value);
+  const lastCommitted = useRef<number | null>(persistedValue !== undefined ? persistedValue : value);
   /** Escape 取消后需要抑制紧接着的 blur 提交（否则会把拟取消值又写回去） */
   const suppressCommit = useRef(false);
 
   /** 校验规则与父表单 flushAll 共用同一份纯函数（V4-03 抽出到 draftForm.ts） */
   const parse = (raw: string): ParsedDraft =>
-    parseDraftNumber(raw, { min, max, integer, validate });
+    parseDraftNumber(raw, { min, max, integer, nullable, validate });
 
   // 外部值变化（其它地方改了）时同步草稿，但不打断正在输入。
   //
@@ -163,7 +184,7 @@ export function DraftNumberField({
      */
     const syncSource = persistedValue !== undefined ? persistedValue : value;
     if (shouldSyncExternal(syncSource, lastCommitted.current, draft)) {
-      setDraft(String(syncSource));
+      setDraft(fmtDraft(syncSource));
       setError(null);
       lastCommitted.current = syncSource;
     }
@@ -179,12 +200,15 @@ export function DraftNumberField({
     if (!form || !fieldId) return undefined;
     const handle: DraftFieldHandle = {
       flush: () => {
+        if (composingRef.current) {
+          return { ok: false, value: null, message: '输入法仍在组合中，请先完成输入' };
+        }
         const r = parse(draftRef.current);
         return { ok: r.ok, value: r.value, message: r.message };
       },
       reset: () => {
         const resetVal = persistedRef.current !== undefined ? persistedRef.current : valueRef.current;
-        setDraft(String(resetVal));
+        setDraft(fmtDraft(resetVal));
         setError(null);
         lastCommitted.current = resetVal;
       },
@@ -197,11 +221,18 @@ export function DraftNumberField({
        *   ③ IME 组合态；
        *   ④ 有错误待修正。
        */
+      rawSignature: () => {
+        const draftNow = draftRef.current;
+        const baseline = fmtDraft(persistedRef.current);
+        const dirty = composingRef.current || Boolean(errorRef.current) || draftNow !== baseline || !parse(draftNow).ok;
+        // 干净字段返回空串：删除预览必须把“没有未提交输入”判为空白，不能一律要求确认
+        return dirty ? `${draftNow}|${composingRef.current ? 'ime' : '-'}|${errorRef.current ?? '-'}` : '';
+      },
       isUnsafeToUnmount: () => {
         if (composingRef.current) return true;
         if (errorRef.current) return true;
         const draftNow = draftRef.current;
-        const baseline = String(persistedRef.current);
+        const baseline = fmtDraft(persistedRef.current);
         if (draftNow !== baseline) return true;
         return !parse(draftNow).ok;
       },
@@ -210,17 +241,19 @@ export function DraftNumberField({
     return () => form.unregister(fieldId);
     // parse 依赖 min/max/validate，这些都来自 props，用 value/fieldId 变化重建即可
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [form, fieldId, value, min, max, integer]);
+  }, [form, fieldId, value, min, max, integer, nullable]);
 
   const commit = () => {
+    // W02/IME 保护：组合未结束时绝不把中间空串或半成品提交（尤其 nullable=true 时不得把原值写成 null）
+    if (composingRef.current) return;
     const r = parse(draftRef.current);
     if (!r.ok) {
       setError(r.message);
       return;
     }
     setError(null);
-    lastCommitted.current = r.value!;
-    setDraft(String(r.value));
+    lastCommitted.current = r.value;
+    setDraft(fmtDraft(r.value));
     /**
      * B4/G3：用**真实持久基准**判断是否需要提交。
      *
@@ -229,7 +262,7 @@ export function DraftNumberField({
      * 未提供 persistedValue 时回退到 value（保持既有调用方行为）。
      */
     const baseline = persistedValue !== undefined ? persistedValue : value;
-    if (r.value !== baseline) void onCommit(r.value!);
+    if (r.value !== baseline) void (onCommit as (v: number | null) => void | Promise<void>)(r.value);
   };
 
   return (
@@ -248,6 +281,7 @@ export function DraftNumberField({
             borderColor: error ? 'var(--brick)' : undefined,
           }}
           value={draft}
+          placeholder={placeholder}
           disabled={disabled}
           aria-label={label}
           aria-invalid={!!error}
@@ -268,9 +302,9 @@ export function DraftNumberField({
           }}
           onCompositionEnd={() => {
             composingRef.current = false;
-            // 组合结束后按真实草稿重算（可能仍脏）
-            const baseline = String(persistedRef.current);
-            const unsafe = !!errorRef.current || draftRef.current !== baseline;
+            // 组合结束后按真实草稿重算（可能仍脏，或非空校验仍不通过）
+            const baseline = fmtDraft(persistedRef.current);
+            const unsafe = !!errorRef.current || draftRef.current !== baseline || !parse(draftRef.current).ok;
             onDirtyChange?.(unsafe);
             if (form && fieldId) form._reportUnsafe?.(fieldId, unsafe);
           }}
@@ -284,13 +318,14 @@ export function DraftNumberField({
           }}
           onKeyDown={(e) => {
             if (e.key === 'Enter') {
+              if (composingRef.current || e.nativeEvent.isComposing) return;
               e.preventDefault();
               e.currentTarget.blur();
             }
             if (e.key === 'Escape') {
               // 明确取消：用受控值覆盖草稿，并标记 suppress 避免 blur 把拟取消值提交
               suppressCommit.current = true;
-              setDraft(String(value));
+              setDraft(fmtDraft(value));
               setError(null);
               e.currentTarget.blur();
             }

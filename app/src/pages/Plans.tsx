@@ -1262,7 +1262,10 @@ function ExistingDropEditor({
               setError(`有字段还不合法：${Object.values(flushed.errors)[0]}`);
               return;
             }
-            const nextDraft = mergeFlushedDropDraft(draft, flushed.values, `ex.${exercise.id}`);
+            const nextDraft = mergeFlushedDropDraft(draft, flushed.values, `ex.${exercise.id}`, {
+              round1AsOverride: true,
+              nullIds: flushed.nullIds,
+            });
             const found = validateDropDraft(nextDraft);
             if (found.length) {
               setError(`还有 ${found.length} 处需要修正：${found[0].message}`);
@@ -1892,6 +1895,20 @@ export function PlanDayEditor({ planId, dayId }: { planId: string; dayId: string
                 </div>
 
                 {ex.target.kind === 'straight' ? (
+                  <>
+                  <div className="segmented" role="group" aria-label="哑铃口径" style={{ marginTop: 8 }}>
+                    {([['per_hand', '按单只'], ['total', '按合计']] as const).map(([basis, label]) => (
+                      <button
+                        key={basis}
+                        type="button"
+                        aria-pressed={(ex.target.kind === 'straight' ? (ex.target.dumbbellBasis ?? 'total') : 'total') === basis}
+                        style={{ fontSize: 12 }}
+                        onClick={() => void save(updateTarget(plan, day.id, ex.id, { dumbbellBasis: basis }))}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
                   <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0,1fr))', gap: 8, marginTop: 8 }}>
                     <DraftNumberField
                       onDirtyChange={editorDirtyHandler(`num:ex:${day.id}:${ex.id}:sets`)}
@@ -1943,18 +1960,21 @@ export function PlanDayEditor({ planId, dayId }: { planId: string; dayId: string
                     <DraftNumberField
                       onDirtyChange={editorDirtyHandler(`num:ex:${day.id}:${ex.id}:weight`)}
                       label="建议重量"
-                      value={ex.target.suggestedWeightKg ?? 0}
+                      nullable
+                      placeholder="—"
+                      value={ex.target.suggestedWeightKg}
                       min={0}
                       max={9999}
                       integer={false}
                       unit="kg"
                       onCommit={(v) =>
                         void save(
-                          updateTarget(plan, day.id, ex.id, { suggestedWeightKg: v > 0 ? v : null }),
+                          updateTarget(plan, day.id, ex.id, { suggestedWeightKg: v }),
                         )
                       }
                     />
                   </div>
+                  </>
                 ) : (
                   <div style={{ marginTop: 8 }}>
                     <ExistingDropEditor
@@ -2145,7 +2165,10 @@ export function PlanDayEditor({ planId, dayId }: { planId: string; dayId: string
                         return;
                       }
 
-                      const nextDrop = mergeFlushedDropDraft(addDropDraft, flushed.values, 'addDrop');
+                      const nextDrop = mergeFlushedDropDraft(addDropDraft, flushed.values, 'addDrop', {
+                        round1AsOverride: true,
+                        nullIds: flushed.nullIds,
+                      });
                       const nextStraight = mergeFlushedStraightDraft(addStraightDraft, flushed.values, 'add');
 
                       if (addForm === 'dropSet') {

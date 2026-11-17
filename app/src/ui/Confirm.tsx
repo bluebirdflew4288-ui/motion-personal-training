@@ -32,15 +32,17 @@ export function Confirm({
 }: Props) {
   return (
     <Sheet
+      data-testid="confirm-sheet"
       open={open}
       title={title}
       onClose={onCancel}
       footer={
         <div style={{ display: 'flex', gap: 10 }}>
-          <button className="btn btn-ghost" style={{ flex: 1 }} onClick={onCancel} disabled={busy}>
+          <button className="btn btn-ghost" data-testid="confirm-cancel" style={{ flex: 1 }} onClick={onCancel} disabled={busy}>
             {cancelText}
           </button>
           <button
+            data-testid="confirm-ok"
             className={`btn ${danger ? 'btn-danger' : 'btn-primary'}`}
             style={{ flex: 1 }}
             onClick={onConfirm}

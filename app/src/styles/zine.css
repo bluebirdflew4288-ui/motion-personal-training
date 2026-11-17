@@ -305,9 +305,10 @@
   width: 100%;
 }
 .btn-danger {
-  border-color: var(--brick);
-  color: var(--brick);
-  background: transparent;
+  /* G02：危险确认按钮也使用独立 danger token；白字对比度 ≥4.5:1，不再沿用品牌砖橙。 */
+  border-color: var(--danger-delete, var(--brick));
+  color: var(--danger-delete-ink, #fff);
+  background: var(--danger-delete, var(--brick));
   box-shadow: none;
 }
 
@@ -512,7 +513,9 @@ select.input {
 .toast-stack {
   position: fixed;
   left: 50%;
-  bottom: calc(84px + var(--safe-bottom));
+  /* F08：撤销堆叠出现时整体抬起（--undo-lift 由 UndoStack 实测写入），
+     普通提示既不会被撤销条挤出屏幕，也不会盖住撤销按钮。 */
+  bottom: calc(84px + var(--safe-bottom) + var(--undo-lift, 0px));
   transform: translateX(-50%);
   z-index: 90;
   display: flex;
@@ -521,8 +524,10 @@ select.input {
   width: min(92vw, 480px);
   pointer-events: none;
 }
+/* R02 FIX3：纯文本 ok/info 提示不截获下方控件；关闭按钮单独可点。
+   error 提示仍需整条可点（关闭），由 `.toast-error` 恢复 auto。 */
 .toast {
-  pointer-events: auto;
+  pointer-events: none;
   background: var(--ink);
   color: var(--paper);
   font-size: var(--fs-14);
@@ -537,15 +542,107 @@ select.input {
   align-items: flex-start;
 }
 .toast-error {
+  pointer-events: auto;
   border-left-color: #d8452a;
   background: #2a1109;
   color: #ffe9e2;
+}
+.toast-dismiss {
+  pointer-events: auto;
+  flex: none;
+  appearance: none;
+  background: none;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  font-size: 16px;
+  line-height: 1;
+  opacity: 0.72;
+  cursor: pointer;
+  padding: 2px 4px;
+  min-width: 28px;
+  min-height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.toast-dismiss:focus-visible {
+  outline: 2px solid var(--paper);
+  outline-offset: 2px;
 }
 @keyframes toast-in {
   from {
     opacity: 0;
     transform: translateY(6px);
   }
+}
+
+/* ── 删除撤销堆叠（F08）─────────────────
+   固定在可见屏幕底部、底部导航（56px+1.5px 边框）与安全区之上；
+   纵向堆叠，最新删除在最下面；最多 3 条高度，超出在列表区域内滚动。 */
+.undo-stack {
+  --undo-row-h: 44px;
+  position: fixed;
+  left: 50%;
+  transform: translateX(-50%);
+  bottom: calc(58px + var(--safe-bottom) + var(--kb-inset, 0px));
+  z-index: 88;
+  width: min(92vw, 480px);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 8px;
+  background: var(--paper-2);
+  border: 1px solid var(--rule);
+  border-left: 3px solid var(--brick);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.22);
+  pointer-events: none;
+}
+.undo-stack-head {
+  font-family: var(--f-mono);
+  font-size: 11.5px;
+  letter-spacing: 0.04em;
+  color: var(--ink-3);
+}
+.undo-stack-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  /* 最多显示 3 条的高度；更多条目在这个区域内滚动，全部可访问 */
+  max-height: calc(3 * var(--undo-row-h));
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  pointer-events: auto;
+}
+.undo-row {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: var(--undo-row-h);
+  border-top: 1px dashed var(--rule);
+  pointer-events: auto;
+}
+.undo-row-name {
+  /* 长名称不挤掉撤销按钮（U02）：名字收缩+省略，按钮 flex:none */
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.undo-row-time {
+  flex: none;
+  font-family: var(--f-mono);
+  font-size: 11.5px;
+  color: var(--ink-4);
+  font-variant-numeric: tabular-nums;
+}
+.undo-row > button {
+  flex: none;
 }
 
 /* ── 空状态 ───────────────────────────── */
@@ -683,4 +780,92 @@ select.input {
 }
 .stamp-pop {
   animation: stamp-in 0.24s cubic-bezier(0.2, 0.8, 0.3, 1);
+}
+
+/* ── F10：删除成功后的局部粒子消散 ─────────────────────────────
+   只覆盖**所属卡自身盒子**：absolute、不进入文档流、pointer-events:none，
+   因此不改变布局与滚动范围，也不截获输入/滚动/键盘焦点。
+   减少动态由 base.css 的全局降级与页面逻辑（不建节点）双重保证。 */
+.dissolve-layer {
+  position: absolute;
+  inset: 0;
+  /* 不抬层级：本层作为分区容器的**第一个**子节点渲染，真实卡片（position:relative）
+     按 DOM 顺序画在它上面。补位上来的邻卡因此会自然盖住消散中的幽灵，
+     不会出现"幽灵压在邻卡内容上"的遮挡。 */
+  z-index: 0;
+  pointer-events: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.dissolve-ghost {
+  position: absolute;
+  /* 粒子与外壳都被裁剪在所属卡自身盒内：不横向溢出、不遮挡邻卡内容 */
+  overflow: hidden;
+  border-radius: 2px;
+  contain: paint;
+  pointer-events: none;
+}
+
+.dissolve-shell {
+  position: absolute;
+  inset: 0;
+  /* G02：删除消散属于删除专用视觉层，跟 danger token 一致，不改动画/提交逻辑。 */
+  background: var(--danger-delete, var(--brick));
+  opacity: 0.26;
+  animation: motion-f10-shell var(--dissolve-ms, 260ms) ease-out forwards;
+}
+
+.dissolve-label {
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-family: var(--f-sans);
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.4;
+  text-align: center;
+  color: #fff;
+  opacity: 0;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+  animation: motion-f10-label var(--dissolve-ms, 260ms) ease-out forwards;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dissolve-particle {
+  position: absolute;
+  border-radius: 50%;
+  background: var(--danger-delete, var(--brick));
+  opacity: 0;
+  animation-name: motion-f10-particle;
+  animation-timing-function: cubic-bezier(0.24, 0.72, 0.36, 1);
+  animation-fill-mode: forwards;
+  will-change: transform, opacity;
+}
+
+.dissolve-particle[data-tone='ink'] {
+  background: var(--ink-2);
+}
+
+@keyframes motion-f10-shell {
+  0% { opacity: 0.26; transform: scale(1); }
+  60% { opacity: 0.12; }
+  100% { opacity: 0; transform: scale(0.985); }
+}
+
+@keyframes motion-f10-label {
+  0% { opacity: 0; }
+  16% { opacity: 0.92; }
+  70% { opacity: 0.45; }
+  100% { opacity: 0; }
+}
+
+@keyframes motion-f10-particle {
+  0% { opacity: 0; transform: translate3d(0, 0, 0) scale(0.6); }
+  18% { opacity: var(--po, 0.85); }
+  100% { opacity: 0; transform: translate3d(var(--dx, 0px), var(--dy, -28px), 0) scale(0.35); }
 }

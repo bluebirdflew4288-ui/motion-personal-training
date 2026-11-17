@@ -115,9 +115,16 @@ export function deriveGroupsFrom(
   stageCountHint?: number,
 ): GroupPlan[] {
   const sets = Array.isArray(setsInput) ? (setsInput as Record<string, unknown>[]) : [];
-  const stageCount =
-    stageCountHint ??
-    (target?.kind === 'dropSet' && Array.isArray(target.stages) ? Math.max(1, target.stages.length) : 1);
+  const roundConfigs = target?.kind === 'dropSet' && Array.isArray(target.roundConfigs)
+    ? (target.roundConfigs as Array<Record<string, unknown>>)
+    : [];
+  const stageCountFor = (roundIndex: number): number => {
+    if (stageCountHint !== undefined) return stageCountHint;
+    if (target?.kind !== 'dropSet') return 1;
+    const override = roundConfigs.find((r) => Number(r.roundIndex) === roundIndex);
+    const stages = override && Array.isArray(override.stages) ? override.stages : target.stages;
+    return Array.isArray(stages) ? Math.max(1, stages.length) : 1;
+  };
 
   // 1) 真实组号骨架：只保留有限的正整数，去重升序
   const realIndexes = Array.from(
@@ -130,12 +137,12 @@ export function deriveGroupsFrom(
   ).sort((a, b) => a - b);
 
   // 2) 有真实组号：本次安排就是这些组，绝不补新组（V4-05：删掉的组不复活）
-  if (realIndexes.length) return realIndexes.map((index) => ({ index, stageCount }));
+  if (realIndexes.length) return realIndexes.map((index) => ({ index, stageCount: stageCountFor(index) }));
 
   // 3) 完全没有 set 行：只能按 target 声明「从无到有」生成（唯一允许的情况）
   const declaredRaw = target ? (target.kind === 'dropSet' ? Number(target.rounds) : Number(target.sets)) : 0;
   const declared = Number.isFinite(declaredRaw) && declaredRaw > 0 ? Math.floor(declaredRaw) : 0;
-  return Array.from({ length: declared }, (_, i) => ({ index: i + 1, stageCount }));
+  return Array.from({ length: declared }, (_, i) => ({ index: i + 1, stageCount: stageCountFor(i + 1) }));
 }
 
 /** 旧签名兼容：从动作对象里取 sets 与 target */

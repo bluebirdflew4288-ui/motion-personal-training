@@ -9,11 +9,13 @@ import {
   MAX_STAGES,
   MIN_ROUNDS,
   MIN_STAGES,
-  addStage,
+  addStageToRound,
   describeDropDraft,
-  moveStage,
-  removeStage,
-  updateStage,
+  setDropDraftRounds,
+  draftStagesForRound,
+  moveStageInRound,
+  removeStageFromRound,
+  updateStageInRound,
   validateDropDraft,
 } from '../domain/dropSet';
 import { DraftNumberField } from './DraftNumberField';
@@ -64,12 +66,14 @@ export function stageFieldIds(
   fieldPrefix: string,
   stageIndex: number,
   toFailure: boolean,
-): { weight: string; repsMin: string | undefined; repsMax: string | undefined } {
-  const p = `${fieldPrefix}.s${stageIndex}`;
+  roundIndex = 1,
+): { weight: string; repsMin: string | undefined; repsMax: string | undefined; rest: string } {
+  const p = roundIndex === 1 ? `${fieldPrefix}.s${stageIndex}` : `${fieldPrefix}.r${roundIndex}s${stageIndex}`;
   return {
     weight: `${p}.weight`,
     repsMin: toFailure ? undefined : `${p}.repsMin`,
     repsMax: toFailure ? undefined : `${p}.repsMax`,
+    rest: `${p}.rest`,
   };
 }
 
@@ -160,10 +164,23 @@ export function DropSetEditor({
    * 只有点「是」才 onChange(removeStage(...))，随后仍需用户按
    * 「保存这个配置」才真正落库 —— 与既有语义一致。
    */
-  const [stageToDelete, setStageToDelete] = useState<number | null>(null);
+  const [stageToDelete, setStageToDelete] = useState<{ round: number; index: number } | null>(null);
+  const [activeRound, setActiveRound] = useState(1);
 
   const issues = validateDropDraft(draft);
   const issueFor = (path: string) => issues.find((i) => i.path === path)?.message ?? null;
+  const effectiveRound = Math.min(Math.max(1, activeRound), Math.max(1, draft.rounds));
+  const currentStages = draftStagesForRound(draft, effectiveRound);
+  const roundStageCounts = Array.from({ length: Math.max(1, draft.rounds) }, (_, i) => draftStagesForRound(draft, i + 1).length);
+  /**
+   * R02 FIX3：`validateDropDraft` 对逐轮覆盖返回的 path 是
+   * `roundOverrides[<数组下标>].stages[i].xxx`，而旧行内错误只查 `stages[i]`，
+   * 于是第 1 轮 override / 其它轮的错误全部丢失。这里按**当前渲染轮**计算
+   * 它在 roundOverrides 中的真实下标；未覆盖的默认轮回退查 `stages[i]`。
+   */
+  const currentOverrideIdx = draft.roundOverrides?.findIndex((o) => o.roundIndex === effectiveRound) ?? -1;
+  const stageIssuePath = (i: number) =>
+    currentOverrideIdx >= 0 ? `roundOverrides[${currentOverrideIdx}].stages[${i}]` : `stages[${i}]`;
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
@@ -191,7 +208,7 @@ export function DropSetEditor({
           max={MAX_ROUNDS}
           form={form}
           fieldId={`${fieldPrefix}.rounds`}
-          onCommit={(v) => onChange({ ...draft, rounds: v })}
+          onCommit={(v) => { onChange(setDropDraftRounds(draft, v)); setActiveRound((r) => Math.min(r, Math.max(1, v))); }}
         />
         <DraftNumberField
           label="阶段间休息"
@@ -214,48 +231,52 @@ export function DropSetEditor({
           onCommit={(v) => onChange({ ...draft, restAfterSec: v })}
         />
       </div>
+      {issueFor('rounds') ? (
+        <div role="alert" data-testid="drop-rounds-error" style={{ color: 'var(--brick)', fontSize: 12 }}>
+          {issueFor('rounds')}
+        </div>
+      ) : null}
 
-      <div className="segmented" role="group" aria-label="负重口径">
-        {(
-          [
-            ['external', '外部负重'],
-            ['bodyweight', '自重'],
-            ['bodyweight_plus', '自重+负重'],
-            ['assisted', '辅助'],
-          ] as const
-        ).map(([v, label]) => (
-          <button
-            key={v}
-            aria-pressed={draft.weightMode === v}
-            onClick={() => onChange({ ...draft, weightMode: v })}
-            style={{ fontSize: 12 }}
-          >
-            {label}
-          </button>
-        ))}
-      </div>
+      {/* R02：逐轮阶段（默认 stages 为第 1 轮；其它轮可独立配置） */}
+      {draft.rounds > 1 ? (
+        <div className="segmented" role="group" aria-label="逐轮阶段配置" style={{ flexWrap: 'wrap' }}>
+          {roundStageCounts.map((count, i) => (
+            <button
+              key={i}
+              type="button"
+              data-testid={`drop-round-tab-${i + 1}`}
+              aria-pressed={effectiveRound === i + 1}
+              onClick={() => setActiveRound(i + 1)}
+              style={{ fontSize: 12, minWidth: 72 }}
+            >
+              第 {i + 1} 轮 · {count} 阶段
+            </button>
+          ))}
+        </div>
+      ) : null}
 
       {/* 阶段 */}
       <div>
         <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', marginBottom: 6 }}>
-          <strong style={{ fontSize: 14 }}>阶段（{draft.stages.length}）</strong>
+          <strong style={{ fontSize: 14 }}>{effectiveRound === 1 ? '阶段' : `第 ${effectiveRound} 轮阶段`}（{currentStages.length}）</strong>
           <div style={{ display: 'flex', gap: 6 }}>
             <button
               className="btn btn-sm btn-ghost"
-              disabled={draft.stages.length >= MAX_STAGES}
-              onClick={() => onChange(addStage(draft))}
+              disabled={currentStages.length >= MAX_STAGES}
+              onClick={() => onChange(addStageToRound(draft, effectiveRound))}
             >
               + 加阶段
             </button>
           </div>
         </div>
 
-        {draft.stages.map((st, i) => {
-          const ids = stageFieldIds(fieldPrefix, i, st.toFailure);
+        {currentStages.map((st, i) => {
+          const ids = stageFieldIds(fieldPrefix, i, st.toFailure, effectiveRound);
           return (
           <div
-            key={i}
+            key={`${effectiveRound}-${i}`}
             data-drop-stage={i}
+            data-drop-round={effectiveRound}
             data-drop-prefix={fieldPrefix}
             data-to-failure={st.toFailure ? '1' : '0'}
             style={{
@@ -273,25 +294,25 @@ export function DropSetEditor({
                   style={{ minWidth: 44, padding: 0 }}
                   disabled={i === 0}
                   aria-label={`阶段 ${i + 1} 上移`}
-                  onClick={() => onChange(moveStage(draft, i, -1))}
+                  onClick={() => onChange(moveStageInRound(draft, effectiveRound, i, -1))}
                 >
                   ↑
                 </button>
                 <button
                   className="btn btn-sm btn-ghost"
                   style={{ minWidth: 44, padding: 0 }}
-                  disabled={i === draft.stages.length - 1}
+                  disabled={i === currentStages.length - 1}
                   aria-label={`阶段 ${i + 1} 下移`}
-                  onClick={() => onChange(moveStage(draft, i, 1))}
+                  onClick={() => onChange(moveStageInRound(draft, effectiveRound, i, 1))}
                 >
                   ↓
                 </button>
                 <button
                   className="btn btn-sm btn-ghost"
                   style={{ minWidth: 44, minHeight: 44, padding: 0, color: 'var(--brick)' }}
-                  disabled={draft.stages.length <= MIN_STAGES}
+                  disabled={currentStages.length <= MIN_STAGES}
                   aria-label={`删除阶段 ${i + 1}`}
-                  onClick={() => setStageToDelete(i)}
+                  onClick={() => setStageToDelete({ round: effectiveRound, index: i })}
                 >
                   ×
                 </button>
@@ -308,14 +329,16 @@ export function DropSetEditor({
               */}
               <DraftNumberField
                 label="重量"
-                value={st.weightKg ?? 0}
+                nullable
+                placeholder="—"
+                value={st.weightKg}
                 min={0}
                 max={999}
                 integer={false}
                 unit="kg"
                 form={form}
                 fieldId={ids.weight}
-                onCommit={(v) => onChange(updateStage(draft, i, { weightKg: v }))}
+                onCommit={(v) => onChange(updateStageInRound(draft, effectiveRound, i, { weightKg: v }))}
               />
               <DraftNumberField
                 label="次数下限"
@@ -325,7 +348,7 @@ export function DropSetEditor({
                 disabled={st.toFailure}
                 form={ids.repsMin ? form : undefined}
                 fieldId={ids.repsMin}
-                onCommit={(v) => onChange(updateStage(draft, i, { repsMin: v, ...(st.toFailure ? { toFailure: false } : {}) }))}
+                onCommit={(v) => onChange(updateStageInRound(draft, effectiveRound, i, { repsMin: v, ...(st.toFailure ? { toFailure: false } : {}) }))}
               />
               <DraftNumberField
                 label="次数上限"
@@ -335,7 +358,7 @@ export function DropSetEditor({
                 disabled={st.toFailure}
                 form={ids.repsMax ? form : undefined}
                 fieldId={ids.repsMax}
-                onCommit={(v) => onChange(updateStage(draft, i, { repsMax: v, ...(st.toFailure ? { toFailure: false } : {}) }))}
+                onCommit={(v) => onChange(updateStageInRound(draft, effectiveRound, i, { repsMax: v, ...(st.toFailure ? { toFailure: false } : {}) }))}
               />
             </div>
 
@@ -367,23 +390,47 @@ export function DropSetEditor({
                         repsMin: st.repsMin ?? 8,
                         repsMax: st.repsMax ?? 12,
                       };
-                  onChange(updateStage(draft, i, next));
+                  onChange(updateStageInRound(draft, effectiveRound, i, next));
                 }}
                 style={{ width: 20, height: 20, accentColor: 'var(--brick)' }}
               />
               本阶段目标为技术性力竭（实际仍记录真实次数）
             </label>
 
-            {issueFor(`stages[${i}].reps`) ? (
-              <div role="alert" style={{ color: 'var(--brick)', fontSize: 12, marginTop: 2 }}>
-                {issueFor(`stages[${i}].reps`)}
+            {issueFor(`${stageIssuePath(i)}.reps`) ? (
+              <div role="alert" data-drop-error="reps" style={{ color: 'var(--brick)', fontSize: 12, marginTop: 2 }}>
+                {issueFor(`${stageIssuePath(i)}.reps`)}
               </div>
             ) : null}
-            {issueFor(`stages[${i}].weightKg`) ? (
-              <div role="alert" style={{ color: 'var(--brick)', fontSize: 12, marginTop: 2 }}>
-                {issueFor(`stages[${i}].weightKg`)}
+            {issueFor(`${stageIssuePath(i)}.weightKg`) ? (
+              <div role="alert" data-drop-error="weight" style={{ color: 'var(--brick)', fontSize: 12, marginTop: 2 }}>
+                {issueFor(`${stageIssuePath(i)}.weightKg`)}
               </div>
             ) : null}
+            {i < currentStages.length - 1 ? (
+              <div className="field" style={{ marginTop: 6 }}>
+                <label htmlFor={ids.rest}>短间歇（秒）</label>
+                <DraftNumberField
+                  label="短间歇"
+                  value={st.restAfterSec ?? draft.restInSec}
+                  min={0}
+                  max={600}
+                  unit="秒"
+                  form={form}
+                  fieldId={ids.rest}
+                  onCommit={(v) => onChange(updateStageInRound(draft, effectiveRound, i, { restAfterSec: v }))}
+                />
+                {issueFor(`${stageIssuePath(i)}.restAfterSec`) ? (
+                  <div role="alert" data-drop-error="rest" style={{ color: 'var(--brick)', fontSize: 12 }}>
+                    {issueFor(`${stageIssuePath(i)}.restAfterSec`)}
+                  </div>
+                ) : null}
+              </div>
+            ) : (
+              <span style={{ display: 'block', marginTop: 6, fontSize: 12, color: 'var(--ink-3)' }}>
+                末阶段直接接整轮休息（不叠加短间歇）
+              </span>
+            )}
           </div>
           );
         })}
@@ -422,7 +469,7 @@ export function DropSetEditor({
         title="删除这个阶段？"
         body={
           stageToDelete !== null
-            ? `将删除第 ${stageToDelete + 1} 阶段。当前还没保存的数字会保留在草稿里。`
+            ? `将删除第 ${stageToDelete.round} 轮的第 ${stageToDelete.index + 1} 阶段。当前还没保存的数字会保留在草稿里。`
             : ''
         }
         confirmText="是"
@@ -431,11 +478,11 @@ export function DropSetEditor({
         onCancel={() => setStageToDelete(null)}
         onConfirm={() => {
           if (stageToDelete === null) return;
-          const idx = stageToDelete;
+          const { round, index } = stageToDelete;
           setStageToDelete(null);
           // 只有这里是唯一改动点；取消路径不会走到
-          if (idx >= 0 && idx < draft.stages.length && draft.stages.length > MIN_STAGES) {
-            onChange(removeStage(draft, idx));
+          if (index >= 0 && index < draftStagesForRound(draft, round).length) {
+            onChange(removeStageFromRound(draft, round, index));
           }
         }}
       />

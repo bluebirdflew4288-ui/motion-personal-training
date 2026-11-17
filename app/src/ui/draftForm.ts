@@ -37,16 +37,25 @@ export interface DraftFieldHandle {
    * 未提供时退回 {@link flush} 的 ok 判定（兼容旧字段）。
    */
   isUnsafeToUnmount?: () => boolean;
+  /**
+   * G3A2：**被动**读取当前精确输入原文（不 flush、不写 state、不丢草稿）。
+   *
+   * 供删除预览/提交时的风险签名使用：同一字段 `7.` → `8.` 必须产生不同签名，
+   * 不能只用"是否 unsafe"的布尔。
+   */
+  rawSignature?: () => string;
 }
 
 export interface DraftFlushOutcome {
   ok: boolean;
   errors: Record<string, string>;
   /**
-   * 各字段**当前文本草稿**的解析值（只含合法字段）。
+   * 各字段**当前文本草稿**的解析值（只含合法非空数值字段）。
    * 父 handler 必须用它构造保存对象，而不是再次读父 state —— 见文件头 (2)。
    */
   values: Record<string, number>;
+  /** 明确清空为 null 的可选数字字段（如 W02 可选重量） */
+  nullIds?: Set<string>;
 }
 
 export interface DraftFormApi {
@@ -87,6 +96,13 @@ export interface DraftFormApi {
    * 不能只在 render 里调用一次（那样仍不会产生被动通知）。
    */
   _reportUnsafe?: (id: string, unsafe: boolean) => void;
+  /**
+   * G3A2：**被动**汇总当前所有字段的精确原文/错误/IME 状态签名。
+   *
+   * 与 `flushAll` 的区别：只读，不 `setErrors`、不提交、不改字段状态，
+   * 因此可在渲染/预览/队列执行时安全调用。
+   */
+  probeRawSignature: () => string;
   /** 汇总校验所有已注册字段的当前文本草稿，并返回解析值映射 */
   flushAll: () => DraftFlushOutcome;
   /**
@@ -199,16 +215,19 @@ export function useDraftForm(): DraftFormApi {
   const flushAll = useCallback((): DraftFlushOutcome => {
     const found: Record<string, string> = {};
     const values: Record<string, number> = {};
+    const nullIds = new Set<string>();
     for (const [id, handle] of handles.current) {
       const r = handle.flush();
       if (r.ok && r.value !== null && Number.isFinite(r.value)) {
         values[id] = r.value;
+      } else if (r.ok && r.value === null) {
+        nullIds.add(id);
       } else {
         found[id] = r.message ?? '输入不合法';
       }
     }
     setErrors(found);
-    return { ok: Object.keys(found).length === 0, errors: found, values };
+    return { ok: Object.keys(found).length === 0, errors: found, values, nullIds };
   }, []);
 
   /**
@@ -236,6 +255,22 @@ export function useDraftForm(): DraftFormApi {
     return true;
   }, []);
 
+  const probeRawSignature = useCallback((): string => {
+    const parts: string[] = [];
+    for (const [id, handle] of handles.current) {
+      let raw = '';
+      try {
+        raw = handle.rawSignature ? handle.rawSignature() : '';
+      } catch {
+        raw = '!probe-error';
+      }
+      // 干净字段的 raw 为空串：不进入签名，避免把“无草稿”误判成有未提交输入
+      if (raw) parts.push(`${id}\u0000${raw}`);
+    }
+    parts.sort();
+    return parts.join('\u0001');
+  }, []);
+
   const resetAll = useCallback(() => {
     for (const handle of handles.current.values()) handle.reset();
     setErrors({});
@@ -254,6 +289,7 @@ export function useDraftForm(): DraftFormApi {
       register,
       unregister,
       flushAll,
+      probeRawSignature,
       probeRawValid,
       resetAll,
       errors,
@@ -268,6 +304,7 @@ export function useDraftForm(): DraftFormApi {
       register,
       unregister,
       flushAll,
+      probeRawSignature,
       probeRawValid,
       resetAll,
       errors,
@@ -290,6 +327,8 @@ export interface ParseDraftNumberOptions {
   min?: number;
   max?: number;
   integer?: boolean;
+  /** W02：重量字段允许留空为 null，与显式 0 严格区分；其余必填数字默认 false */
+  nullable?: boolean;
   /** 自定义校验：返回消息则判为不合法 */
   validate?: (v: number) => string | null;
 }
@@ -298,13 +337,15 @@ export interface ParseDraftNumberOptions {
  * 文本草稿 → 数字的唯一解析规则。
  * blur 提交与父表单 flushAll 共用这一份，避免两条路径判定不一致。
  *
- * 关键点（F4-I02）：空串**必须**返回 ok:false / value:null，
- * 不允许任何上层把它当 0 或当旧值。
+ * 关键点（F4-I02）：默认空串**必须**返回 ok:false / value:null，
+ * 不允许任何上层把它当 0 或当旧值；仅显式 `nullable: true` 时空串返回 ok:true / value:null。
  */
 export function parseDraftNumber(raw: string, opts: ParseDraftNumberOptions = {}): DraftFieldResult {
-  const { min = 0, max = 9999, integer = true, validate } = opts;
+  const { min = 0, max = 9999, integer = true, nullable = false, validate } = opts;
   const t = raw.trim();
-  if (t === '') return { ok: false, value: null, message: '不能为空' };
+  if (t === '') {
+    return nullable ? { ok: true, value: null, message: null } : { ok: false, value: null, message: '不能为空' };
+  }
   // 允许 "-" / "7." 等中间态存在，但提交时必须是完整数字
   if (t === '-' || t === '.' || t === '-.' || t.endsWith('.')) {
     return { ok: false, value: null, message: '数字未输完' };
@@ -345,11 +386,11 @@ export function parseDraftNumber(raw: string, opts: ParseDraftNumberOptions = {}
  *   · 草稿为空串、未完（`7.`）、非法、或与基线不同 → **保留草稿**，不采纳。
  * 空串的保留语义与既有 F4-I02 修复一致（不能把"清空必填项"洗回旧值）。
  */
-export function shouldSyncExternal(value: number, lastCommitted: number, draft: string): boolean {
+export function shouldSyncExternal(value: number | null, lastCommitted: number | null, draft: string): boolean {
   // 外部值没变：不需要同步
   if (value === lastCommitted) return false;
   // 草稿与已提交基线一致 = 用户没有未提交意图 → 可以采纳外部更新
-  const baseline = String(lastCommitted);
+  const baseline = lastCommitted === null ? '' : String(lastCommitted);
   if (draft === baseline) return true;
   /**
    * 草稿非空但与基线不同 → 用户有未提交意图（含未完 `7.`、非法 `99999`）→ 保留。
@@ -438,11 +479,32 @@ export interface DraftIssueLike {
 }
 
 /** 递减组草稿的形状（结构兼容 domain/dropSet 的 DropSetDraft，避免 ui→domain 循环依赖） */
+export interface DropDraftStageLike {
+  weightKg: number | null;
+  repsMin: number | null;
+  repsMax: number | null;
+  toFailure: boolean;
+  restAfterSec?: number;
+}
+
 export interface DropDraftLike {
   rounds: number;
   restInSec: number;
   restAfterSec: number;
-  stages: { weightKg: number | null; repsMin: number | null; repsMax: number | null; toFailure: boolean }[];
+  stages: DropDraftStageLike[];
+  /** R02 逐轮覆盖（1..N 轮）；字段 id 用 `${prefix}.r{round}s{i}.*`，第 1 轮沿用 `${prefix}.s{i}.*` */
+  roundOverrides?: { roundIndex: number; stages: DropDraftStageLike[]; restInSec?: number }[];
+}
+
+export interface MergeFlushedDropDraftOptions {
+  /**
+   * R02 FIX2：第 1 轮字段（`${prefix}.s{i}.*`）是否应写入 `roundOverrides[1]` 而不是
+   * 共享默认 `stages`。真实计划编辑器必须传 true：第 1 轮与其它轮相互独立，
+   * 修改第 1 轮不能改写未覆盖的默认轮。旧测试/旧调用不传时保持原有 flush 语义。
+   */
+  round1AsOverride?: boolean;
+  /** W02：flushAll 明确清空为 null 的字段集合（用于保留空白重量而不沿用旧值） */
+  nullIds?: Set<string>;
 }
 
 /**
@@ -454,27 +516,83 @@ export interface DropDraftLike {
  * 力竭阶段的 weight 也会出现在 values 里（F4-I01：重量始终注册），
  * 而 repsMin/repsMax 在力竭时是 disabled、不注册，因此不会覆盖。
  */
+function mergeDropStageValues<T extends DropDraftStageLike>(
+  st: T,
+  values: Record<string, number>,
+  p: string,
+  nullIds?: Set<string>,
+): T {
+  const weightCleared = nullIds?.has(`${p}.weight`) ?? false;
+  const weight = values[`${p}.weight`];
+  const lo = values[`${p}.repsMin`];
+  const hi = values[`${p}.repsMax`];
+  const rest = values[`${p}.rest`];
+  return {
+    ...st,
+    weightKg: weightCleared ? null : typeof weight === 'number' && Number.isFinite(weight) ? weight : st.weightKg,
+    repsMin: typeof lo === 'number' && Number.isFinite(lo) ? lo : st.repsMin,
+    repsMax: typeof hi === 'number' && Number.isFinite(hi) ? hi : st.repsMax,
+    ...(typeof rest === 'number' && Number.isFinite(rest) ? { restAfterSec: rest } : {}),
+  };
+}
+
 export function mergeFlushedDropDraft<T extends DropDraftLike>(
   base: T,
   values: Record<string, number>,
   prefix: string,
+  opts: MergeFlushedDropDraftOptions = {},
 ): T {
+  const nullIds = opts.nullIds;
   const next = mergeFlushedValues(base, values, {
     rounds: `${prefix}.rounds`,
     restInSec: `${prefix}.restIn`,
     restAfterSec: `${prefix}.restAfter`,
   });
-  const stages = base.stages.map((st, i) => {
-    const p = `${prefix}.s${i}`;
-    const weight = values[`${p}.weight`];
-    const lo = values[`${p}.repsMin`];
-    const hi = values[`${p}.repsMax`];
-    return {
-      ...st,
-      weightKg: typeof weight === 'number' && Number.isFinite(weight) ? weight : st.weightKg,
-      repsMin: typeof lo === 'number' && Number.isFinite(lo) ? lo : st.repsMin,
-      repsMax: typeof hi === 'number' && Number.isFinite(hi) ? hi : st.repsMax,
-    };
-  });
-  return { ...next, stages };
+  let overrides = (base.roundOverrides ?? []).map((ov) => ({
+    ...ov,
+    stages: ov.stages.map((st, i) => mergeDropStageValues(st, values, `${prefix}.r${ov.roundIndex}s${i}`, nullIds)),
+  }));
+  let stages: DropDraftStageLike[];
+  if (opts.round1AsOverride) {
+    // 第 1 轮是独立轮：s{i} 字段写入 roundOverrides[1]；默认 stages 不动。
+    stages = base.stages.map((st) => ({ ...st }));
+    const existing1 = overrides.find((o) => o.roundIndex === 1);
+    if (existing1) {
+      existing1.stages = existing1.stages.map((st, i) => mergeDropStageValues(st, values, `${prefix}.s${i}`, nullIds));
+    } else {
+      overrides.push({
+        roundIndex: 1,
+        stages: base.stages.map((st, i) => mergeDropStageValues(st, values, `${prefix}.s${i}`, nullIds)),
+      });
+    }
+  } else {
+    stages = base.stages.map((st, i) => mergeDropStageValues(st, values, `${prefix}.s${i}`, nullIds));
+  }
+  // 第 2..N 轮若字段已被 flush（用户还在聚焦未 blur），但 base 尚无 override：
+  // 用默认行克隆出该轮再应用 flush 值，避免“保存旧值并关窗”（V4-03 同类缺陷）。
+  const knownRounds = new Set(overrides.map((o) => o.roundIndex));
+  for (let r = 2; r <= Math.max(1, base.rounds); r += 1) {
+    if (knownRounds.has(r)) continue;
+    const roundPrefix = `${prefix}.r${r}s`;
+    const hasFlushed =
+      Object.keys(values).some((k) => k.startsWith(roundPrefix)) ||
+      Array.from(nullIds ?? []).some((k) => k.startsWith(roundPrefix));
+    if (!hasFlushed) continue;
+    overrides.push({
+      roundIndex: r,
+      stages: base.stages.map((st, i) => mergeDropStageValues(st, values, `${roundPrefix}${i}`, nullIds)),
+    });
+  }
+  // 轮数 flush 也可能尚未 blur：结构新增轮必须复制紧邻上一轮，不能只把数字改大。
+  const nextRounds = typeof next.rounds === 'number' && Number.isInteger(next.rounds) ? next.rounds : base.rounds;
+  if (nextRounds < base.rounds) overrides = overrides.filter((o) => o.roundIndex <= nextRounds);
+  const stagesForRound = (r: number) => overrides.find((o) => o.roundIndex === r)?.stages ?? stages;
+  const knownAfter = new Set(overrides.map((o) => o.roundIndex));
+  for (let r = base.rounds + 1; r <= nextRounds; r += 1) {
+    if (knownAfter.has(r)) continue;
+    overrides.push({ roundIndex: r, stages: stagesForRound(r - 1).map((st) => ({ ...st })) });
+  }
+  return overrides.length
+    ? ({ ...next, stages, roundOverrides: overrides.sort((a, b) => a.roundIndex - b.roundIndex) } as T)
+    : ({ ...next, stages } as T);
 }

@@ -99,6 +99,8 @@ export interface ExerciseHistoryEntry {
   fragments: MovementFragment[];
   /** 完整大组数（按组结构判定，不用除法） */
   completeGroups: number;
+  /** R02：完整大组对应真实阶段总数（按每轮 stageCount 求和） */
+  completeStages: number;
   /** 部分大组数（有记录但不完整） */
   partialGroups: number;
   /** 已记录阶段行数（真实记录量，不是 完整大组 × 阶段数） */
@@ -197,6 +199,7 @@ export function buildExerciseHistory(
       stageCount: dropFragments.length ? Math.max(1, ...dropFragments.map((f) => f.stageCount)) : 1,
       fragments: perf.fragments,
       completeGroups: perf.completeGroups,
+      completeStages: perf.fragments.reduce((n, f) => n + f.completeStages, 0),
       partialGroups: perf.partialGroups,
       loggedStages: perf.loggedStages,
       maxWeightKg: perf.maxWeightKg,

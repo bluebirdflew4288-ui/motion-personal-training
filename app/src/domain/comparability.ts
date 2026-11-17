@@ -10,6 +10,7 @@
 
 import type { ExerciseTarget, Session, SessionExercise, SessionSet, WeightMode, DumbbellBasis } from './types';
 import { comparabilityKey, comparabilityLabel, WEIGHT_MODE_LABEL } from './identity';
+import { roundStagesOf } from './exerciseConfig';
 
 /** 从任意 session 动作取出它的计量口径 */
 export function modeOf(ex: SessionExercise): { weightMode: WeightMode; dumbbellBasis: DumbbellBasis } {
@@ -99,10 +100,15 @@ function structureOf(ex: SessionExercise): FragmentStructure[] {
       skipped: Boolean(g.skipped),
     }));
   }
-  const fallbackStage = ex.target.kind === 'dropSet' ? Math.max(1, ex.target.stages.length) : 1;
+  const target = ex.target;
+  const fallbackStage = (round: number): number => {
+    if (target.kind !== 'dropSet') return 1;
+    // R02 FIX2：与 roundStagesOf 同一口径（额外轮按最后声明轮回退，不跨轮搜索）。
+    return Math.max(1, roundStagesOf(target, round).length);
+  };
   return Array.from(new Set(ex.sets.map((s) => s.roundIndex)))
     .sort((a, b) => a - b)
-    .map((index) => ({ index, stageCount: fallbackStage, skipped: false }));
+    .map((index) => ({ index, stageCount: fallbackStage(index), skipped: false }));
 }
 
 function roundRows(ex: SessionExercise, index: number): SessionSet[] {
@@ -142,7 +148,7 @@ function groupsPartial(ex: SessionExercise): number {
 
 /* ── 同一次训练里「同动作多片段」的聚合（V4-04 A）──────────
    问题背景（审查 F-SPLIT-LAST）：
-   训练中把「剩余未开始的组」转成递减组时，`convertExerciseToDropSet` 会在同一次训练里
+   历史数据中曾把「剩余未开始的组」转成递减组，会在同一次训练里
    留下两个合法的 SessionExercise（同 exerciseId、同计量口径）：
    · 片段 1 straight，1 组已记录；
    · 片段 2 dropSet，2 轮 × 3 阶段已记录。
@@ -167,6 +173,8 @@ export interface MovementFragment {
   partialGroups: number;
   /** 已记录阶段行数（不等于 completeGroups × stageCount） */
   loggedStages: number;
+  /** 完整大组对应的真实阶段总数（R02：按每个完整轮自己的 stageCount 求和） */
+  completeStages: number;
 }
 
 export interface MovementPerformance {
@@ -192,10 +200,14 @@ export function fragmentOf(ex: SessionExercise): MovementFragment {
   const logged = ex.sets
     .filter(isLogged)
     .sort((a, b) => a.roundIndex - b.roundIndex || a.stageIndex - b.stageIndex);
+  const completeStages = structure
+    .filter((g) => groupIsComplete(ex, g))
+    .reduce((n, g) => n + g.stageCount, 0);
   return {
     sessionExerciseId: ex.id,
     kind: ex.target.kind,
-    stageCount: ex.target.kind === 'dropSet' ? Math.max(1, ex.target.stages.length) : 1,
+    // 兼容旧字段：片段内各轮可能不同，显示上限（统计口径以 completeStages / groups 为准）
+    stageCount: structure.length ? Math.max(1, ...structure.map((g) => g.stageCount)) : 1,
     // 每段保留自己的组号，不重排、不跨段合并
     groups: structure.map((g) => ({ index: g.index, stageCount: g.stageCount, skipped: g.skipped })),
     sets: logged.map((s) => ({
@@ -207,6 +219,7 @@ export function fragmentOf(ex: SessionExercise): MovementFragment {
     completeGroups: groupsComplete(ex),
     partialGroups: groupsPartial(ex),
     loggedStages: logged.length,
+    completeStages,
   };
 }
 
@@ -392,10 +405,8 @@ export function buildComparableHistory(
     if (!perf) continue;
     name = name || perf.name;
     const sets = perf.fragments.flatMap((f) => f.sets);
-    const completeStages = perf.fragments.reduce(
-      (n, f) => n + (f.kind === 'dropSet' ? f.completeGroups * f.stageCount : f.completeGroups),
-      0,
-    );
+    // R02：每个完整轮按自己的真实 stageCount 求和，绝不能用 completeGroups × 全局阶段数。
+    const completeStages = perf.fragments.reduce((n, f) => n + f.completeStages, 0);
     entries.push({
       sessionId: s.id,
       at: s.endedAt ?? s.startedAt,

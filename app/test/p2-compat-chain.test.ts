@@ -196,10 +196,10 @@ describe('场景2 · v1 备份恢复保真 + 夹带新结构必须拒绝', () =>
     expect(validateBackup(v1).ok).toBe(false);
   });
 
-  it('version 3 → 拒绝（不猜测读取）', () => {
+  it('version 4 → 拒绝（不猜测读取；v3 已是当前格式）', () => {
     const v3 = {
       format: BACKUP_FORMAT,
-      version: 3,
+      version: 4,
       exportedAt: NOW,
       appVersion: '9.9.9',
       counts: { plans: 0, sessions: 0, activeSessions: 0 },
@@ -252,7 +252,7 @@ describe('场景5 · v2 导出 → 校验 → 恢复 → 重读 → 重导出 �
 
     // 导出 v2
     const b1 = await buildBackup('2.0.0');
-    expect(b1.version).toBe(2);
+    expect(b1.version).toBe(3);
     const json1 = JSON.parse(JSON.stringify(b1));
 
     // 校验

@@ -27,6 +27,7 @@ import * as tx from '../src/db/tx';
 import * as repo from '../src/db/repo';
 import * as locks from '../src/lib/lock';
 import * as rescue from '../src/lib/draftRescue';
+import * as sessionWrite from '../src/lib/sessionWrite';
 import * as domain from '../src/domain/session';
 import * as merge from '../src/domain/draftMerge';
 import { createV32Plan } from '../src/domain/presets/v32';
@@ -120,6 +121,8 @@ function makeEnv(args: {
     nextDraftToken: () => ++tokenSeq,
     accumulateDraftIntent: merge.accumulateDraftIntent,
     mergeDraftOntoFresh: merge.mergeDraftOntoFresh,
+    decideQueuedSessionWrite: sessionWrite.decideQueuedSessionWrite,
+    pendingDraftFromIntent: sessionWrite.pendingDraftFromIntent,
     publishRescueDraft: rescue.publishRescueDraft,
     republishRebasedDraft: rescue.republishRebasedDraft,
     ackRescueDraft: rescue.ackRescueDraft,

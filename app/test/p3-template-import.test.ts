@@ -405,7 +405,7 @@ describe('导入后的完整生命周期', () => {
   it('导入的新计划进入全量 v2 备份 → 校验 → 恢复 → 重读保真', async () => {
     const plan = await importedPlan();
     const bak = await buildBackup('2.0.0');
-    expect(bak.version).toBe(2);
+    expect(bak.version).toBe(3);
     const v = validateBackup(JSON.parse(JSON.stringify(bak)));
     expect(v.ok, v.ok ? '' : (v as { error: string }).error).toBe(true);
     if (!v.ok) return;

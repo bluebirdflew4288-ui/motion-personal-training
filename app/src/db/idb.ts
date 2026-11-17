@@ -178,3 +178,150 @@ export function idbReplaceAll(payload: Record<string, unknown[]>): Promise<void>
 export function __resetDbHandle(): void {
   dbPromise = null;
 }
+
+/**
+ * G1：全量恢复（plans / sessions / settings / 动作模板）的原子入口。
+ *
+ * 关键边界：
+ * · **绝不把整个 meta store 交给通用 clear**：只删除 `exercise-template:` 前缀的行；
+ *   锁（lock:*）、播种（seeded）、恢复前快照（pre-restore-snapshot）等无关元数据
+ *   完整保留。恢复成功后在同一事务内写 `seeded = true`（恢复即视为已初始化）。
+ * · plans / sessions / settings 与模板在一笔 readwrite 事务里替换，
+ *   任一步失败整体 abort（原有数据不变）。
+ */
+export function idbRestoreAll(payload: {
+  plans: unknown[];
+  sessions: unknown[];
+  settings: unknown[];
+  exerciseTemplates: unknown[];
+}): Promise<void> {
+  const TEMPLATE_PREFIX = 'exercise-template:';
+  return openDb().then(
+    (db) =>
+      new Promise<void>((resolve, reject) => {
+        let t: IDBTransaction;
+        try {
+          t = db.transaction(['plans', 'sessions', 'settings', 'meta'], 'readwrite');
+        } catch (err) {
+          reject(new StorageError('恢复失败，原有数据未改变', err));
+          return;
+        }
+        let failed = false;
+        const fail = (cause: unknown) => {
+          if (failed) return;
+          failed = true;
+          try {
+            t.abort();
+          } catch {
+            /* ignore */
+          }
+          reject(cause instanceof StorageError ? cause : new StorageError('恢复失败，原有数据未改变', cause));
+        };
+        t.oncomplete = () => {
+          if (!failed) resolve();
+        };
+        t.onerror = () => fail(t.error);
+        t.onabort = () => fail(new StorageError('恢复被中止，原有数据未改变', t.error));
+        try {
+          const plansStore = t.objectStore('plans');
+          const sessionsStore = t.objectStore('sessions');
+          const settingsStore = t.objectStore('settings');
+          const metaStore = t.objectStore('meta');
+          plansStore.clear();
+          sessionsStore.clear();
+          settingsStore.clear();
+          for (const row of payload.plans) plansStore.put(row as object);
+          for (const row of payload.sessions) sessionsStore.put(row as object);
+          for (const row of payload.settings) settingsStore.put(row as object);
+
+          // 只定向清理模板前缀；其它 meta（锁/seed/恢复前快照等）原样保留
+          const keysReq = metaStore.getAllKeys();
+          keysReq.onerror = () => fail(keysReq.error);
+          keysReq.onsuccess = () => {
+            try {
+              for (const key of keysReq.result) {
+                if (typeof key === 'string' && key.startsWith(TEMPLATE_PREFIX)) metaStore.delete(key);
+              }
+              for (const tpl of payload.exerciseTemplates) {
+                const row = tpl as { exerciseId?: unknown };
+                if (typeof row.exerciseId !== 'string' || !row.exerciseId) {
+                  throw new StorageError('动作模板缺少 exerciseId，恢复已取消');
+                }
+                metaStore.put({ key: `${TEMPLATE_PREFIX}${row.exerciseId}`, value: tpl });
+              }
+              metaStore.put({ key: 'seeded', value: true });
+            } catch (err) {
+              fail(err);
+            }
+          };
+        } catch (err) {
+          fail(err);
+        }
+      }),
+  );
+}
+
+/**
+ * G1：单笔只读事务读取完整备份所需的所有 store（plans / sessions / settings / meta）。
+ *
+ * 为什么必须同一事务：buildBackup 若依次 await 多个独立事务，
+ * Session+模板的原子更新可能在两次读取之间提交，导出会拼出
+ * 「旧 Session + 新模板」的不一致快照。同一 readonly 事务保证看到同一提交点。
+ */
+export interface DbSnapshot {
+  plans: unknown[];
+  sessions: unknown[];
+  settings: unknown[];
+  meta: Array<{ key: unknown; value: unknown }>;
+}
+
+export function idbSnapshotAll(): Promise<DbSnapshot> {
+  return openDb().then(
+    (db) =>
+      new Promise<DbSnapshot>((resolve, reject) => {
+        let t: IDBTransaction;
+        try {
+          t = db.transaction(['plans', 'sessions', 'settings', 'meta'], 'readonly');
+        } catch (err) {
+          reject(new StorageError('读取备份快照失败', err));
+          return;
+        }
+        let plans: unknown[] = [];
+        let sessions: unknown[] = [];
+        let settings: unknown[] = [];
+        let meta: Array<{ key: unknown; value: unknown }> = [];
+        let pending = 4;
+        let settled = false;
+        const fail = (cause: unknown) => {
+          if (settled) return;
+          settled = true;
+          reject(cause instanceof StorageError ? cause : new StorageError('读取备份快照失败', cause));
+        };
+        const done = () => {
+          pending -= 1;
+          if (pending === 0 && !settled) {
+            settled = true;
+            resolve({ plans, sessions, settings, meta });
+          }
+        };
+        t.onerror = () => fail(t.error);
+        t.onabort = () => fail(t.error);
+        try {
+          const rPlans = t.objectStore('plans').getAll();
+          rPlans.onsuccess = () => { plans = rPlans.result as unknown[]; done(); };
+          rPlans.onerror = () => fail(rPlans.error);
+          const rSessions = t.objectStore('sessions').getAll();
+          rSessions.onsuccess = () => { sessions = rSessions.result as unknown[]; done(); };
+          rSessions.onerror = () => fail(rSessions.error);
+          const rSettings = t.objectStore('settings').getAll();
+          rSettings.onsuccess = () => { settings = rSettings.result as unknown[]; done(); };
+          rSettings.onerror = () => fail(rSettings.error);
+          const rMeta = t.objectStore('meta').getAll();
+          rMeta.onsuccess = () => { meta = rMeta.result as Array<{ key: unknown; value: unknown }>; done(); };
+          rMeta.onerror = () => fail(rMeta.error);
+        } catch (err) {
+          fail(err);
+        }
+      }),
+  );
+}

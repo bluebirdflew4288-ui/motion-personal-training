@@ -51,6 +51,9 @@ html {
   -webkit-text-size-adjust: 100%;
   text-size-adjust: 100%;
   height: 100%;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
 }
 
 body {
@@ -64,6 +67,9 @@ body {
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   overscroll-behavior-y: contain;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
 }
 
 /* 纸张纤维：固定在最底层，不拦截任何指针事件 */
@@ -130,4 +136,68 @@ a {
     transition-duration: 0.001ms !important;
     scroll-behavior: auto !important;
   }
+}
+
+/* G01-R2 / G04：全局非输入界面默认不可选中，仅文本输入控件开放选区与原生菜单。
+   · 外层容器（html/body/.app-shell/分区容器/占位块）默认 user-select:none，
+     杜绝拖动浮起（卡片 pointer-events:none）后长按击穿到外层容器产生空 Range
+     及多卡原生拖拽阴影；
+   · 卡片展示子树保持 pointer-events:none（点击/手势由内容层统一接收），
+     输入与交互控件显式恢复命中与编辑选区。 */
+.app-shell,
+[data-reorder-zone],
+[data-drag-placeholder],
+.reorder-card,
+.reorder-card-body {
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+
+input:not([type="range"]):not([type="checkbox"]):not([type="radio"]):not([type="button"]):not([type="submit"]):not([type="reset"]):not([type="file"]):not([type="color"]),
+textarea,
+[contenteditable=""],
+[contenteditable="plaintext-only"],
+[contenteditable="true"],
+[contenteditable="true"] *,
+[contenteditable=""] *,
+[contenteditable="plaintext-only"] * {
+  -webkit-user-select: text;
+  user-select: text;
+  -webkit-touch-callout: default;
+}
+
+.reorder-card-body,
+.reorder-card-body * {
+  -webkit-user-select: none !important;
+  user-select: none !important;
+  -webkit-touch-callout: none !important;
+  pointer-events: none;
+}
+.reorder-card-body input:not([type="range"]):not([type="checkbox"]):not([type="radio"]):not([type="button"]):not([type="submit"]):not([type="reset"]):not([type="file"]):not([type="color"]),
+.reorder-card-body textarea,
+.reorder-card-body select,
+.reorder-card-body [contenteditable=""],
+.reorder-card-body [contenteditable="plaintext-only"],
+.reorder-card-body [contenteditable="true"],
+.reorder-card-body [contenteditable="true"] *,
+.reorder-card-body [contenteditable=""] *,
+.reorder-card-body [contenteditable="plaintext-only"] * {
+  -webkit-user-select: text !important;
+  user-select: text !important;
+  -webkit-touch-callout: default !important;
+  pointer-events: auto;
+}
+.reorder-card-body input[type="range"],
+.reorder-card-body input[type="checkbox"],
+.reorder-card-body input[type="radio"],
+.reorder-card-body button,
+.reorder-card-body a,
+.reorder-card-body label,
+.reorder-card-body [role="slider"],
+.reorder-card-body [role="button"],
+.reorder-card-body [role="checkbox"],
+.reorder-card-body [role="switch"],
+.reorder-card-body [tabindex] {
+  pointer-events: auto;
 }

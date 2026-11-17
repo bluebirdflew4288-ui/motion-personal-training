@@ -25,7 +25,6 @@ import {
   isSetLogged,
   markExerciseDone,
   removeLastRound,
-  replaceExerciseInSession,
   summarizeSession,
   withSet,
 } from '../src/domain/session';
@@ -232,46 +231,6 @@ describe('R1-03 损坏备份允许覆盖', () => {
     await idbClear('sessions');
     await restoreBackup(r.payload);
     expect(await listSessions()).toHaveLength(1);
-  });
-});
-
-describe('R2-03 替换动作变成追加', () => {
-  it('替换未记录动作：位置不变、数量不变', () => {
-    const plan = createV32Plan(NOW);
-    const legsA = plan.days.find((d) => d.name === '腿 A')!;
-    const session = createSession(plan, legsA, NOW);
-    const before = session.exercises.length;
-    const target = session.exercises[0]; // 正向哈克深蹲
-    const r = replaceExerciseInSession(session, target.id, '自由杠铃卧推');
-    expect(r.replaced).toBe(true);
-    const replaced = r.session;
-
-    expect(replaced.exercises).toHaveLength(before);          // 数量不变
-    expect(replaced.exercises[0].name).toBe('自由杠铃卧推');   // 原位置变新动作
-    expect(replaced.exercises.some((e) => e.name === '正向哈克深蹲')).toBe(false);
-    expect(replaced.exercises[0].exerciseId).toBe(exerciseIdFromName('自由杠铃卧推'));
-    // 新动作继承可编辑结构（组结构不为空）
-    expect(replaced.exercises[0].groups.length).toBeGreaterThan(0);
-  });
-
-  it('已有记录的动作：保留原记录，只替换剩余部分', () => {
-    const plan = createV32Plan(NOW);
-    let session = createSession(plan, plan.days[0], NOW);
-    const dip = session.exercises[0];
-    session = withSet(session, dip.id, dip.sets[0].id, { reps: 10, status: 'done' });
-
-    const r = replaceExerciseInSession(session, dip.id, '哑铃卧推');
-    expect(r.replaced).toBe(true);
-    const after = r.session;
-    const kept = after.exercises[0];
-    const fresh = after.exercises[1];
-    expect(kept.name).toBe('双杠臂屈伸');
-    expect(kept.sets.filter(isSetLogged)).toHaveLength(1);   // 原记录还在
-    expect(fresh.name).toBe('哑铃卧推');
-    expect(fresh.sets).toHaveLength(2);                       // 3 - 1 = 剩余 2 组
-    expect(fresh.groups).toHaveLength(2);
-    // 原动作身份不被新动作顶替
-    expect(kept.exerciseId).not.toBe(fresh.exerciseId);
   });
 });
 

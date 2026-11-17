@@ -50,9 +50,18 @@
   · `dumbbellBasis`：`per_hand`/`total`
   · `suggestedWeightKg: 0` 是实际 0，`null`/缺省是未填。
 - 递减组 `target.kind="dropSet"`：
-  `{ rounds, stages: [{ weightKg?, repsMin?, repsMax?, toFailure }], restInSec, restAfterSec, weightMode, dumbbellBasis? }`
+  `{ rounds, stages: [{ id?, weightKg?, repsMin?, repsMax?, toFailure }], roundConfigs?, restInSec, restAfterSec, weightMode, dumbbellBasis?, form? }`
   · **阶段数 2–6**（= 编辑器能力；旧备份容忍到 12 不在此外溢）。
   · `toFailure:true` 的阶段不填次数范围；填了会拒绝。
+  · `form` 可选：`dropSet`（缺省）/ `superset`，用于保留超级组语义。
+  · `roundConfigs` 可选（R02 逐轮配置）：`[{ roundIndex, stages: [...同阶段结构], restInSec? }]`；
+    只写与默认 `stages` 不同的轮（`roundIndex` 从 1 开始、不重复、不能超过 `rounds`）。
+    缺省时所有轮沿用默认 `stages`（旧 JSON 语义）。总行数按各轮真实 stageCount 求和，不能超过 200。
+  · **阶段 `id` 可选（R02 FIX3）**：省略即由 App 按“默认轮 `stage-pos-N` / 可证明同源阶段共享身份”
+    稳定化，旧 JSON 完全兼容。显式提供时必须是**同一阶段数组内唯一**的非空文本（≤120 字符）；
+    跨轮表达“同一阶段”应使用同一个 `id`（例如默认第 2 阶段与第 2 轮第 1 阶段同为 `"stage-pos-2"`），
+    不要复制后另造新 id。导入器保留已有显式 id，不会按位置把不同 id 强行合并；
+    无法证明同源的阶段保持独立身份，训练中“未完成轮沿用上一完整轮”会让这些阶段保持空白并提示。
 
 ### 有氧 `cardio[]`（只两预设，无自定义参数设计器；无目标时长/实际计时）
 - 坡走：`{ "preset":"treadmill-incline", "name", "target": { "speedKmh", "inclinePct" }, "note"? }`

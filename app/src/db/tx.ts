@@ -24,11 +24,12 @@ import {
   type LockOpResult,
 } from './locks';
 import { pushCycle } from '../domain/cycle';
-import type { Plan, Session } from '../domain/types';
+import type { ExerciseTemplate, Plan, Session } from '../domain/types';
 import { localDateKey } from '../domain/localDate';
 import { finalizeCardioForFinish } from '../domain/cardio';
 import { hasAnyRealContent } from '../domain/sessionContent';
 import { MAX_CARDIO_ENTRIES, MAX_PLANS } from '../domain/limits';
+import { validateExerciseTemplate } from './templates';
 
 export type WriteFailureReason =
   | 'lock-lost'
@@ -49,6 +50,8 @@ export type WriteResult =
       plan?: Plan;
       /** true = 记录本来已是终态，本次没有写入 */
       alreadyTerminal?: boolean;
+      /** 与本次写入同事务提交的模板（若请求了 templateWrite） */
+      template?: ExerciseTemplate;
     }
   | {
       ok: false;
@@ -94,6 +97,16 @@ export interface WriteOptions {
   lockPolicy?: 'required' | 'optional';
   /** 锁租期 */
   ttlMs?: number;
+  /**
+   * 可选：与本次 session 修改**同一事务**写入的动作配置记忆（G1）。
+   * · expectedRevision = null → 首次创建，必须不存在；
+   * · expectedRevision = number → 必须与现有 revision 相等；
+   * · 任一冲突 / 写入失败 → 整个事务 abort，session 与模板一起回滚。
+   */
+  templateWrite?: {
+    template: ExerciseTemplate;
+    expectedRevision: number | null;
+  };
 }
 
 /**
@@ -152,7 +165,36 @@ function fail(
  * 所有判断都在 request 的 onsuccess 里同步完成，保证事务不被提前提交。
  */
 export function atomicWriteSession(opts: WriteOptions): Promise<WriteResult> {
-  const { intent, session, editorId, expectedRevision, lockPolicy = 'required', ttlMs = DEFAULT_LOCK_TTL_MS } = opts;
+  const { intent, session, editorId, expectedRevision, lockPolicy = 'required', ttlMs = DEFAULT_LOCK_TTL_MS, templateWrite } = opts;
+  /**
+   * G1-PRE-REVIEW #3：原子写入口不能绕过模板权威校验。
+   * 在开启事务前按与 putExerciseTemplate 相同的 validateExerciseTemplate 校验
+   * （schemaVersion / key 前缀 / 纯配置白名单 / target 结构 / 名称边界）；
+   * 非法直接失败，Session / revision / meta 都不变。
+   */
+  if (templateWrite) {
+    /**
+     * F2：成对原子保存同样必须校验「计算后的 nextRevision」。
+     * 已有模板 revision=MAX_SAFE_INTEGER 时 +1 不安全，必须在开启事务前拒绝，
+     * 保证 Session / revision / meta 全部保持原值（不 clamp / 截断 / 重编号）。
+     */
+    const nextRevision = templateWrite.expectedRevision === null ? 1 : templateWrite.expectedRevision + 1;
+    if (!Number.isSafeInteger(nextRevision) || nextRevision < 1) {
+      return Promise.resolve(
+        fail(
+          'version-conflict',
+          '动作配置记忆的 revision 已达安全整数上限，无法安全递增；本次训练修改与模板写入均已取消',
+        ),
+      );
+    }
+    const parsed = validateExerciseTemplate(templateWrite.template);
+    if (!parsed.ok) {
+      const first = parsed.issues[0];
+      return Promise.resolve(
+        fail('storage', `动作模板不合法，已拒绝写入：${first ? `${first.path} — ${first.message}` : '结构不合法'}`),
+      );
+    }
+  }
   const needsPlans = intent.kind === 'finish' || intent.kind === 'create-rest';
   const stores = needsPlans ? ['sessions', 'meta', 'plans'] : ['sessions', 'meta'];
   /**
@@ -186,6 +228,8 @@ export function atomicWriteSession(opts: WriteOptions): Promise<WriteResult> {
         let pendingSuccess: WriteResult | null = null;
         /** 不需要写库就能确定的成功结果（幂等终态）—— 它不依赖事务提交 */
         let immediateSuccess: WriteResult | null = null;
+        /** 与本次 session 同事务写入的模板（仅在提交后交给调用方） */
+        let pendingTemplate: ExerciseTemplate | undefined;
 
         let t: IDBTransaction;
         try {
@@ -202,6 +246,7 @@ export function atomicWriteSession(opts: WriteOptions): Promise<WriteResult> {
           // 主动失败：先清掉暂存的成功，避免 oncomplete 抢答（正常 abort 不会触发 oncomplete）
           pendingSuccess = null;
           immediateSuccess = null;
+          pendingTemplate = undefined;
           try {
             t.abort();
           } catch {
@@ -235,17 +280,27 @@ export function atomicWriteSession(opts: WriteOptions): Promise<WriteResult> {
         const curReq = sessions.get(session.id);
         /** rest 相关：需要全部 sessions 做同日去重/冲突核验（同一事务内决定） */
         const allReq = needsAllSessions ? sessions.getAll() : null;
+        /** 可选模板：在同一事务内读取当前 revision，用于 expected revision 冲突保护 */
+        const templateReq = templateWrite ? meta.get(templateWrite.template.key) : null;
 
         let lockRaw: unknown;
         let current: Session | undefined;
         let allSessions: Session[] | undefined;
-        let pending = needsAllSessions ? 3 : 2;
+        let templateRaw: unknown;
+        let pending = (needsAllSessions ? 3 : 2) + (templateWrite ? 1 : 0);
 
         if (allReq) {
           allReq.onsuccess = () => {
             allSessions = allReq.result as Session[];
             step();
           };
+        }
+        if (templateReq) {
+          templateReq.onsuccess = () => {
+            templateRaw = templateReq.result;
+            step();
+          };
+          templateReq.onerror = () => abort(fail('storage', '无法读取动作配置记忆'));
         }
 
         const step = () => {
@@ -657,9 +712,69 @@ export function atomicWriteSession(opts: WriteOptions): Promise<WriteResult> {
             abort(fail('storage', err instanceof Error ? err.message : '写入失败', current));
             return;
           }
+          /**
+           * G1：可选模板记忆与 session 修改在同一事务内提交。
+           * 模板 revision 冲突 → abort 整个事务（session 也不落库），
+           * 绝不出现"训练存了但模板冲突"或"模板写了但训练回滚"的半状态。
+           */
+          if (templateWrite) {
+            const row = templateRaw as { value?: unknown } | undefined;
+            const currentTpl =
+              row && typeof row === 'object' && typeof row.value === 'object' && row.value !== null
+                ? (row.value as Record<string, unknown>)
+                : undefined;
+            const actualRev =
+              currentTpl && typeof currentTpl.revision === 'number' ? currentTpl.revision : null;
+            if (templateWrite.expectedRevision === null) {
+              if (actualRev !== null) {
+                abort(
+                  fail(
+                    'version-conflict',
+                    '这条动作配置已经有记忆了（可能另一个页面刚保存过），本页没有覆盖它；训练修改也已取消，请刷新后重试',
+                    current,
+                  ),
+                );
+                return;
+              }
+            } else if (actualRev !== templateWrite.expectedRevision) {
+              abort(
+                fail(
+                  'version-conflict',
+                  '动作配置记忆已被更新（可能在另一个页面改过），本页没有覆盖新数据；训练修改也已取消，请刷新后重试',
+                  current,
+                ),
+              );
+              return;
+            }
+            const nextTemplate: ExerciseTemplate = {
+              ...templateWrite.template,
+              schemaVersion: 1,
+              revision: templateWrite.expectedRevision === null ? 1 : templateWrite.expectedRevision + 1,
+              updatedAt: Date.now(),
+            };
+            try {
+              meta.put({ key: nextTemplate.key, value: nextTemplate });
+            } catch (err) {
+              abort(fail('storage', err instanceof Error ? err.message : '模板写入失败', current));
+              return;
+            }
+            pendingTemplate = nextTemplate;
+          }
           // 活动保存会顺手续租，避免长间隔后自己掉锁（与记录写同事务）
           if (intent.kind === 'active-save' && editorId) {
-            meta.put({ key: lockKey(session.id), sessionId: session.id, editorId, at: Date.now() });
+            /**
+             * G3A2-FIX2：续租写与同函数其他写入一样必须走 storage 失败门禁。
+             * 事务已结束/被 abort 时 put 会抛 TransactionInactiveError，
+             * 旧实现不 catch → 未捕获异常（真实 abort 注入用例的 pageerror）。
+             * 这里只把失败转成既有 fail('storage') → abort，不吞成功、
+             * 不改 CAS/锁资格/事务原子性。
+             */
+            try {
+              meta.put({ key: lockKey(session.id), sessionId: session.id, editorId, at: Date.now() });
+            } catch (err) {
+              abort(fail('storage', err instanceof Error ? err.message : '续租写入失败', current));
+              return;
+            }
           }
           finishWrite({ ok: true, revision: next.revision ?? 0, session: next });
         };
@@ -670,12 +785,22 @@ export function atomicWriteSession(opts: WriteOptions): Promise<WriteResult> {
         const finishWrite = (result: WriteResult) => {
           // 锁清理与终态同事务（finish/discard 都释放锁，一起提交或一起回滚）
           if (intent.kind === 'finish' || intent.kind === 'discard') {
-            meta.put({ key: lockKey(session.id), sessionId: session.id, editorId: '', at: 0 });
+            try {
+              meta.put({ key: lockKey(session.id), sessionId: session.id, editorId: '', at: 0 });
+            } catch (err) {
+              // 同上：锁清理写失败也必须走 storage 门禁，不能抛成未捕获异常
+              abort(fail('storage', err instanceof Error ? err.message : '释放锁写入失败', current));
+              return;
+            }
           }
           // G6：所有成功出口的 session 也补内存缺省（读时归一，不写库）
           pendingSuccess =
             'session' in result && result.session
-              ? { ...result, session: withDefaults(result.session)! }
+              ? {
+                  ...result,
+                  session: withDefaults(result.session)!,
+                  ...(pendingTemplate ? { template: pendingTemplate } : {}),
+                }
               : result;
         };
 
@@ -707,6 +832,28 @@ export function atomicSaveSession(args: {
     editorId: guard.editorId,
     expectedRevision: typeof guard.expectedVersion === 'number' ? guard.expectedVersion : undefined,
     ttlMs: guard.ttlMs,
+  });
+}
+
+/**
+ * G1：活动保存 + 可选模板记忆，同一锁/事务/revision 约束。
+ * 模板 expectedRevision 冲突会 abort 整个事务（session 修改也回滚）。
+ */
+export function atomicSaveSessionWithTemplate(args: {
+  session: Session;
+  guard: { sessionId?: string; editorId: string; ttlMs?: number; expectedVersion?: number | null };
+  template: ExerciseTemplate;
+  /** null = 首次创建必须不存在；number = 必须等于现有 revision */
+  templateExpectedRevision: number | null;
+}): Promise<WriteResult> {
+  const { session, guard, template, templateExpectedRevision } = args;
+  return atomicWriteSession({
+    intent: { kind: 'active-save' },
+    session,
+    editorId: guard.editorId,
+    expectedRevision: typeof guard.expectedVersion === 'number' ? guard.expectedVersion : undefined,
+    ttlMs: guard.ttlMs,
+    templateWrite: { template, expectedRevision: templateExpectedRevision },
   });
 }
 

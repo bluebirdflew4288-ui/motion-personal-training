@@ -26,6 +26,7 @@ import { createSession } from '../src/domain/session';
 import { createV32Plan } from '../src/domain/presets/v32';
 import * as merge from '../src/domain/draftMerge';
 import * as rescue from '../src/lib/draftRescue';
+import * as sessionWrite from '../src/lib/sessionWrite';
 import type { Session } from '../src/domain/types';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -86,6 +87,7 @@ describe('REVIEW-1 #5 · persist 存储异常必须保留意图', () => {
       viewBeforeRef: { current: null },
       unsavedDraft: { current: null },
       rescuedSeqRef: { current: null },
+      ownPriorCommitRef: { current: null },
       saveQueue: { current: Promise.resolve() },
       lockBlockedRef: { current: false },
       editorId: { current: 'ed-1' },
@@ -104,6 +106,9 @@ describe('REVIEW-1 #5 · persist 存储异常必须保留意图', () => {
         return () => ++n;
       })(),
       accumulateDraftIntent: merge.accumulateDraftIntent,
+      decideQueuedSessionWrite: sessionWrite.decideQueuedSessionWrite,
+      pendingDraftFromIntent: sessionWrite.pendingDraftFromIntent,
+      getSession: async () => undefined,
       pushToast: (m: string) => messages.push(m),
       setSaveState() {},
       setLockBlocked() {},

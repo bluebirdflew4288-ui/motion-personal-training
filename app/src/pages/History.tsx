@@ -737,7 +737,7 @@ export function HistoryDetailPage({ id }: { id: string }) {
                         {ex.target.kind === 'dropSet' ? `R${st.roundIndex}S${st.stageIndex}` : `#${st.roundIndex}`}
                         {' · '}
                         {st.reps} 次
-                        {st.weightKg !== null && st.weightKg > 0 ? ` × ${fmtWeight(st.weightKg)} kg` : ''}
+                        {typeof st.weightKg === 'number' && Number.isFinite(st.weightKg) ? ` × ${fmtWeight(st.weightKg)} kg` : ''}
                       </span>
                     ))}
                   </div>

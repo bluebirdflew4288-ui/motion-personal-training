@@ -33,6 +33,10 @@ const SOURCES = [
   // B4-R3：已确认落盘的视图（commit 失败不回滚内存 → 读回真值而不是失败候选）
   join(PLUGIN_DIR, 'RestDurableView.java'),
   join(PLUGIN_DIR, 'RestDurableFlag.java'),
+  // F11：删除成功音/准备触感的纯策略判定（铃声/勿扰/前台/音量/加载态，不依赖 Android API）
+  join(PLUGIN_DIR, 'DeleteFeedbackPolicy.java'),
+  // G04：WebView 非输入区选词菜单/长按/原生拖拽门禁纯策略判定
+  join(PLUGIN_DIR, 'WebViewSelectionPolicy.java'),
 ];
 // 类全名（ExportSpoolTest 放在与插件相同的包里，才能访问包级测试钩子）
 const TESTS = ['BackupIoTest', 'app.motion.personal.plugins.ExportSpoolTest', 'app.motion.personal.plugins.ExportPhaseTest', 'app.motion.personal.plugins.ExportOriginalBindingTest', 'app.motion.personal.plugins.RestArgsTest', 'app.motion.personal.plugins.RestStateTest', 'app.motion.personal.plugins.RestGateTest', 'app.motion.personal.plugins.RestCallArgsTest',
@@ -61,7 +65,13 @@ const TESTS = ['BackupIoTest', 'app.motion.personal.plugins.ExportSpoolTest', 'a
   // B4-R3 closure2：−15 经精确取消保留水位 + D1 目标墙钟/单调截止换算
   'app.motion.personal.plugins.RestR3Closure2Test',
   // B4-R3 legacy-lineage：旧原生数据无 lastIntentToken 键时的归属兼容与单点正规化
-  'app.motion.personal.plugins.RestLegacyLineageTest'];
+  'app.motion.personal.plugins.RestLegacyLineageTest',
+  // F11：删除成功音策略矩阵（正常/静音/振动/勿扰各档/未知/异常/后台/未加载）
+  'app.motion.personal.plugins.DeleteFeedbackPolicyTest',
+  // N01：持续通知正文「点击打开/带回应用」的源码契约 + requestCode 纯策略
+  'app.motion.personal.plugins.RestNotificationNavTest',
+  // G04：WebView 非输入区选词/长按/拖拽门禁纯策略矩阵
+  'app.motion.personal.plugins.WebViewSelectionPolicyTest'];
 
 for (const s of SOURCES) {
   if (!existsSync(s)) {
@@ -87,7 +97,7 @@ let failed = 0;
 for (const t of TESTS) {
   console.log(`\n▶ 运行 ${t}`);
   try {
-    execFileSync('java', ['-cp', OUT, t], { stdio: 'inherit' });
+    execFileSync('java', ['-Dmotion.plugin.dir=' + PLUGIN_DIR, '-cp', OUT, t], { stdio: 'inherit' });
   } catch {
     failed++;
   }

@@ -1,10 +1,12 @@
 /* 训练执行页 —— 本轮最重要的页面。
    优先保证：输入、查看、点击效率。
    · 每个动作显示目标、上次表现、逐组记录、完成/休息操作
-   · 支持临时替换/添加/排序/跳过程，全部只影响本次
+   · 统一编辑器承接名称/动作/形式/组次/间歇配置；添加与左滑编辑共用同一编辑器
+   · 左滑删除、长按拖动排序；空白项删除后可短时撤销
+   · 保留跳过剩余组等既有能力；所有修改只影响本次训练
    · 所有修改立即自动保存；保存失败会明确提示 */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useStore } from '../store';
 import { navigate } from '../lib/router';
 import { fmtDate, fmtDuration, fmtRest, fmtTime } from '../lib/format';
@@ -15,49 +17,44 @@ import { Confirm } from '../ui/Confirm';
 import {
   hasSkippedGroupsToUnskip,
   restAfterSet,
-  addConfiguredLooseExercise,
+  addSetBlocker,
   addSetTo,
+  applyTargetToSessionExercise,
   describeTarget,
   dropRoundComplete,
   dropRoundSets,
+  requiredStages,
   hasAnyData,
   hasReps,
   exerciseCompletion,
+  inheritPreviousCompleteRound,
+  inheritPreviousCompleteRoundForExercise,
   isSetIncomplete,
   isSetLogged,
-  moveExercise,
+  needsWeight,
   removeSetFrom,
   removeLastRound,
   skipRemaining,
   unskipExercise,
-  groupHasNoRecords,
   skippedGroupCount,
-  convertExerciseToDropSet,
-  convertExerciseToStraight,
   lastRoundHasRecords,
-  replaceExerciseInSession,
-  replaceConfigSeedFor,
-  exerciseRemovalProtection,
-  removeExerciseFromSession,
-  checkLooseExerciseConfig,
-  type LooseExerciseConfig,
   roundsOf,
   addCardioToSession,
   summarizeSession,
   withExercise,
   withSet,
 } from '../domain/session';
-import type { DumbbellBasis, Session, SessionExercise, SessionSet, WeightMode } from '../domain/types';
+import type { DumbbellBasis, ExerciseTarget, ExerciseTemplate, Session, SessionExercise, SessionSet, WeightMode } from '../domain/types';
 
 /** 递减组阶段的重量提示 */
-const DROP_WEIGHT_NOTE = '哑铃 · 按单只记录';
+const dropWeightNote = (basis: 'per_hand' | 'total' | undefined): string | undefined =>
+  basis === 'per_hand' ? '哑铃 · 按单只记录' : basis === 'total' ? '哑铃 · 按合计记录' : undefined;
 
 /** 首版仅两个有氧预设（默认初始参数，用户可当场调整） */
 const CARDIO_PRESETS = [
   { preset: 'treadmill-incline' as const, label: '有氧爬坡', params: { speedKmh: 4, inclinePct: 4 } },
   { preset: 'stair-climber' as const, label: '爬楼机', params: { level: 5 } },
 ];
-import { EXERCISE_LIBRARY, searchExercises } from '../domain/presets/library';
 import { createCardioEntry, validateCardioParams } from '../domain/cardio';
 import { revisionOf } from '../db/tx';
 import {
@@ -67,6 +64,9 @@ import {
   type PersistOutcome,
 } from '../domain/draftMerge';
 import { getSession } from '../db/repo';
+import { commitPairedSession, type PairedOutcome } from '../lib/pairedCommit';
+import { applyDeleteItem, previewDeleteItem, undoDeleteItem, type DeleteItemKind, type DeleteItemPreview, type DeleteUndoRecord } from '../domain/sessionItemIntent';
+import { captureOrdinaryChange, decideQueuedSessionWrite, pendingDraftFromIntent } from '../lib/sessionWrite';
 import {
   collectMovementFragments,
   comparabilityOf,
@@ -74,43 +74,41 @@ import {
   describeMovementPerformance,
   modeOf,
 } from '../domain/comparability';
-import { DropSetEditor } from '../ui/DropSetEditor';
-import { DraftNumberField } from '../ui/DraftNumberField';
+import { ExerciseEditor, type ExerciseEditorInitial, type ExerciseEditorSubmitValue } from '../ui/ExerciseEditor';
+import { ExerciseNamePicker, type ExerciseNameSelection } from '../ui/ExerciseNamePicker';
+import { SwipeActionCard } from '../ui/SwipeActionCard';
+import { UndoStack, type UndoStackItem } from '../ui/UndoStack';
+import { DeleteDissolveLayer } from '../ui/DeleteDissolveLayer';
+import {
+  applyReflowAnimation,
+  buildDissolveParticles,
+  captureCardTops,
+  captureDeleteRect,
+  dissolveAttribution,
+  dissolveTiming,
+  prefersReducedMotion,
+  type DissolveGhost,
+  type DissolveKind,
+  type DissolvePending,
+  type ZoneRect,
+} from '../ui/deleteDissolve';
+import { useCardDragSnapshot, type CardDragSnapshot, type ReorderKind } from '../ui/cardDrag';
+import {
+  bindDeleteFeedback,
+  captureDeleteFeedbackIntent,
+  invalidateDeleteFeedback,
+  notifyDeleteSucceeded,
+  setDeleteFeedbackEnabled,
+} from '../lib/deletionFeedback';
+import { reorderSessionItems } from '../domain/reorder';
+import {
+  assessExerciseIdentityChange,
+  planTargetApply,
+  resolveGroupConfig,
+} from '../domain/exerciseConfig';
+import { sessionExerciseFromTemplate, exerciseTemplateFromConfig } from '../domain/exerciseConfig';
 import { CardioPanel } from '../ui/CardioPanel';
-import {
-  canCloseReplaceSheet,
-  canConfirmReplace,
-  decideReplaceRetry,
-  isStaleCommit,
-  replacePhaseAfterOutcome,
-} from '../lib/replaceCommit';
-import {
-  ADD_EXERCISE_DEFAULTS,
-  canCloseCommitSheet,
-  canConfirmCommit,
-  commitPhaseAfterOutcome,
-  decideCommitRetry,
-  isStaleCommit as isStaleExerciseCommit,
-  newCommitId,
-  type CommitOutcome,
-} from '../lib/exerciseCommit';
-import { mergeFlushedDropDraft, mergeFlushedValues, useDraftForm } from '../ui/draftForm';
-import {
-  MAX_CARDIO_ENTRIES,
-  MAX_EXERCISES,
-  MAX_REPS,
-  MAX_REST,
-  MAX_ROUNDS,
-  MAX_STRAIGHT_SETS,
-} from '../domain/limits';
-import {
-  defaultDropDraft,
-  draftToDropTarget,
-  straightToDropDraft,
-  dropTargetToDraft,
-  validateDropDraft,
-  type DropSetDraft,
-} from '../domain/dropSet';
+import { MAX_CARDIO_ENTRIES } from '../domain/limits';
 import {
   acquireSessionLockDetailed,
   listenLockEvents,
@@ -133,6 +131,17 @@ import {
   type RescueRecord,
 } from '../lib/draftRescue';
 
+/**
+ * F08：一条可撤销的空白删除。
+ * `until` 是该条**自己**的截止时间（从它的保存成功时刻起算 8 秒），
+ * `name` 是与真正撤销对象一致的条目名（不能显示 A 却撤销 B）。
+ */
+interface DeleteUndoEntry {
+  undo: DeleteUndoRecord;
+  until: number;
+  name: string;
+}
+
 /** 草稿身份生成器（V6-01）：单调递增，进程内唯一 */
 let draftTokenSeq = 0;
 const nextDraftToken = () => {
@@ -149,6 +158,7 @@ function SetRow({
   timer,
   restSec,
   label,
+  source,
   onAutoRest,
   weightUnitNote,
   recordingPaused,
@@ -164,13 +174,14 @@ function SetRow({
   timer: ReturnType<typeof useRestTimer>;
   restSec: number;
   label: string;
+  source: { sessionExerciseId: string; setId?: string };
   onAutoRest: () => void;
   weightUnitNote?: string;
   /** V6-01：有待存草稿时暂停记录，输入必须真的不可用 */
   recordingPaused?: boolean;
   /**
    * 问题三：把「本行有未提交 raw」上报给动作级（键为 fieldId）。
-   * 用于「从本次训练移除」的保护判定，避免把刚动过的字段当空白删除。
+   * 用于删除预览/提交时的 raw 风险判定，避免把刚动过的字段当空白直接删除。
    */
   onRawRisk?: (fieldId: string, risky: boolean) => void;
   rawDraftFor?: (fieldId: string) => string | undefined;
@@ -226,7 +237,7 @@ function SetRow({
             </button>
           )}
           {done || partial ? (
-            <button className="btn btn-sm btn-ghost" onClick={() => timer.start(restSec)} aria-label="开始组间休息计时">
+            <button className="btn btn-sm btn-ghost" onClick={() => timer.start(restSec, source)} aria-label="开始组间休息计时">
               计时
             </button>
           ) : null}
@@ -302,6 +313,8 @@ function ExerciseCard({
   latestRef,
   timer,
   onOpenTools,
+  onEditExercise,
+  onDeleteExercise,
   onRequestRemoveRound,
   pushToast,
   recordingPaused,
@@ -311,6 +324,10 @@ function ExerciseCard({
   rawResetToken,
   hasRawRisk,
   onDiscardRawDraft,
+  reorderIds,
+  drag,
+  onReorderCommit,
+  deleteRequiresConfirm,
 }: {
   ex: SessionExercise;
   index: number;
@@ -322,6 +339,8 @@ function ExerciseCard({
   latestRef: React.RefObject<Session | undefined>;
   timer: ReturnType<typeof useRestTimer>;
   onOpenTools: () => void;
+  onEditExercise: () => void;
+  onDeleteExercise: () => void;
   onRequestRemoveRound: (exId: string) => void;
   pushToast: (text: string, kind?: 'info' | 'error' | 'ok') => void;
   /** V6-01：有待存草稿时暂停记录（覆盖输入、组操作、备注） */
@@ -337,10 +356,24 @@ function ExerciseCard({
   rawResetToken?: number;
   hasRawRisk?: boolean;
   onDiscardRawDraft?: () => void;
+  /** G3B：同分区当前顺序与拖动快照（由页面统一持有） */
+  reorderIds?: string[];
+  drag?: CardDragSnapshot | null;
+  onReorderCommit?: (orderedIds: string[], startIds: string[] | null) => void;
+  /** F09：就绪提示文案判定（空白直删 vs 有风险先确认） */
+  deleteRequiresConfirm?: boolean | (() => boolean);
 }) {
   const [noteOpen, setNoteOpen] = useState(false);
   const isDrop = ex.target.kind === 'dropSet';
-  const showWeight = ex.target.kind === 'straight' ? ex.target.weightMode !== 'bodyweight' : true;
+  /**
+   * R02 FIX3：多阶段动作达到 20 轮 / 200 行上限时，UI 必须直接禁用加轮，
+   * 并明确显示被阻止的原因；不能先写入 21 轮/204 行再由导出或校验兜底失败。
+   * 普通组保持既有行为（addSetBlocker 对普通组恒为 null）。
+   */
+  const addSetBlock = isDrop ? addSetBlocker(ex) : null;
+  const dropTarget = ex.target.kind === 'dropSet' ? ex.target : null;
+  const straightTarget = ex.target.kind === 'straight' ? ex.target : null;
+  const showWeight = needsWeight(ex);
   const completion = exerciseCompletion(ex);
   const done = completion === 'done';
   const partial = completion === 'partial';
@@ -352,10 +385,27 @@ function ExerciseCard({
     apply((prev) => withSet(prev, ex.id, setId, patch));
 
   return (
+    <SwipeActionCard
+      testId={`exercise-card-${ex.id}`}
+      onEdit={onEditExercise}
+      onDelete={onDeleteExercise}
+      deleteRequiresConfirm={deleteRequiresConfirm}
+      disabled={recordingPaused}
+      // F06/F12：该动作的记录展开时同时禁用左滑与长按拖动排序；
+      // 只锁手势入口，输入、完成/休息、计时与正常纵向滚动保持可用。
+      locked={expanded}
+      reorderId={ex.id}
+      reorderKind="strength"
+      reorderIndex={index}
+      reorderIds={reorderIds}
+      drag={drag}
+      onReorderCommit={onReorderCommit}
+    >
     <section
       className="slip"
       style={{
-        marginTop: 14,
+        // F02：卡间留白由 SwipeActionCard 容器的 CARD_GAP 内边距承担，
+        // 卡片自身不再自带外边距，操作区才能与卡片可见边界严格对齐。
         opacity: skipped ? 0.62 : 1,
         borderColor: done ? 'var(--brick)' : 'var(--rule)',
       }}
@@ -397,8 +447,8 @@ function ExerciseCard({
               {describeTarget({ id: ex.id, name: ex.name, restSec: ex.restSec, target: ex.target })}
               <span style={{ color: 'var(--ink-4)' }}> · 休息 {fmtRest(ex.restSec)}</span>
             </div>
-            {/* 递减组阶段明细：单独成块，允许换行（不挤进右列） */}
-            {ex.target.kind === 'dropSet' ? (
+            {/* 目标明细：使用 G1 resolver，逐组/逐阶段显示实际配置（不读旧 targetText） */}
+            {dropTarget ? (
               <div
                 style={{
                   marginTop: 4,
@@ -410,15 +460,60 @@ function ExerciseCard({
                   gap: 1,
                 }}
               >
-                {ex.target.stages.map((st, i) => (
-                  <span key={`${st.label}-${i}`} style={{ overflowWrap: 'anywhere' }}>
-                    {st.label}：{st.targetText}
-                  </span>
-                ))}
+                {dropTarget.roundConfigs?.length ? (
+                  roundsOf(ex).map((round) => {
+                    const need = requiredStages(ex, round);
+                    const parts = Array.from({ length: need }, (_, i) => {
+                      const r = resolveGroupConfig(dropTarget, round, i + 1);
+                      const reps = r.repsMin === null && r.repsMax === null ? '参考次数未设' : `${r.repsMin}–${r.repsMax} 次`;
+                      return `${r.label ?? `阶段${i + 1}`} ${r.weightKg !== null ? `${r.weightKg}kg · ` : ''}${r.toFailure ? '力竭' : reps}`;
+                    });
+                    return (
+                      <span key={`round-${round}`} style={{ overflowWrap: 'anywhere' }}>
+                        第 {round} 轮（{need} 阶段）：{parts.join(' / ')}
+                      </span>
+                    );
+                  })
+                ) : (
+                  dropTarget.stages.map((st, i) => {
+                    const r = resolveGroupConfig(dropTarget, 1, i + 1);
+                    const reps = r.repsMin === null && r.repsMax === null ? '参考次数未设' : `${r.repsMin}–${r.repsMax} 次`;
+                    return (
+                      <span key={`${st.label}-${i}`} style={{ overflowWrap: 'anywhere' }}>
+                        {st.label}：{r.weightKg !== null ? `${r.weightKg} kg · ` : ''}{r.toFailure ? '力竭' : reps}
+                      </span>
+                    );
+                  })
+                )}
                 <span style={{ color: 'var(--ink-4)' }}>
-                  阶段间休 {fmtRest(ex.target.restInSec)} · 轮间休 {fmtRest(ex.target.restAfterSec)} ·{' '}
-                  {ex.target.rounds} 轮 = {ex.target.rounds} 个正式大组
+                  阶段间歇{' '}
+                  {(() => {
+                    const shortRests = dropTarget.roundConfigs?.length
+                      ? Array.from({ length: requiredStages(ex, 1) }, (_, i) => resolveGroupConfig(dropTarget, 1, i + 1))
+                          .slice(0, -1)
+                          .map((r) => fmtRest(r.restAfterSec ?? dropTarget.restInSec))
+                      : dropTarget.stages
+                          .slice(0, -1)
+                          .map((_, i) => fmtRest(resolveGroupConfig(dropTarget, 1, i + 1).restAfterSec ?? dropTarget.restInSec));
+                    return shortRests.length ? shortRests.join(' / ') : '无';
+                  })()}{' '}
+                  · 整轮休息 {fmtRest(dropTarget.restAfterSec)} · {dropTarget.rounds} 轮 = {dropTarget.rounds} 个正式大组
                 </span>
+              </div>
+            ) : straightTarget?.perSetConfigs?.length ? (
+              <div style={{ marginTop: 4, fontSize: 12.5, color: 'var(--ink-3)', lineHeight: 1.7, display: 'flex', flexDirection: 'column', gap: 1 }}>
+                {straightTarget.perSetConfigs
+                  .slice()
+                  .sort((a, b) => a.setIndex - b.setIndex)
+                  .map((c) => {
+                    const r = resolveGroupConfig(straightTarget, c.setIndex, 1);
+                    const reps = r.repsMin === null && r.repsMax === null ? '参考次数未设' : `${r.repsMin}–${r.repsMax} 次`;
+                    return (
+                      <span key={c.setIndex} style={{ overflowWrap: 'anywhere' }}>
+                        第 {c.setIndex} 组：{r.weightKg !== null ? `${r.weightKg} kg · ` : ''}{r.toFailure ? '力竭' : reps}
+                      </span>
+                    );
+                  })}
               </div>
             ) : null}
 
@@ -546,18 +641,19 @@ function ExerciseCard({
                       <SetRow
                         key={`${set.id}:${rawResetToken ?? 0}`}
                         set={set}
-                        showWeight
-                        label={`阶段 ${set.stageIndex}`}
+                        showWeight={showWeight}
+                        label={resolveGroupConfig(dropTarget!, set.roundIndex, set.stageIndex).label ?? `阶段 ${set.stageIndex}`}
                         restSec={restAfterSet(ex, set)}
                         timer={timer}
+                        source={{ sessionExerciseId: ex.id, setId: set.id }}
                         canRemove={false}
                         onAutoRest={() => {
                           // V3-06：自动计时与手动「计时」共用同一份快照配置
-                          timer.start(restAfterSet(ex, set));
+                          timer.start(restAfterSet(ex, set), { sessionExerciseId: ex.id, setId: set.id });
                         }}
                         onPatch={(p) => patchSet(set.id, p)}
                         onRemove={() => apply((prev) => removeSetFrom(prev, ex.id, set.id))}
-                        weightUnitNote={DROP_WEIGHT_NOTE}
+                        weightUnitNote={dropWeightNote(ex.target.dumbbellBasis)}
                         recordingPaused={recordingPaused}
                         onRawRisk={onRawRisk ? (fid, r) => onRawRisk(ex.id, fid, r) : undefined}
                         rawDraftFor={rawDraftFor ? (fid) => rawDraftFor(ex.id, fid) : undefined}
@@ -571,7 +667,9 @@ function ExerciseCard({
                 <button
                   className="btn btn-sm btn-ghost"
                   style={{ minHeight: 40 }}
-                  disabled={recordingPaused}
+                  disabled={recordingPaused || Boolean(addSetBlock)}
+                  title={addSetBlock?.message}
+                  aria-describedby={addSetBlock ? `add-set-block-${ex.id}` : undefined}
                   onClick={() => apply((prev) => addSetTo(prev, ex.id))}
                 >
                   + 加一轮
@@ -617,7 +715,66 @@ function ExerciseCard({
                 >
                   本轮全部标记完成
                 </button>
+                <button
+                  className="btn btn-sm btn-ghost"
+                  // R01：多阶段（超级组/递减组）专用「未完成轮沿用上一完整轮」。
+                  // 只补空白字段、保留已填内容；有未提交输入或记录暂停时禁用，
+                  // 避免把未提交草稿/中文 IME 的临时输入冲掉。
+                  disabled={recordingPaused || Boolean(hasRawRisk)}
+                  onClick={() => {
+                    if (recordingPaused) return;
+                    if (hasRawRisk) {
+                      pushToast('有未提交输入，请先确认或放弃后再沿用上一轮。', 'error');
+                      return;
+                    }
+                    // 用最新状态先算一次，既产出提示，也保证与随后的 apply 一致
+                    const cur = latestRef.current?.exercises.find((e) => e.id === ex.id);
+                    if (!cur) return;
+                    const preview = inheritPreviousCompleteRoundForExercise(cur);
+                    // 需要让用户知道哪些轮被跳过（不能只报成功）
+                    const skipNotes: string[] = [];
+                    if (preview.mismatchRounds.length) {
+                      // R02 FIX3：无法证明阶段同源/结构不一致时，不猜、不硬配；
+                      // 明确提示该轮保持空白，由用户手动填写。
+                      skipNotes.push(`第 ${preview.mismatchRounds.join('、')} 轮阶段身份或结构无法可靠对应（保持空白）`);
+                    }
+                    if (preview.noSourceRounds.length) {
+                      skipNotes.push(`第 ${preview.noSourceRounds.join('、')} 轮无完整来源`);
+                    }
+                    if (preview.unmatchedStages > 0) {
+                      skipNotes.push(`有 ${preview.unmatchedStages} 个目标阶段无可靠来源，保持空白`);
+                    }
+                    const skipText = skipNotes.length ? `${skipNotes.join('；')}。` : '';
+                    if (preview.filledFields === 0) {
+                      if (skipText) {
+                        pushToast(`${skipText}请手动填写。`, 'error');
+                      } else {
+                        pushToast('未完成的轮里没有空白字段需要沿用（已填内容已保留）。', 'info');
+                      }
+                      return;
+                    }
+                    apply((prev) => inheritPreviousCompleteRound(prev, ex.id).session);
+                    pushToast(
+                      `已按阶段沿用上一完整轮：补 ${preview.filledFields} 个空白字段，保留已填内容。` +
+                        (skipText ? ` 另有：${skipText}` : ''),
+                      skipNotes.length ? 'info' : 'ok',
+                    );
+                  }}
+                  style={{ minHeight: 40 }}
+                >
+                  未完成轮沿用上一完整轮
+                </button>
               </div>
+              {addSetBlock ? (
+                <div
+                  id={`add-set-block-${ex.id}`}
+                  role="status"
+                  data-testid="add-round-blocked"
+                  style={{ marginTop: 6, color: 'var(--brick)', fontSize: 12.5, lineHeight: 1.6 }}
+                >
+                  不能再加一轮：{addSetBlock.message}
+                </div>
+              ) : null}
             </div>
           ) : (
             <div style={{ marginTop: 8 }}>
@@ -629,13 +786,11 @@ function ExerciseCard({
                   label={`第 ${set.roundIndex} 组`}
                   restSec={restAfterSet(ex, set)}
                   timer={timer}
+                  source={{ sessionExerciseId: ex.id, setId: set.id }}
                   canRemove={ex.sets.length > 1}
-                  onAutoRest={() => timer.start(restAfterSet(ex, set))}
+                  onAutoRest={() => timer.start(restAfterSet(ex, set), { sessionExerciseId: ex.id, setId: set.id })}
                   onPatch={(p) => patchSet(set.id, p)}
                   onRemove={() => apply((prev) => removeSetFrom(prev, ex.id, set.id))}
-                  weightUnitNote={
-                    ex.target.kind === 'straight' && ex.target.weightMode === 'bodyweight' ? '自重动作 · 无需重量' : undefined
-                  }
                   recordingPaused={recordingPaused}
                   onRawRisk={onRawRisk ? (fid, r) => onRawRisk(ex.id, fid, r) : undefined}
                   rawDraftFor={rawDraftFor ? (fid) => rawDraftFor(ex.id, fid) : undefined}
@@ -719,6 +874,7 @@ function ExerciseCard({
         </div>
       ) : null}
     </section>
+    </SwipeActionCard>
   );
 }
 
@@ -727,8 +883,12 @@ export function SessionPage({ sessionId }: { sessionId: string }) {
     sessions,
     plans,
     activeSession,
+    settings,
     syncSessionLocal,
     saveActiveSession,
+    saveActiveSessionWithTemplate,
+    exerciseTemplates,
+    exerciseTemplateError,
     finishTrainingSession,
     discardTrainingSession,
     pushToast,
@@ -746,71 +906,7 @@ export function SessionPage({ sessionId }: { sessionId: string }) {
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const defaultExpandedApplied = useRef(false);
   const [confirmRemoveRoundOpen, setConfirmRemoveRoundOpen] = useState(false);
-  /** C01 路径 B：训练中调整训练形式 */
-  const [convertFor, setConvertFor] = useState<string | null>(null);
-  const [convertForm, setConvertForm] = useState<'straight' | 'dropSet'>('dropSet');
-  const [convertDraft, setConvertDraft] = useState<DropSetDraft>(defaultDropDraft());
-  /**
-   * V3-04：训练中「转普通组」的组数必须接真实草稿。
-   * 旧实现 onCommit 为空回调，应用时又从旧 target 读组数 → 用户改的组数完全没用（审查 I02）。
-   */
-  const [convertStraightSets, setConvertStraightSets] = useState(3);
-  const convertFormApi = useDraftForm();
-  const [convertError, setConvertError] = useState<string | null>(null);
   const pendingRemoveRound = useRef<string | null>(null);
-  /** 动作选择弹层的明确意图（审计 R2-03：原来进入选择前清空 toolsFor 导致替换变追加） */
-  const [picker, setPicker] = useState<
-    { mode: 'add' } | { mode: 'replace'; sessionExerciseId: string } | null
-  >(null);
-  const [addQuery, setAddQuery] = useState('');
-  /**
-   * 问题二：临时添加动作的「配置步骤」状态。
-   *
-   * 选定库动作或输入自定义名后**不直接添加**，先在这里设定本次
-   * 组数 / 每组目标次数 / 组间休息，确认后才写进 session。
-   * 取消、返回都不产生任何动作，也不产生空动作。
-   *
-   * `commitId` + `sessionId` 是这次添加意图的稳定归属凭据（见 lib/exerciseCommit）。
-   */
-  const [addConfig, setAddConfig] = useState<
-    | {
-        commitId: string;
-        sessionId: string;
-        /** 第一次确认时冻结的完整配置；重试只保存它，不再读 UI 草稿 */
-        intent: LooseExerciseConfig;
-        /** 编辑中的草稿（确认后不再改动） */
-        draft: LooseExerciseConfig;
-        phase: 'editing' | 'submitting' | 'failed';
-        submitted: boolean;
-      }
-    | null
-  >(null);
-  const addConfigFormApi = useDraftForm();
-  const [addConfigError, setAddConfigError] = useState<string | null>(null);
-  /** 领域层产生的拒绝原因 / 成功文案（fn 必须纯，提示统一在 await 结果后发出） */
-  const addRejectRef = useRef<string | null>(null);
-  const addSuccessRef = useRef<string | null>(null);
-
-  /**
-   * 问题三：「从本次训练移除」的确认状态。
-   *
-   * 按 **sessionExerciseId** 定位（不按名称），确认时用最新 session 重新核对。
-   */
-  const [removeEx, setRemoveEx] = useState<
-    | {
-        commitId: string;
-        sessionId: string;
-        exerciseId: string;
-        /** 打开确认时的名称快照（动作消失后仍可显示） */
-        name: string;
-        phase: 'editing' | 'submitting' | 'failed';
-        submitted: boolean;
-      }
-    | null
-  >(null);
-  const [removeError, setRemoveError] = useState<string | null>(null);
-  const removeRejectRef = useRef<string | null>(null);
-  const removeSuccessRef = useRef<string | null>(null);
   /**
    * 未提交 raw 风险登记（问题三）。
    *
@@ -852,6 +948,20 @@ export function SessionPage({ sessionId }: { sessionId: string }) {
     (exId: string, fieldId: string) => rawDraftRef.current.get(exId)?.get(fieldId),
     [],
   );
+
+  /** G3A2：精确 raw 风险签名（field/risk + 输入内容），用于删除 preview/commit 复核。 */
+  const cardioRawSignatureGettersRef = useRef<Map<string, () => string | undefined>>(new Map());
+  const rawSignatureFor = useCallback((exId: string): string | undefined => {
+    const cardioGetter = cardioRawSignatureGettersRef.current.get(exId);
+    if (cardioGetter) {
+      const live = cardioGetter();
+      if (live) return live;
+    }
+    const fields = [...(rawRiskRef.current.get(exId) ?? [])].sort();
+    const raws = [...(rawDraftRef.current.get(exId)?.entries() ?? [])].sort(([a], [b]) => a.localeCompare(b));
+    if (!fields.length && !raws.length) return undefined;
+    return JSON.stringify({ fields, raws });
+  }, []);
   const discardRawDrafts = useCallback((exId: string) => {
     rawDraftRef.current.delete(exId);
     rawRiskRef.current.delete(exId);
@@ -870,7 +980,6 @@ export function SessionPage({ sessionId }: { sessionId: string }) {
    * 只有本次提交的 settle 路径才清除它（按 commitId 匹配，避免旧回调误清新的）。
    */
   const addInFlightRef = useRef<string | null>(null);
-  const removeInFlightRef = useRef<string | null>(null);
   /**
    * 清理已经不存在于最新 session 的登记。
    *
@@ -912,51 +1021,278 @@ export function SessionPage({ sessionId }: { sessionId: string }) {
     }
     if (changed) setRawRiskVersion((v) => v + 1);
   }, [session]);
-  /**
-   * 需求 1：选定替代动作后的「确认组数与休息」步骤。
-   *
-   * 只在这里存草稿，用户点「确认替换」才写进 session（取消不改变本次训练）。
-   * 初始值继承可承接的原动作配置：组数=可承接的未开始组/轮数，休息=原动作休息秒。
-   */
-  /**
-   * 替换确认步骤的状态。
-   *
-   * `commitId` 是**一次替换意图的稳定标识**（预审 P1 #1）：
-   * 它和待存草稿绑定，重试时复用它而不是按旧 targetId 重放领域操作 ——
-   * 否则「另一路已保存同次替换」后旧 ID 可能已不存在（空窗），
-   * 或对已被跳过标记的组再次承接（重复替换）。
-   */
-  const [replaceConfig, setReplaceConfig] = useState<
+  /* ── G2B：共用编辑器 / 名称选择 / 记忆分流 ───────────────── */
+  const [editorState, setEditorState] = useState<
     | {
-        commitId: string;
-        sessionExerciseId: string;
-        name: string;
-        /** 原动作名快照（origin 消失后仍可显示，避免空弹层） */
-        originName: string;
-        sets: number;
-        restSec: number;
-        /**
-         * B4：**每组目标次数**草稿（只作用于新动作 target，不碰 actual）。
-         * 普通组用 repsMin/repsMax；递减组用逐阶段数组。
-         */
-        reps:
-          | { kind: 'straight'; repsMin: number; repsMax: number }
-          | {
-              kind: 'dropSet';
-              stages: Array<{ repsMin: number | null; repsMax: number | null; toFailure: boolean }>;
-            };
-        /** 提交阶段：editing=可改可确认；submitting=已提交等结果；failed=可重试 */
-        phase: 'editing' | 'submitting' | 'failed';
-        /** 本次提交是否已经真正写入过（决定重试是"重放"还是"仅重试保存"） */
-        submitted: boolean;
+        key: string;
+        mode: 'add' | 'edit';
+        /** edit 模式的目标动作；add 为 null */
+        exId: string | null;
+        initial: ExerciseEditorInitial;
       }
     | null
   >(null);
-  const replaceFormApi = useDraftForm();
-  const [replaceError, setReplaceError] = useState<string | null>(null);
-  /** 替换 fn 内产生的拒绝原因 / 成功文案：fn 必须纯，提示统一在 await 结果后发出 */
-  const replaceRejectRef = useRef<string | null>(null);
-  const replaceSuccessRef = useRef<string | null>(null);
+  /** 实时编辑器归属：异步确认回调只允许关闭发起它的那个编辑器实例/新一轮 */
+  const editorStateRef = useRef(editorState);
+  editorStateRef.current = editorState;
+  const [editorConfirm, setEditorConfirm] = useState<
+    | {
+        payload: ExerciseEditorSubmitValue;
+        exId: string;
+        title: string;
+        body: string;
+      }
+    | null
+  >(null);
+  const [addNameOpen, setAddNameOpen] = useState(false);
+  const editorDirtyRef = useRef(false);
+  /** 一次添加意图的固定实例（重试复用同一 sessionExerciseId，绝不追加两次） */
+  const addCommitRef = useRef<{ sessionId: string; exercise: SessionExercise } | null>(null);
+  const [addFailed, setAddFailed] = useState<{ entry: { sessionId: string; exercise: SessionExercise }; payload?: ExerciseEditorSubmitValue } | null>(null);
+  const [addRetryBusy, setAddRetryBusy] = useState(false);
+  const discardedAddIds = useRef<Set<string>>(new Set());
+
+  /** G3A2：按稳定 ID 的删除预览/确认；F08：空白删除的多条独立撤销。 */
+  const [deletePreview, setDeletePreview] = useState<DeleteItemPreview | null>(null);
+
+  /* ── F10：删除成功后的局部消散 + 平滑补位（纯表现层）───────────────
+     纪律：
+     · 只有删除事务真的 saved/oncomplete 才 play；失败/冲突/取消/abort 什么都不做；
+     · 几何在**命令发出前**惰性记录（Store 保存出口会先刷新 Session，await 之后
+       原卡 DOM 可能已不存在，因此这里绝不能事后去读卡）；
+     · 一次意图一次效果：按 token 去重，旧回调只能清自己那一条；
+     · 撤销成功立即清掉目标效果，且不触碰恢复后的真实卡；
+     · 卸载 / 切 session / 页面隐藏 / 失锁 / 效果自身结束都清空节点与补位样式。 */
+  const [dissolveGhosts, setDissolveGhosts] = useState<DissolveGhost[]>([]);
+  /** 已经播放过的删除意图（防止重复回调/重试再放一次） */
+  const dissolvePlayedRef = useRef<Set<string>>(new Set());
+  /** 每条效果**自己**的收尾定时器，按 token 归属 */
+  const dissolveTimersRef = useRef<Map<string, number>>(new Map());
+  /**
+   * 效果世代：卸载或切 session 时递增。
+   * 慢事务的 `await` 可能在离页之后才落地 —— 那时 epoch 已经变了，
+   * 迟到的成功回调不得向新页面注入消散或补位。
+   */
+  const dissolveEpochRef = useRef(0);
+  /** 结束时收回补位动画（不含任何业务状态） */
+  const reflowCleanupRef = useRef<(() => void) | null>(null);
+  /**
+   * 待生效的补位批次。
+   *
+   * F10-FIX1：不仅记录几何，还带**归属**（session / item / token / 版本 / 捕获世代）。
+   * 合法慢事务（真实 IDB 提交 2s+）与排队都必须能等到，因此这里**没有**短超时；
+   * 批次只在四种情况下释放：失败、被这一次提交消费（含"无可动画位移"）、
+   * 生命周期（卸载/切 session/隐藏/失锁）、以及下一次意图覆盖。
+   */
+  const pendingReflowRef = useRef<(DissolvePending & { tops: Map<string, number> }) | null>(null);
+
+  const cancelReflow = useCallback(() => {
+    const cleanup = reflowCleanupRef.current;
+    reflowCleanupRef.current = null;
+    cleanup?.();
+  }, []);
+
+  /** 释放待生效批次（失败/取消/撤销/卸载/隐藏/失锁/被消费时调用） */
+  const disarmReflowPending = useCallback(() => {
+    pendingReflowRef.current = null;
+  }, []);
+
+  /**
+   * 命令发出时（事务开始前）登记待生效的补位批次。
+   *
+   * 为什么必须在这里记录：Store 的保存出口在事务成功后立刻 `syncSessionLocal`，
+   * `await` 回来时原卡 DOM 可能已经不在 —— 那时再读几何就晚了。
+   * 这里只读几何 + 记录归属，不参与任何业务判定；
+   * **不设短超时**：慢事务/排队都要能等到（F10-FIX1）。
+   */
+  const armReflow = useCallback(
+    (pending: DissolvePending) => {
+      disarmReflowPending();
+      pendingReflowRef.current = { ...pending, tops: captureCardTops() };
+    },
+    [disarmReflowPending],
+  );
+
+  const clearDissolveTimer = useCallback((token: string) => {
+    const timer = dissolveTimersRef.current.get(token);
+    if (timer !== undefined) {
+      window.clearTimeout(timer);
+      dissolveTimersRef.current.delete(token);
+    }
+  }, []);
+
+  /** 展示层的同步真源：判定（旧回调/撤销）只读 ref，渲染走 state */
+  const dissolveGhostsRef = useRef<DissolveGhost[]>([]);
+  const setDissolveGhostsBoth = useCallback((next: DissolveGhost[]) => {
+    dissolveGhostsRef.current = next;
+    setDissolveGhosts(next);
+  }, []);
+
+  /**
+   * 结束指定归属的效果（正常收尾 / 撤销 / 越页都走这里）。
+   *
+   * 归属只认 token；`itemId` 只是撤销时的补充入口（同一条目若因为重试换过 token，
+   * 也要一起清掉）。本函数只改展示层数组与自己的定时器，
+   * **绝不**去动列表里的真实卡 —— 撤销恢复后的卡不会被任何旧回调删除。
+   */
+  const endDissolveFor = useCallback(
+    (keys: { token?: string; itemId?: string }) => {
+      const tokens = new Set<string>();
+      if (keys.token) tokens.add(keys.token);
+      if (keys.itemId) {
+        for (const g of dissolveGhostsRef.current) {
+          if (g.itemId === keys.itemId) tokens.add(g.token);
+        }
+      }
+      if (!tokens.size) {
+        cancelReflow();
+        return;
+      }
+      for (const token of tokens) clearDissolveTimer(token);
+      const next = dissolveGhostsRef.current.filter((g) => !tokens.has(g.token));
+      if (next.length !== dissolveGhostsRef.current.length) setDissolveGhostsBoth(next);
+      cancelReflow();
+    },
+    [cancelReflow, clearDissolveTimer, setDissolveGhostsBoth],
+  );
+
+  /** 清空全部效果（卸载 / 切 session / 隐藏 / 失锁） */
+  const resetDissolve = useCallback(() => {
+    for (const token of Array.from(dissolveTimersRef.current.keys())) clearDissolveTimer(token);
+    dissolveTimersRef.current.clear();
+    disarmReflowPending();
+    cancelReflow();
+    if (dissolveGhostsRef.current.length) setDissolveGhostsBoth([]);
+  }, [cancelReflow, clearDissolveTimer, disarmReflowPending, setDissolveGhostsBoth]);
+
+  /**
+   * 让**已开始的反馈捕获**失效（隐藏 / 失锁）。
+   *
+   * 只清展示层是不够的：慢事务的 saved 晚到，若 epoch 没变，
+   * 迟到的成功回调仍会注入消散/补位（正是 root-review-01 case-8 的失败）。
+   * 递增 epoch 后，那个旧意图的 saved 无论如何都进不来；
+   * 恢复可见/重新取得锁也**不会**复活它（新意图要重新捕获）。
+   */
+  const invalidateFeedback = useCallback(() => {
+    dissolveEpochRef.current += 1;
+    resetDissolve();
+    /**
+     * F11：音频反馈也必须一起作废。
+     * 隐藏/失锁后再回到页面**不会**复活旧意图 —— 成功音是一次性事件，
+     * 迟到的 saved 不允许在用户看不到的时候才响。
+     */
+    invalidateDeleteFeedback('hidden-or-lock-lost');
+  }, [resetDissolve]);
+
+  /** 前置条件统一在这里判定：减少动态、隐藏页、越页都不播放 */
+  const canPlayDissolve = useCallback(
+    (epoch: number): boolean => {
+      if (epoch !== dissolveEpochRef.current) return false;
+      if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return false;
+      if (prefersReducedMotion()) return false;
+      return true;
+    },
+    [],
+  );
+
+  /**
+   * 删除命令发出时的**惰性几何快照**（纯读）。
+   *
+   * 只记录本次意图所属卡的盒子（供消散幽灵定位）与全部分区卡的当前页面坐标
+   * （供补位使用）。两者都只是"如果成功该从哪里开始"的参考，不参与任何业务判定；
+   * 任何一次失败都不影响删除本身，只是这次没有效果可播。
+   */
+  const prepareDissolveGeometry = useCallback(
+    (preview: DeleteItemPreview, revisionAtIntent: number): ZoneRect | null => {
+      try {
+        const rect = captureDeleteRect(preview.itemId, preview.kind);
+        const kind: DissolveKind = preview.kind === 'cardio' ? 'cardio' : 'exercise';
+        armReflow({
+          epoch: dissolveEpochRef.current,
+          token: preview.token,
+          sessionId: preview.sessionId,
+          itemId: preview.itemId,
+          kind,
+          revision: revisionAtIntent,
+        });
+        return rect;
+      } catch {
+        // 表现层快照失败：删除照常进行，本次不播放效果
+        disarmReflowPending();
+        return null;
+      }
+    },
+    [armReflow, disarmReflowPending],
+  );
+
+  /**
+   * 播放一次删除消散。
+   *
+   * 调用点只有一个：`commitDelete` 里 `status === 'saved'` 的分支。
+   * 因此 request-success / buildNext / 点击删除都不可能让效果提前出现。
+   */
+  const playDissolve = useCallback(
+    (args: { token: string; itemId: string; kind: DeleteItemKind; name: string; rect: ZoneRect | null; epoch: number }) => {
+      if (!args.rect) return;
+      if (dissolvePlayedRef.current.has(args.token)) return;
+      if (!canPlayDissolve(args.epoch)) return;
+      const timing = dissolveTiming(false);
+      if (!timing.ghostMs) return;
+      dissolvePlayedRef.current.add(args.token);
+      const ghost: DissolveGhost = {
+        token: args.token,
+        itemId: args.itemId,
+        kind: args.kind === 'cardio' ? 'cardio' : 'exercise',
+        name: args.name,
+        rect: args.rect,
+        startedAt: Date.now(),
+        durationMs: timing.ghostMs,
+        particles: buildDissolveParticles(args.token),
+      };
+      // 同一 token 只保留一条（重复回调/重试不得叠加成两次效果）
+      if (!dissolveGhostsRef.current.some((g) => g.token === args.token)) {
+        setDissolveGhostsBoth([...dissolveGhostsRef.current, ghost]);
+      }
+      clearDissolveTimer(args.token);
+      // 收尾只清**自己这一条**：晚到的定时器不会碰到同区其它删除，也不碰真实卡
+      const timer = window.setTimeout(() => {
+        dissolveTimersRef.current.delete(args.token);
+        const next = dissolveGhostsRef.current.filter((g) => g.token !== args.token);
+        if (next.length !== dissolveGhostsRef.current.length) setDissolveGhostsBoth(next);
+      }, timing.ghostMs + 40);
+      dissolveTimersRef.current.set(args.token, timer);
+    },
+    [canPlayDissolve, clearDissolveTimer, setDissolveGhostsBoth],
+  );
+  /**
+   * F08：固定底部撤销堆叠的同步真源。
+   * 每条自带 expiresAt（从**各自保存成功**起算 8 秒），旧条目不会因为新删除被顶掉或重置。
+   * ref 用于判定，state 只用于渲染（与旧单条实现同一纪律）。
+   */
+  const [deleteUndoStack, setDeleteUndoStack] = useState<DeleteUndoEntry[]>([]);
+  const deleteUndoStackRef = useRef<DeleteUndoEntry[]>([]);
+  /** 当前批内真正**撤销成功**的条数（失败/过期不计；清空后本批结束并归零） */
+  const [deleteUndoneCount, setDeleteUndoneCount] = useState(0);
+  /**
+   * 本批删除的参照顺序（按分区）。撤销可以按任意顺序进行，
+   * 但"原相对顺序"必须按批开始时的分区顺序恢复，不能按逐次删除时的邻居推断。
+   */
+  const deleteBatchOrderRef = useRef<Partial<Record<DeleteItemKind, string[]>>>({});
+  const [deleteBusy, setDeleteBusy] = useState(false);
+  const deleteInFlightRef = useRef<string | null>(null);
+  const deleteConsumedRef = useRef<Set<string>>(new Set());
+  /** 同步写 ref 与 state：撤销判定只读 ref，避免迟到的 state 复活已消费条目 */
+  const setDeleteUndoStackBoth = useCallback((next: DeleteUndoEntry[]) => {
+    deleteUndoStackRef.current = next;
+    setDeleteUndoStack(next);
+  }, []);
+  /** 展示层只需要 token/名称/截止时间；顺序即数组顺序（最新在最下面） */
+  const deleteUndoStackItems = useMemo<UndoStackItem[]>(
+    () => deleteUndoStack.map((it) => ({ token: it.undo.token, name: it.name, until: it.until })),
+    [deleteUndoStack],
+  );
+  const editorSeq = useRef(0);
+
   const [lockBlocked, setLockBlocked] = useState(false);
   const [advanceCycleTouched, setAdvanceCycleTouched] = useState(false);
   const [advanceCycle, setAdvanceCycle] = useState(true);
@@ -1029,7 +1365,12 @@ export function SessionPage({ sessionId }: { sessionId: string }) {
   const [finishing, setFinishing] = useState(false);
   const saveQueue = useRef<Promise<void>>(Promise.resolve());
   // 需求 2 + BRIEF 第2项：计时绑定本次训练，页面重建后按快照恢复
-  const timer = useRestTimer(120, sessionId);
+  const timer = useRestTimer(120, sessionId, (src) =>
+    Boolean(latestRef.current?.exercises.some((ex) => ex.id === src.sessionExerciseId && (!src.setId || ex.sets.some((st) => st.id === src.setId)))),
+  );
+  /** 删除 await 完成后必须读实时 timer owner/token，不能相信旧闭包 */
+  const timerLiveRef = useRef(timer);
+  timerLiveRef.current = timer;
 
   /**
    * 单活动训练编辑锁 + 页面生命周期（V3-01 / V4-02a）。
@@ -1239,6 +1580,12 @@ export function SessionPage({ sessionId }: { sessionId: string }) {
         return false;
       }
 
+      // ③.5 G2B：编辑器草稿未保存 → 由编辑器自己的保存/放弃流程处理，页面守卫不放行
+      if (editorDirtyRef.current) {
+        pushToast('动作编辑器还有未保存内容，请先在编辑器内保存或放弃。', 'error');
+        return false;
+      }
+
       // ④ 干净状态：清掉可能残留的救援位并放行
       clearRescueDraft(sessionId);
       return true;
@@ -1406,7 +1753,8 @@ export function SessionPage({ sessionId }: { sessionId: string }) {
   /** 本次编辑前的当前视图（用于判断"这次改了哪些字段"，V6-01 路径 B） */
   const viewBeforeRef = useRef<Session | null>(null);
 
-  const rememberDraft = useCallback((next: Session) => {
+  const rememberDraft = useCallback(
+    (next: Session, baseOverride?: { baseRevision: number; baseSession: Session }) => {
     const existing = unsavedDraft.current;
     if (existing) {
       /**
@@ -1448,12 +1796,15 @@ export function SessionPage({ sessionId }: { sessionId: string }) {
       if (seq !== null) ownPublishedSeq.current = Math.max(ownPublishedSeq.current, seq);
       return;
     }
-    unsavedDraft.current = {
-      token: nextDraftToken(),
-      session: next,
-      baseRevision: confirmedRevision.current,
-      baseSession: baseSessionRef.current ?? next,
-    };
+    /**
+     * G2B-FIX1-R2：普通输入失败救援必须携带**原始意图基线**。
+     * 调用方在 applyChange 构建 next 之前冻结 prev/confirmedRevision；
+     * 若这里退回读取 confirmedRevision.current / baseSessionRef.current，
+     * paired 已提交的新 base 会把旧 next 里“没有新动作”误判成用户删除。
+     */
+    const baseRevision = baseOverride?.baseRevision ?? confirmedRevision.current;
+    const baseSession = baseOverride?.baseSession ?? baseSessionRef.current ?? next;
+    unsavedDraft.current = pendingDraftFromIntent(next, baseSession, baseRevision, nextDraftToken());
     // 这是用户自己新产生的草稿（不是救援来的）：之后到达的救援版本不得覆盖它
     pendingFromRescue.current = false;
     setHasPendingDraft(true);
@@ -1461,7 +1812,9 @@ export function SessionPage({ sessionId }: { sessionId: string }) {
     const seqAgain = publishRescueDraft(sessionId, unsavedDraft.current);
     rescuedSeqRef.current = seqAgain;
     if (seqAgain !== null) ownPublishedSeq.current = Math.max(ownPublishedSeq.current, seqAgain);
-  }, [sessionId]);
+    },
+    [sessionId],
+  );
 
   /**
    * 保存一次改动（V3-01 / V5-01）。
@@ -1480,6 +1833,13 @@ export function SessionPage({ sessionId }: { sessionId: string }) {
         writable?: boolean;
         expectedRevision?: number;
         draftToken?: number;
+        /** G2B：与本次保存同事务的模板记忆（可选） */
+        templateWrite?: { template: import('../domain/types').ExerciseTemplate; expectedRevision: number | null };
+        /** G2B 成对意图失败由 Editor 重试，不进入通用救援（否则重试会丢模板） */
+        skipRescue?: boolean;
+        /** 本次提交在构建 next 之前的真实意图基线（不可变随队列携带） */
+        baseSession?: Session;
+        baseRevisionAtCall?: number;
         /** 本次提交对应的救援版本快照（A06 F1：调用时绑定，随队列不可变携带） */
         reservedSeq?: number | null;
         /**
@@ -1538,9 +1898,20 @@ export function SessionPage({ sessionId }: { sessionId: string }) {
        * 重试/合并路径必须由调用方传入 pending.session，绝不能用合并后的 next。
        */
       const intentSnapshot: Session = ctx?.intentSnapshot ?? next;
+      /** G2B-FIX1：队列执行时若 confirmedRevision 已前进，用当前库重新合并，绝不旧快照套新 revision */
+      const baseRevisionAtCall = ctx?.baseRevisionAtCall ?? confirmedRevision.current;
+      const baseSessionAtCall = ctx?.baseSession ?? next;
+      /**
+       * G2B-FIX1-R2：普通输入失败救援必须冻结**原始意图的 base/revision**。
+       * 只有调用方显式提供了 baseSession 才启用；未提供时保持既有行为。
+       */
+      const rescueBase =
+        ctx?.baseSession !== undefined && ctx.baseRevisionAtCall !== undefined
+          ? { baseRevision: ctx.baseRevisionAtCall, baseSession: ctx.baseSession }
+          : undefined;
 
       if (!writable) {
-        rememberDraft(next);
+        if (!ctx?.skipRescue) rememberDraft(next, rescueBase);
         setSaveState('error');
         pushToast(
           '本页当前只读，这次改动还没有保存。取得编辑控制后可以重试保存；你的输入仍保留在本页。',
@@ -1560,12 +1931,49 @@ export function SessionPage({ sessionId }: { sessionId: string }) {
       });
       saveQueue.current = saveQueue.current
         .then(async () => {
-          // 队列执行时才确定期望版本（见上方说明）
-          const expected = explicitExpected ?? confirmedRevision.current;
-          const r = await saveActiveSession(
-            { ...next, revision: expected },
-            { editorId: editorId.current, expectedRevision: expected },
-          );
+          /**
+           * G2B-FIX1-R2：队列执行时才确定期望版本（见上方说明）。
+           * 判定逻辑抽到生产模块 sessionWrite.decideQueuedSessionWrite，
+           * 测试直接执行同一函数，避免测试里另写一套“正确 rebase”。
+           */
+          const decision = await decideQueuedSessionWrite({
+            sessionId,
+            next,
+            explicitExpectedRevision: explicitExpected,
+            baseSessionAtCall,
+            baseRevisionAtCall,
+            queueExecutionRevision: confirmedRevision.current,
+            hasTemplateWrite: Boolean(ctx?.templateWrite),
+            getSession,
+            ownPriorCommit: ownPriorCommitRef.current ?? null,
+          });
+          if (decision.kind === 'conflict') {
+            // 普通输入仍有既有救援保障；paired 意图（skipRescue）不得变成仅 Session 救援
+            if (!ctx?.skipRescue) rememberDraft(next, rescueBase);
+            setSaveState('error');
+            setConflictMessage(decision.message);
+            pushToast(decision.message, 'error');
+            settle({ status: 'failed', reason: 'version-conflict', message: decision.message });
+            return;
+          }
+          if (decision.kind === 'storage') {
+            if (!ctx?.skipRescue) rememberDraft(next, rescueBase);
+            setSaveState('error');
+            pushToast(`未保存：${decision.message}`, 'error');
+            settle({ status: 'failed', reason: 'storage', message: decision.message });
+            return;
+          }
+          let expected = decision.expectedRevision;
+          let nextToSave = decision.session;
+          const saveArgs = { editorId: editorId.current, expectedRevision: expected };
+          const r = ctx?.templateWrite
+            ? await saveActiveSessionWithTemplate(
+                { ...nextToSave, revision: expected },
+                saveArgs,
+                ctx.templateWrite.template,
+                ctx.templateWrite.expectedRevision,
+              )
+            : await saveActiveSession({ ...nextToSave, revision: expected }, saveArgs);
           if (!r.ok) {
             /**
              * A06 F2：**旧版提交失败不得覆盖已经接住的更新意图**。
@@ -1599,7 +2007,7 @@ export function SessionPage({ sessionId }: { sessionId: string }) {
               setHasPendingDraft(true);
             } else {
               // 失败的就是当前这份意图：正常登记草稿，不静默丢失输入
-              rememberDraft(next);
+              if (!ctx?.skipRescue) rememberDraft(next, rescueBase);
             }
             if (r.reason === 'lock-lost' || r.reason === 'no-lock' || r.reason === 'corrupt-lock') {
               setLockBlocked(true);
@@ -1627,10 +2035,12 @@ export function SessionPage({ sessionId }: { sessionId: string }) {
            * A06 F1：成功时**记住本页这一版已经落库**（供同一意图后续增量避免自撞冲突）。
            * 这属于普通保存路径，逐键输入也会记录，不改变任何 CAS 语义。
            */
-          if (includedDraft) {
+          if (includedDraft || (token === null && !ctx?.templateWrite && !ctx?.skipRescue)) {
             /**
              * D1 = intentSnapshot：**原始意图**，既不是合并后的 next，
              * 也不是落库结果 r.session（后者可能含别处写入的字段）。
+             * 普通逐键输入也登记本页已提交前缀，避免下一笔快速输入把
+             * 本页自己刚写入的 1 当成外部改动的“两边冲突”。
              */
             ownPriorCommitRef.current = { revision: r.revision, intent: intentSnapshot };
           }
@@ -1741,7 +2151,7 @@ export function SessionPage({ sessionId }: { sessionId: string }) {
            * 现在把 next 登记为待存草稿（与普通失败路径一致），
            * 让"重试"真的走 applyPendingDraft → 写库。
            */
-          rememberDraft(next);
+          if (!ctx?.skipRescue) rememberDraft(next, rescueBase);
           pushToast(err instanceof Error ? `未保存：${err.message}` : '未保存：本地写入失败', 'error');
           settle({ status: 'failed', reason: 'storage', message: '本地写入失败' });
         });
@@ -1843,20 +2253,594 @@ export function SessionPage({ sessionId }: { sessionId: string }) {
       }
       const prev = latestRef.current;
       if (!prev) return 'not-executed';
-      const next = fn(prev);
-      if (next === prev) return 'not-executed';
+      /**
+       * G2B-FIX1-R2：必须在构造 next **之前**捕获真实 intent base 与 revision，
+       * 并作为不可变 ctx 随本次提交入队。否则 persist 里 baseSessionAtCall
+       * 会回退成 next（base===mine），paired 先行提交后普通输入会被当“没有改动”而吞掉。
+       */
+      const capturedRevision = confirmedRevision.current;
+      const staged = captureOrdinaryChange(prev, capturedRevision, fn);
+      if (!staged) return 'not-executed';
       // V6-01 路径 B：记录"本次编辑前的视图"，供草稿累积判断哪些字段属于本次意图
       viewBeforeRef.current = prev;
-      latestRef.current = next;
-      return persist(next);
+      latestRef.current = staged.next;
+      return persist(staged.next, {
+        baseSession: staged.baseSession,
+        baseRevisionAtCall: staged.baseRevisionAtCall,
+      });
     },
     [persist, inputPaused, pausedNotice],
   );
 
   /**
+   * G2B-FIX1：成对提交队列。每次从最新 DB Session 重放 buildNext，
+   * 失败不进入通用救援；成功更新 confirmedRevision/latestRef。
+   */
+  const commitPaired = useCallback(
+    (
+      buildNext: (fresh: Session) => Session,
+      templateWrite?: { template: ExerciseTemplate; expectedRevision: number | null },
+    ): Promise<PairedOutcome> => {
+      let settle: (o: PairedOutcome) => void = () => undefined;
+      const outcome = new Promise<PairedOutcome>((res) => { settle = res; });
+      saveQueue.current = saveQueue.current
+        .then(async () => {
+          const out = await commitPairedSession({
+            sessionId,
+            editorId: editorId.current,
+            buildNext,
+            templateWrite,
+            deps: {
+              getSession,
+              save: async (session, guard, tw) =>
+                tw
+                  ? saveActiveSessionWithTemplate(
+                      session,
+                      { editorId: guard.editorId, expectedRevision: guard.expectedRevision },
+                      tw.template,
+                      tw.expectedRevision,
+                    )
+                  : saveActiveSession(session, { editorId: guard.editorId, expectedRevision: guard.expectedRevision }),
+            },
+          });
+          if (out.status === 'saved') {
+            confirmedRevision.current = out.revision;
+            baseSessionRef.current = out.session;
+            latestRef.current = out.session;
+            setSaveState('idle');
+          } else if (out.status === 'failed') {
+            setSaveState('error');
+            if (out.reason === 'lock-lost' || out.reason === 'no-lock' || out.reason === 'corrupt-lock') {
+              setLockBlocked(true);
+              setLockLostReason(out.message);
+            }
+            if (out.reason === 'state-conflict' || out.reason === 'version-conflict') {
+              setConflictMessage(out.message);
+            }
+            pushToast(out.message, 'error');
+          }
+          settle(out);
+        })
+        .catch((err: unknown) => {
+          setSaveState('error');
+          const message = err instanceof Error ? err.message : '本地写入失败';
+          pushToast(`未保存：${message}`, 'error');
+          settle({ status: 'failed', reason: 'storage', message });
+        });
+      return outcome;
+    },
+    [saveActiveSession, saveActiveSessionWithTemplate, pushToast, sessionId],
+  );
+
+  /**
+   * G3A2：按稳定 preview 走既有 commitPaired 队列，删除成功后只处理本意图。
+   * blank 删除返回 undo；有数据确认删除不返回 undo。
+   */
+  const commitDelete = useCallback(async (preview: DeleteItemPreview, confirmed: boolean): Promise<boolean> => {
+    if (deleteInFlightRef.current) return false;
+    deleteInFlightRef.current = preview.token;
+    setDeleteBusy(true);
+    let builtUndo: DeleteUndoRecord | null = null;
+    const ownerTokenAtStart = timerLiveRef.current.token;
+    /**
+     * F10：命令发出前**惰性**记录几何（当前仍在的卡）。
+     * 这里只读 DOM 盒子，不写数据、不推迟真实保存；播放与否只由下面 saved 分支决定。
+     */
+    const dissolveEpochAtStart = dissolveEpochRef.current;
+    /**
+     * F11-FIX1：命令发出前捕获**音频归属凭证**（世代 + 绑定 session）。
+     *
+     * 控制器只在 notify 被调用时才会看到当时的世代；慢事务期间只要发生
+     * 隐藏/失锁/离页/换 session/开关变化，世代就变了。把"开始"这一刻固定下来，
+     * 迟到的 saved 才不会被当成恢复页面之后的一次新成功。
+     * 纯读、不碰音频，失败也不影响删除本身。
+     */
+    const feedbackTicketAtStart = captureDeleteFeedbackIntent();
+    // 版本在命令发出时冻结：补位归属用它判断"这是不是一个真实提交"
+    const dissolveRect = prepareDissolveGeometry(preview, confirmedRevision.current);
+    try {
+      const r = await commitPaired((fresh) => {
+        // 固定原 preview；rawSignature 必须在队列真正执行时读取，不能读队列外的旧值。
+        const rawSignature = rawSignatureFor(preview.itemId);
+        const applied = applyDeleteItem(fresh, preview, { confirmed, hasRawDraft: hasRawRisk(preview.itemId), rawSignature });
+        if (!applied.ok) throw new Error(applied.message);
+        builtUndo = applied.undo;
+        return applied.session;
+      });
+      if (r.status === 'saved') {
+        // 删除成功后同步本页 store 快照，避免后续快速输入基于删除前旧 session 入队并误判冲突
+        syncSessionLocal(r.session);
+        // 只有删除 owner 且 token 未被 await 期间的新计时替换才精确 stop
+        const liveTimer = timerLiveRef.current;
+        if (liveTimer.source?.sessionExerciseId === preview.itemId && liveTimer.token === ownerTokenAtStart) liveTimer.stop();
+        const built = builtUndo as DeleteUndoRecord | null;
+        if (built) {
+          /**
+           * G3A2-FIX2：undo 的 8 秒**只在真实提交成功后起算**。
+           * domain 在 build 时算出的 expiresAt 可能早于 oncomplete（慢事务），
+           * 会导致提示刚出现就“已过期”。这里以成功回调时刻统一两个时钟。
+           *
+           * F08：追加到撤销堆叠**末尾**（最新在最下面）。已存在的条目
+           * 既不提前结束、也不重置剩余时间（新删除不顶旧机会）。
+           */
+          const committedAt = Date.now();
+          const undo: DeleteUndoRecord = { ...built, expiresAt: committedAt + 8000 };
+          const wasEmpty = deleteUndoStackRef.current.length === 0;
+          if (wasEmpty) {
+            // 新的一批：清空上一批的计数与参照顺序
+            deleteBatchOrderRef.current = {};
+            setDeleteUndoneCount(0);
+          }
+          // 本批该分区的参照顺序取**第一次**删除前的顺序（含本批后来被删掉的项）
+          if (!deleteBatchOrderRef.current[built.kind]) {
+            deleteBatchOrderRef.current[built.kind] = [...(built.orderBefore ?? [])];
+          }
+          setDeleteUndoStackBoth([
+            ...deleteUndoStackRef.current,
+            { undo, until: undo.expiresAt, name: preview.name },
+          ]);
+        } else pushToast('已删除');
+        /**
+         * F10：唯一播放点，放在撤销/计时等真实善后**之后**。
+         *
+         * 到这一行意味着事务已经 oncomplete/saved：request success、buildNext、
+         * 点击删除都不会走到这里。表现层任何异常都在这里被吞掉 ——
+         * 反馈失败绝不能影响已经成功的删除、8 秒撤销与计时收尾。
+         */
+        try {
+          playDissolve({
+            token: preview.token,
+            itemId: preview.itemId,
+            kind: preview.kind,
+            name: preview.name,
+            rect: dissolveRect,
+            epoch: dissolveEpochAtStart,
+          });
+        } catch {
+          /* 表现层失败不阻断裂已成功的业务结果 */
+        }
+        /**
+         * F11：删除成功短音的**唯一出口**。
+         *
+         * 与消散同处 `saved` 分支之后，因此空白直删、有内容确认删、点击删除、
+         * F09 松手删除都走这里，而失败/取消/冲突/重复回调/撤销根本到不了这一行。
+         * 单独 try/catch：音频任何异常都不能影响已成功的删除、8 秒撤销与计时收尾。
+         * 所属 session 由模块内部与页面绑定关系核对，别的 session 的迟到回调不会响。
+         * F11-FIX1：带上命令发出前捕获的凭证 —— 提交期间隐藏/失锁/离页/换 session/
+         * 开关变化过的旧 saved，不会在恢复后的页面上补响一声。
+         */
+        try {
+          notifyDeleteSucceeded(
+            {
+              sessionId: preview.sessionId,
+              itemId: preview.itemId,
+              token: preview.token,
+            },
+            feedbackTicketAtStart,
+          );
+        } catch {
+          /* 反馈失败不影响业务结果 */
+        }
+        return true;
+      }
+      // F10：没有真正保存成功 —— 撤销待生效的补位批次，绝不做假消散/假补位
+      disarmReflowPending();
+      pushToast(r.status === 'failed' ? r.message : '删除没有保存成功，请重试', 'error');
+      return false;
+    } catch (err) {
+      disarmReflowPending();
+      throw err;
+    } finally {
+      deleteInFlightRef.current = null;
+      setDeleteBusy(false);
+    }
+  }, [commitPaired, rawSignatureFor, hasRawRisk, timer, pushToast, syncSessionLocal, playDissolve, prepareDissolveGeometry, armReflow, disarmReflowPending]);
+
+  /**
+   * G3B：卡片拖动排序（力量 / 有氧各自分区）。
+   * 松手后只在**最新 Session** 上按稳定 ID 改顺序，一次落库；失败保留原顺序。
+   */
+  const dragSnapshot = useCardDragSnapshot();
+  const strengthIds = useMemo(() => session?.exercises.map((e) => e.id) ?? [], [session]);
+  const cardioIds = useMemo(() => (session?.cardio ?? []).map((c) => c.id), [session]);
+
+  const commitReorder = useCallback(
+    async (kind: ReorderKind, orderedIds: string[], startIds: string[] | null) => {
+      const r = await commitPaired((fresh) => {
+        /**
+         * 意图校验：拖动开始时的分区顺序必须仍是**当前库里的顺序**。
+         * 拖动期间若有其他合法改动改变了成员或顺序，绝不拿旧排列覆盖，
+         * 明确失败让用户重试（不换 revision 强写）。
+         */
+        const currentIds = kind === 'strength'
+          ? fresh.exercises.map((e) => e.id)
+          : (fresh.cardio ?? []).map((c) => c.id);
+        if (startIds && JSON.stringify(currentIds) !== JSON.stringify(startIds)) {
+          throw new Error('拖动期间顺序已被其他改动更新，请重新拖动');
+        }
+        const applied = reorderSessionItems(fresh, kind, orderedIds);
+        if (!applied.ok) throw new Error(applied.message);
+        return applied.changed ? applied.session : fresh;
+      });
+      if (r.status === 'saved') {
+        syncSessionLocal(r.session);
+        pushToast('顺序已保存');
+      } else {
+        pushToast(r.status === 'failed' ? r.message : '顺序没有保存成功，已保留原顺序', 'error');
+      }
+    },
+    [commitPaired, pushToast, syncSessionLocal],
+  );
+
+  const requestDeleteItem = useCallback((itemId: string) => {
+    if (inputPaused) { pausedNotice(); return; }
+    const latest = latestRef.current;
+    if (!latest) return;
+    const rawSignature = rawSignatureFor(itemId);
+    const p = previewDeleteItem(latest, itemId, { hasRawDraft: hasRawRisk(itemId), rawSignature });
+    if (!p.ok) { pushToast(p.message, 'error'); return; }
+    if (p.preview.requiresConfirm) setDeletePreview(p.preview);
+    else void commitDelete(p.preview, false);
+  }, [commitDelete, hasRawRisk, inputPaused, pausedNotice, pushToast, rawSignatureFor]);
+
+  /** F09：就绪状态文案判定（实时读取最新 Session，判断是否需要二次确认） */
+  const checkDeleteRequiresConfirm = useCallback((itemId: string): boolean => {
+    const current = latestRef.current ?? session;
+    if (!current) return false;
+    const p = previewDeleteItem(current, itemId, {
+      hasRawDraft: hasRawRisk(itemId),
+      rawSignature: rawSignatureFor(itemId),
+    });
+    return p.ok && p.preview.requiresConfirm;
+  }, [hasRawRisk, rawSignatureFor, session]);
+
+  const confirmDeletePreview = useCallback(() => {
+    const preview = deletePreview;
+    if (!preview || deleteBusy) return;
+    setDeletePreview(null);
+    void commitDelete(preview, true);
+  }, [commitDelete, deleteBusy, deletePreview]);
+
+  /**
+   * F08：撤销**任意一条**有效项（不要求是最近一条）。
+   *
+   * · 判定只用同步 ref：过期、已消费、已在途都不动数据；
+   * · 只有真正保存成功才移除该条并让「已撤销N」+1；失败保留条目、不计成功；
+   * · 过期的条目只移除，不算已撤销，也不恢复数据。
+   */
+  const undoDeleteEntry = useCallback(
+    async (token: string) => {
+      if (deleteInFlightRef.current) return;
+      const entry = deleteUndoStackRef.current.find((it) => it.undo.token === token);
+      if (!entry) return;
+      if (deleteConsumedRef.current.has(token) || Date.now() > entry.until) {
+        // 过期/已消费：只移除，不恢复、不计数
+        const left = deleteUndoStackRef.current.filter((it) => it.undo.token !== token);
+        setDeleteUndoStackBoth(left);
+        if (!left.length) {
+          deleteBatchOrderRef.current = {};
+          setDeleteUndoneCount(0);
+        }
+        pushToast('撤销已过期', 'error');
+        return;
+      }
+      deleteInFlightRef.current = token;
+      setDeleteBusy(true);
+      // F10：撤销点下即收尾当前补位/待生效批次，恢复后的卡直接落在最终布局
+      endDissolveFor({ token: entry.undo.token, itemId: entry.undo.itemId });
+      disarmReflowPending();
+      try {
+        const orderRef = deleteBatchOrderRef.current[entry.undo.kind];
+        const result = await commitPaired((fresh) => {
+          const r = undoDeleteItem(fresh, entry.undo, Date.now(), { orderRef });
+          if (!r.ok) throw new Error(r.message);
+          return r.session;
+        });
+        if (result.status === 'saved') {
+          deleteConsumedRef.current.add(token);
+          /**
+           * F10：撤销真实成功 —— 立即终止**目标**效果（按 token 与 itemId 双重清理）。
+           * 旧定时器/补位收尾都只能清展示层自己的节点，绝不会再移除恢复后的卡。
+           */
+          endDissolveFor({ token: entry.undo.token, itemId: entry.undo.itemId });
+          const left = deleteUndoStackRef.current.filter((it) => it.undo.token !== token);
+          setDeleteUndoStackBoth(left);
+          if (left.length) setDeleteUndoneCount((n) => n + 1);
+          else {
+            // 队列清空 = 本批结束：计数与参照顺序不污染下一批
+            deleteBatchOrderRef.current = {};
+            setDeleteUndoneCount(0);
+          }
+          pushToast('已撤销删除');
+        } else {
+          pushToast(result.status === 'failed' ? result.message : '撤销没有保存成功', 'error');
+        }
+      } finally {
+        deleteInFlightRef.current = null;
+        setDeleteBusy(false);
+      }
+    },
+    [commitPaired, pushToast, setDeleteUndoStackBoth],
+  );
+
+  /**
+   * F08：每条按**自己的**截止时间过期。这里只排最近一个截止点的定时器，
+   * 栈变化时重排，因此新删除既不会提前结束旧条目，也不会重置旧条目的剩余时间。
+   */
+  useEffect(() => {
+    if (!deleteUndoStack.length) return undefined;
+    const nextDeadline = Math.min(...deleteUndoStack.map((it) => it.until));
+    const timeout = window.setTimeout(() => {
+      const at = Date.now();
+      const live = deleteUndoStackRef.current.filter((it) => it.until > at);
+      if (live.length === deleteUndoStackRef.current.length) return;
+      setDeleteUndoStackBoth(live);
+      if (!live.length) {
+        deleteBatchOrderRef.current = {};
+        setDeleteUndoneCount(0);
+      }
+    }, Math.max(0, nextDeadline - Date.now()) + 16);
+    return () => window.clearTimeout(timeout);
+  }, [deleteUndoStack, setDeleteUndoStackBoth]);
+
+  const memoryFor = useCallback(
+    (exerciseId: string): NonNullable<ExerciseEditorInitial['memory']> => {
+      if (exerciseTemplateError) return { mode: 'none', revision: null };
+      const tpl = exerciseTemplates.find((t) => t.exerciseId === exerciseId);
+      return tpl ? { mode: 'exists', revision: tpl.revision } : { mode: 'first', revision: null };
+    },
+    [exerciseTemplates, exerciseTemplateError],
+  );
+
+  const defaultStraightTarget = (): ExerciseTarget => ({
+    kind: 'straight',
+    sets: 3,
+    setsMax: 3,
+    repsMin: 8,
+    repsMax: 12,
+    weightMode: 'external',
+    suggestedWeightKg: null,
+  });
+
+  const openEditEditor = useCallback(
+    (exId: string) => {
+      const latest = latestRef.current;
+      const ex = latest?.exercises.find((e) => e.id === exId);
+      if (!ex) {
+        pushToast('这个动作已经不在本次训练里了', 'error');
+        return;
+      }
+      if (hasRawRisk(exId)) {
+        pushToast('这个动作还有未完成输入；请先提交或放弃那些输入，再编辑结构。', 'error');
+        return;
+      }
+      editorSeq.current += 1;
+      setEditorState({
+        key: `edit:${exId}:${editorSeq.current}`,
+        mode: 'edit',
+        exId,
+        initial: {
+          key: `edit:${exId}:${editorSeq.current}`,
+          name: ex.name,
+          ...(ex.en !== undefined ? { en: ex.en } : {}),
+          exerciseId: ex.exerciseId,
+          target: structuredClone(ex.target),
+          restSec: ex.restSec,
+          arrangedGroups: ex.groups.map((g) => ({ ...g })),
+          memory: memoryFor(ex.exerciseId),
+        },
+      });
+    },
+    [hasRawRisk, memoryFor, pushToast],
+  );
+
+  const commitAddExercise = useCallback(
+    async (
+      entry: { sessionId: string; exercise: SessionExercise },
+      payload?: ExerciseEditorSubmitValue,
+    ): Promise<{ ok: boolean; message?: string }> => {
+      const latest = latestRef.current;
+      if (!latest) return { ok: false, message: '当前不可写，草稿已保留' };
+      const intentId = entry.exercise.id;
+      // 同一意图/任一添加在途时同步拒绝，避免重试连点产生第二笔 paired 写
+      if (addInFlightRef.current) return { ok: false, message: '这次添加正在保存，请稍候' };
+      addInFlightRef.current = intentId;
+      const templateWrite =
+        payload?.remember && payload.template
+          ? { template: payload.template, expectedRevision: payload.templateExpectedRevision }
+          : undefined;
+      try {
+      const r = await commitPaired(
+        (fresh) =>
+          fresh.exercises.some((e) => e.id === entry.exercise.id)
+            ? fresh
+            : { ...fresh, exercises: [...fresh.exercises, entry.exercise] },
+        templateWrite,
+      );
+      if (r.status === 'saved') {
+        pushToast(
+          payload?.remember
+            ? `已添加「${entry.exercise.name}」，并设为此动作的默认配置`
+            : `已添加「${entry.exercise.name}」`,
+        );
+        addCommitRef.current = null;
+        setAddFailed((prev) => (prev && prev.entry.exercise.id !== entry.exercise.id ? prev : null));
+        return { ok: true };
+      }
+      if (!discardedAddIds.current.has(intentId)) {
+        setAddFailed({ entry, ...(payload ? { payload } : {}) });
+        pushToast(`添加没有保存成功：${r.status === 'failed' ? r.message : '版本冲突'}。配置已保留，可重试。`, 'error');
+      }
+      return { ok: false, message: '保存失败，配置已保留' };
+      } finally {
+        if (addInFlightRef.current === intentId) addInFlightRef.current = null;
+      }
+    },
+    [commitPaired, pushToast],
+  );
+
+  const handleAddName = useCallback(
+    (selection: ExerciseNameSelection) => {
+      setAddNameOpen(false);
+      if (exerciseTemplateError) {
+        // 读取失败分支必须清掉在途 ref，恢复读取后仍可添加
+        addInFlightRef.current = null;
+        pushToast(`动作配置记忆读取异常：${exerciseTemplateError}`, 'error');
+        return;
+      }
+      if (addInFlightRef.current) return;
+      const tpl = exerciseTemplates.find((t) => t.exerciseId === selection.exerciseId);
+      if (tpl) {
+        // 有合法记忆：直接按全套配置新增，不经配置/确认页
+        const exercise = sessionExerciseFromTemplate(tpl);
+        const entry = { sessionId, exercise };
+        addCommitRef.current = entry;
+        void commitAddExercise(entry).finally(() => { addInFlightRef.current = null; });
+        return;
+      }
+      editorSeq.current += 1;
+      const target = defaultStraightTarget();
+      setEditorState({
+        key: `add:${selection.exerciseId}:${editorSeq.current}`,
+        mode: 'add',
+        exId: null,
+        initial: {
+          key: `add:${selection.exerciseId}:${editorSeq.current}`,
+          name: selection.name,
+          ...(selection.en !== undefined ? { en: selection.en } : {}),
+          exerciseId: selection.exerciseId,
+          target,
+          restSec: 120,
+          arrangedGroups: [{ index: 1, stageCount: 1 }, { index: 2, stageCount: 1 }, { index: 3, stageCount: 1 }],
+          memory: { mode: 'first', revision: null },
+        },
+      });
+    },
+    [commitAddExercise, exerciseTemplateError, exerciseTemplates, pushToast, sessionId],
+  );
+
+  const commitEditPayload = useCallback(
+    async (payload: ExerciseEditorSubmitValue, exId: string): Promise<{ ok: boolean; message?: string }> => {
+      const latest = latestRef.current;
+      const source = latest?.exercises.find((e) => e.id === exId);
+      if (!latest || !source) return { ok: false, message: '这个动作已经不在本次训练里了' };
+      const templateWrite =
+        payload.remember && payload.template
+          ? { template: payload.template, expectedRevision: payload.templateExpectedRevision }
+          : undefined;
+      const r = await commitPaired((fresh) => {
+        const freshSource = fresh.exercises.find((e) => e.id === exId);
+        if (!freshSource) throw new Error('这个动作已经不在本次训练里了');
+        const applied = applyTargetToSessionExercise(fresh, exId, payload.target, { confirmImpact: true });
+        if (!applied.applied) throw new Error(applied.message);
+        const appliedExercise = applied.session.exercises.find((e) => e.id === exId);
+        if (!appliedExercise) throw new Error('这个动作已经不在本次训练里了');
+        const identity = assessExerciseIdentityChange(freshSource, payload.exerciseId, payload.name);
+        const nextExercise: SessionExercise = {
+          ...appliedExercise,
+          name: payload.name,
+          ...(payload.en !== undefined ? { en: payload.en } : {}),
+          restSec: payload.restSec,
+          ...(identity.changed
+            ? { exerciseId: payload.exerciseId, planExerciseId: null, replacedFrom: freshSource.name }
+            : {}),
+        };
+        if (identity.changed && payload.en === undefined) {
+          delete nextExercise.en;
+        }
+        return {
+          ...applied.session,
+          exercises: applied.session.exercises.map((e) => (e.id === exId ? nextExercise : e)),
+        };
+      }, templateWrite);
+      if (r.status === 'saved') {
+        if (!payload.remember) {
+          pushToast(`已保存本次调整（「${payload.name}」）`);
+        } else if (payload.templateExpectedRevision === null) {
+          pushToast(`已保存「${payload.name}」，并设为此动作的默认配置`);
+        } else {
+          pushToast(`已保存，并更新此动作的默认配置（「${payload.name}」）`);
+        }
+        return { ok: true };
+      }
+      const errMsg = r.status === 'failed' ? r.message : '版本冲突或记录已变化';
+      pushToast(`保存没有成功：${errMsg}。草稿已保留。`, 'error');
+      return { ok: false, message: `${errMsg}，草稿已保留` };
+    },
+    [commitPaired, pushToast],
+  );
+
+  const handleEditorSubmit = useCallback(
+    async (payload: ExerciseEditorSubmitValue): Promise<{ ok: boolean; message?: string }> => {
+      if (!editorState) return { ok: false, message: '编辑器状态已失效' };
+      if (editorState.mode === 'add') {
+        const existing = addCommitRef.current;
+        const tpl = exerciseTemplateFromConfig({
+          exerciseId: payload.exerciseId,
+          name: payload.name,
+          ...(payload.en !== undefined ? { en: payload.en } : {}),
+          target: payload.target,
+          restSec: payload.restSec,
+        });
+        const built = sessionExerciseFromTemplate(tpl);
+        // 重试复用同一 sessionExerciseId，但配置与本次 payload 同源（不沿用旧冻结配置）
+        const entry = {
+          sessionId,
+          exercise: existing && existing.sessionId === sessionId ? { ...built, id: existing.exercise.id } : built,
+        };
+        addCommitRef.current = entry;
+        const result = await commitAddExercise(entry, payload);
+        if (result.ok) addInFlightRef.current = null;
+        return result;
+      }
+      const exId = editorState.exId;
+      if (!exId) return { ok: false, message: '找不到编辑对象' };
+      const latest = latestRef.current;
+      const source = latest?.exercises.find((e) => e.id === exId);
+      if (!latest || !source) return { ok: false, message: '这个动作已经不在本次训练里了' };
+      const impact = planTargetApply(source, payload.target);
+      const identity = assessExerciseIdentityChange(source, payload.exerciseId, payload.name);
+      if (impact.needsConfirmation || (identity.changed && identity.hasActual)) {
+        const lines = [...impact.messages];
+        if (identity.changed) lines.push(identity.message);
+        setEditorConfirm({
+          payload,
+          exId,
+          title: '确认修改影响',
+          body: lines.join('\n') || '本次修改会影响已有记录，确认继续？',
+        });
+        return { ok: false, message: '请先确认影响后再保存' };
+      }
+      return commitEditPayload(payload, exId);
+    },
+    [commitAddExercise, commitEditPayload, editorState, sessionId],
+  );
+
+
+  /**
    * 需求 1：打开「替换后确认组数与休息」步骤。
    *
-   * 初始值继承可承接的原动作配置（replaceConfigSeedFor）。
+   * 初始值继承可承接的原动作配置（旧替换配置链已退役）。
    * 这里只准备草稿，**不修改 session**；用户点「确认替换」才落库，取消则本次训练不变。
    */
 
@@ -2145,728 +3129,6 @@ export function SessionPage({ sessionId }: { sessionId: string }) {
    * 这里不改动 retryUnsaved 的行为（其他调用者继续用它），
    * 只按同一份 pending 做一次可判定结果的提交。
    */
-  const retryUnsavedDraftForReplace = useCallback(async (label = '替换'): Promise<{
-    ok: boolean;
-    message: string;
-  }> => {
-    const pending = unsavedDraft.current;
-    const pendingSeq = rescuedSeqRef.current;
-    if (!pending) {
-      /**
-       * REVIEW-3 #2：**pending 为空且没有本次结果的身份凭据时，一律判为无法核实**。
-       *
-       * 为什么不再"读库 + 启发式判断"：
-       * 库里可能存在**完全符合旧启发式**的既存实例 ——
-       * 同一训练此前已把另一个同名原动作换成同一目标，
-       * 它同样满足「名称相同 / replacedFrom==originName / id!=oldID」，
-       * 于是"本次其实没保存"会被误报成"已保存"（Codex 已用真实回调+库复现）。
-       *
-       * 任何基于名称/标记的推断都无法证明"这是**本次**提交的结果"。
-       * 按 REVIEW-3 给出的最小安全方案：这里直接返回失败，
-       * 让用户关闭后自行检查或重新操作，**不猜成功**，
-       * 也不为此罕见分支新增存储协议。
-       */
-      return {
-        ok: false,
-        message: `无法确认这次${label}是否已经写入本机（缺少本次提交的记录）。请关闭后检查动作列表，或重新操作一次。`,
-      };
-    }
-    if (!beginBusy('retry')) {
-      return { ok: false, message: '正在保存，请稍候' };
-    }
-    try {
-      const acq = await acquireSessionLockDetailed(sessionId, editorId.current);
-      if (!acq.ok) {
-        setLockBlocked(true);
-        setLockLostReason(
-          acq.reason === 'held-by-other'
-            ? '这个训练仍被另一个标签页编辑。请先在那个标签页停止操作，约 20 秒后此处可接管。'
-            : (acq.message ?? '仍未能取得编辑锁'),
-        );
-        return { ok: false, message: '没有编辑控制（可能另一页正在编辑）' };
-      }
-      await refreshSessions();
-      const fresh = await getSession(sessionId);
-      if (!fresh) return { ok: false, message: '读不到最新记录' };
-      syncSessionLocal(fresh);
-      setLockBlocked(false);
-      setLockLostReason(null);
-      setSaveState('idle');
-
-      const outcome = await applyPendingDraft(pending, fresh, pendingSeq);
-      if (outcome.kind === 'saved') return { ok: true, message: '已保存' };
-      if (outcome.kind === 'conflict') {
-        return { ok: false, message: '与另一页的改动冲突，草稿仍保留' };
-      }
-      return { ok: false, message: outcome.message };
-    } catch (err) {
-      return { ok: false, message: err instanceof Error ? err.message : '本地写入失败' };
-    } finally {
-      endBusy('retry');
-    }
-  }, [
-    sessionId,
-    refreshSessions,
-    syncSessionLocal,
-    applyPendingDraft,
-    beginBusy,
-    endBusy,
-  ]);
-
-  const openReplaceConfig = useCallback(
-    (sessionExerciseId: string, name: string) => {
-      const cur = latestRef.current?.exercises.find((e) => e.id === sessionExerciseId);
-      if (!cur) {
-        pushToast('找不到要替换的动作', 'error');
-        return;
-      }
-      // 先做一次可行性判断：没有任何可承接的组时，直接给出既有提示，不进入配置步骤
-      const seed = replaceConfigSeedFor(cur);
-      if (seed.carriedCount === 0) {
-        pushToast(
-          `「${cur.name}」的每一组都已经开始记录，没有可承接的完整组。请用「临时加动作」另加「${name}」。`,
-          'error',
-        );
-        return;
-      }
-      replaceFormApi.resetAll();
-      setReplaceError(null);
-      setReplaceConfig({
-        commitId: `replace-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
-        sessionExerciseId,
-        name,
-        // REVIEW-1 #7：保存原动作名快照，origin 消失后仍能显示有意义的内容
-        originName: cur.name,
-        sets: seed.sets,
-        restSec: seed.restSec,
-        /**
-         * B4：目标次数初值**从原动作本次快照继承**（不硬编码 8–12）。
-         * 递减组按阶段逐个继承 repsMin/repsMax/toFailure。
-         */
-        reps:
-          cur.target.kind === 'straight'
-            ? {
-                kind: 'straight' as const,
-                repsMin: cur.target.repsMin,
-                repsMax: cur.target.repsMax,
-              }
-            : {
-                kind: 'dropSet' as const,
-                stages: cur.target.stages.map((st) => ({
-                  repsMin: st.repsMin,
-                  repsMax: st.repsMax,
-                  toFailure: st.toFailure,
-                })),
-              },
-        phase: 'editing',
-        submitted: false,
-      });
-    },
-    [pushToast, replaceFormApi],
-  );
-
-  /** 关闭替换 Sheet：提交中不允许关闭，避免"已入队写入仍在完成"（预审 P1 #2） */
-  const closeReplaceConfig = useCallback(
-    (reason: 'user' | 'settled') => {
-      const cfg = replaceConfig;
-      if (!cfg) return;
-      if (!canCloseReplaceSheet(cfg, reason)) {
-        pushToast('正在保存这次替换，请稍候再关闭。');
-        return;
-      }
-      replaceFormApi.resetAll();
-      setReplaceError(null);
-      setReplaceConfig(null);
-    },
-    [replaceConfig, replaceFormApi, pushToast],
-  );
-
-  /**
-   * 需求 1：确认替换。
-   *
-   * ── 幂等与作用域（预审 P1 #1 / #2）──────────────────────────
-   * 1. **提交中防二次确认**：phase='submitting' 时直接返回（慢保存下不会重复入队）。
-   * 2. **提交用稳定 commitId**：结果回调只在「当前 Sheet 仍是同一 commitId」时才
-   *    允许关窗/写提示 —— 旧回调不会清掉后来打开的新配置。
-   * 3. **失败后重试不重放领域操作**：`submitted=true` 表示这次替换已经写进
-   *    latestRef（可能落成待存草稿），重试只走既有「重试保存这次改动」链路，
-   *    不再按旧 targetId 做第二次替换。
-   * 4. **失败即解锁**：失败后把 phase 置为 'failed'，并在 Sheet 内直接提供
-   *    「重试保存」/「放弃这份改动」入口，避免被 inputPaused 锁死在空弹层里。
-   */
-  const confirmReplace = useCallback(async () => {
-    const cfg = replaceConfig;
-    if (!cfg) return;
-    // 提交中：禁止二次确认（防重复入队）
-    if (!canConfirmReplace(cfg)) return;
-
-    const commitId = cfg.commitId;
-
-    // ── 重试决策：已写入过就只重试保存，绝不重放领域操作 ──
-    const retryDecision = decideReplaceRetry(cfg);
-    if (retryDecision.action === 'reject-busy') return;
-    if (retryDecision.action === 'retry-save-only') {
-      setReplaceConfig((prev) =>
-        prev && prev.commitId === commitId ? { ...prev, phase: 'submitting' } : prev,
-      );
-      const retried = await retryUnsavedDraftForReplace();
-      setReplaceConfig((prev) => {
-        if (!prev || isStaleCommit(commitId, prev.commitId)) return prev; // 旧回调不碰新配置
-        if (retried.ok) {
-          pushToast(replaceSuccessRef.current ?? '替换已保存');
-          replaceFormApi.resetAll();
-          return null;
-        }
-        setReplaceError(
-          `替换还没有保存成功：${retried.message}。配置已保留，可再试，或放弃这份改动。`,
-        );
-        return { ...prev, phase: 'failed' };
-      });
-      return;
-    }
-
-    // flushAll：用**当前文本草稿**校验并取值，不依赖 blur（与转换表单同一契约）
-    const flushed = replaceFormApi.flushAll();
-    if (!flushed.ok) {
-      setReplaceError(`有字段还不合法：${Object.values(flushed.errors)[0]}`);
-      return;
-    }
-    const cur = latestRef.current?.exercises.find((e) => e.id === cfg.sessionExerciseId);
-    if (!cur) {
-      setReplaceError('这个动作已经不在本次训练里了（可能另一处已保存过替换）。请关闭后重新操作。');
-      return;
-    }
-    const kind = cur.target.kind;
-    const maxGroups = kind === 'straight' ? MAX_STRAIGHT_SETS : MAX_ROUNDS;
-    const nextSets = mergeFlushedValues({ sets: cfg.sets }, flushed.values, {
-      sets: 'replace.sets',
-    }).sets;
-    const nextRest = mergeFlushedValues({ restSec: cfg.restSec }, flushed.values, {
-      restSec: 'replace.rest',
-    }).restSec;
-
-    if (!Number.isInteger(nextSets) || nextSets < 1 || nextSets > maxGroups) {
-      setReplaceError(`${kind === 'straight' ? '组数' : '轮数'}必须是 1–${maxGroups} 的整数`);
-      return;
-    }
-    if (!Number.isInteger(nextRest) || nextRest < 0 || nextRest > MAX_REST) {
-      setReplaceError(`休息秒数必须是 0–${MAX_REST} 的整数`);
-      return;
-    }
-
-    /**
-     * B4：目标次数校验（引用既有 limits 真源，不新造上限）。
-     * 普通组：范围/整数/下限≤上限；递减组：非力竭阶段必须有完整合法范围。
-     */
-    /**
-     * B4-R1：**必须用 flush 出来的最新 raw**，不能只读 `cfg.reps`。
-     *
-     * 真实风险：用户改了次数输入但还没 blur（配置未回写 cfg），
-     * 点确认时若只读 cfg 就会用旧值 —— 用户明确输入被忽略。
-     * 这里把 flushAll 的值按 fieldId 合并回草稿。
-     */
-    const reps: typeof cfg.reps =
-      cfg.reps.kind === 'straight'
-        ? {
-            kind: 'straight',
-            repsMin: flushed.values['replace.repsMin'] ?? cfg.reps.repsMin,
-            repsMax: flushed.values['replace.repsMax'] ?? cfg.reps.repsMax,
-          }
-        : {
-            kind: 'dropSet',
-            stages: cfg.reps.stages.map((st, i) => ({
-              repsMin: flushed.values[`replace.stage${i}.repsMin`] ?? st.repsMin,
-              repsMax: flushed.values[`replace.stage${i}.repsMax`] ?? st.repsMax,
-              toFailure: st.toFailure,
-            })),
-          };
-    if (reps.kind === 'straight') {
-      const { repsMin, repsMax } = reps;
-      if (
-        !Number.isInteger(repsMin) || !Number.isInteger(repsMax) ||
-        repsMin < 0 || repsMax > MAX_REPS
-      ) {
-        setReplaceError(`每组目标次数必须是 0–${MAX_REPS} 的整数`);
-        return;
-      }
-      if (repsMin > repsMax) {
-        setReplaceError('每组目标次数的下限不能大于上限');
-        return;
-      }
-    } else {
-      for (let i = 0; i < reps.stages.length; i += 1) {
-        const st = reps.stages[i];
-        if (st.toFailure) continue; // 力竭阶段不要求次数
-        if (
-          st.repsMin === null || st.repsMax === null ||
-          !Number.isInteger(st.repsMin) || !Number.isInteger(st.repsMax) ||
-          st.repsMin < 0 || st.repsMax > MAX_REPS
-        ) {
-          setReplaceError(`第 ${i + 1} 阶段的目标次数必须是 0–${MAX_REPS} 的整数`);
-          return;
-        }
-        if (st.repsMin > st.repsMax) {
-          setReplaceError(`第 ${i + 1} 阶段的下限不能大于上限`);
-          return;
-        }
-      }
-    }
-
-    const targetId = cfg.sessionExerciseId;
-    const name = cfg.name;
-    setReplaceError(null);
-    // 进入提交中：此后确认按钮与关闭都被禁用，直到 settle
-    setReplaceConfig((prev) =>
-      prev && prev.commitId === commitId ? { ...prev, phase: 'submitting' } : prev,
-    );
-
-    const outcome = applyChange((prev) => {
-      const r = replaceExerciseInSession(prev, targetId, name, {
-        config: {
-          sets: nextSets,
-          restSec: nextRest,
-          // domain 侧用 undefined 表示"该阶段未覆盖"，这里把 null 归一
-          reps:
-            reps.kind === 'straight'
-              ? reps
-              : {
-                  kind: 'dropSet' as const,
-                  stages: reps.stages.map((st) => ({
-                    repsMin: st.repsMin ?? undefined,
-                    repsMax: st.repsMax ?? undefined,
-                    toFailure: st.toFailure,
-                  })),
-                },
-        },
-      });
-      if (!r.replaced) {
-        // 明确拒绝（无可承接组 / 超行数上限）：不产生改动
-        replaceRejectRef.current = r.message;
-        return prev;
-      }
-      replaceRejectRef.current = null;
-      replaceSuccessRef.current = r.message;
-      return r.session;
-    });
-
-    if (outcome === 'not-executed') {
-      const reject = replaceRejectRef.current;
-      setReplaceConfig((prev) => {
-        if (!prev || isStaleCommit(commitId, prev.commitId)) return prev;
-        if (reject) {
-          // 领域明确拒绝：本次没有写入，回到可编辑态让用户修正
-          setReplaceError(reject);
-          return { ...prev, phase: 'editing' };
-        }
-        /**
-         * REVIEW-1 #7：输入被暂停时，横幅在遮罩后面看不到，
-         * 只说"请处理下面的待存改动"等于没有出口。
-         * 这里直接把**可操作入口**放进 Sheet：
-         *   · 有待存草稿 → 允许在本 Sheet 内重试保存（复用既有链路）；
-         *   · 本页只读（失锁）→ 明确提示需要接管或等待。
-         */
-        setReplaceError(
-          hasPendingDraft
-            ? '还有改动没存进本机，所以这次替换没有写入。可以先在这里重试保存，或关闭弹层去处理。'
-            : '本页当前只读（编辑权在另一页或锁已失效），这次替换没有写入。',
-        );
-        return { ...prev, phase: 'failed' };
-      });
-      if (reject) pushToast(reject, 'error');
-      return;
-    }
-
-    const result = await outcome;
-    const mapped =
-      result.status === 'saved'
-        ? ({ kind: 'saved' } as const)
-        : result.status === 'failed'
-          ? ({ kind: 'failed', message: result.message } as const)
-          : ({ kind: 'not-attempted' } as const);
-
-    setReplaceConfig((prev) => {
-      // 旧回调：Sheet 已换成另一次替换 → 绝不改动它
-      if (!prev || isStaleCommit(commitId, prev.commitId)) return prev;
-      const effect = replacePhaseAfterOutcome(prev, mapped);
-      if (effect.error) setReplaceError(effect.error);
-      if (effect.close) {
-        pushToast(replaceSuccessRef.current ?? `已替换为「${name}」`);
-        replaceFormApi.resetAll();
-        return null;
-      }
-      // 保留本次替换的业务字段（targetId/名称/组数/休息），只更新提交阶段
-      return effect.next ? { ...prev, ...effect.next } : prev;
-    });
-    if (mapped.kind !== 'saved') {
-      pushToast('替换没有保存成功，配置已保留。', 'error');
-    }
-  }, [
-    replaceConfig,
-    replaceFormApi,
-    applyChange,
-    pushToast,
-    retryUnsavedDraftForReplace,
-    hasPendingDraft,
-  ]);
-
-  /* ── 问题二：临时添加动作 —— 先配置，确认后才添加 ────────────────
-     选库动作或输入自定义名后都走**同一配置步骤**（普通组即可，不扩展递减组设计）。
-     取消/返回不写 session，也不产生空动作。 */
-
-  /** 打开配置步骤：只准备草稿，不修改本次训练 */
-  const openAddConfig = useCallback(
-    (name: string) => {
-      const trimmed = name.trim();
-      if (!trimmed) {
-        pushToast('动作名不能为空', 'error');
-        return;
-      }
-      addConfigFormApi.resetAll();
-      setAddConfigError(null);
-      setAddConfig({
-        commitId: newCommitId('add'),
-        sessionId,
-        intent: { ...ADD_EXERCISE_DEFAULTS, name: trimmed },
-        draft: { ...ADD_EXERCISE_DEFAULTS, name: trimmed },
-        phase: 'editing',
-        submitted: false,
-      });
-    },
-    [addConfigFormApi, pushToast, sessionId],
-  );
-
-  /** 关闭配置步骤：提交中不允许关闭，避免「已入队写入仍在完成」 */
-  const closeAddConfig = useCallback(
-    (reason: 'user' | 'settled') => {
-      const cfg = addConfig;
-      if (!cfg) return;
-      if (!canCloseCommitSheet(cfg, reason)) {
-        pushToast('正在保存这次添加，请稍候再关闭。');
-        return;
-      }
-      addConfigFormApi.resetAll();
-      setAddConfigError(null);
-      setAddConfig(null);
-    },
-    [addConfig, addConfigFormApi, pushToast],
-  );
-
-  /**
-   * 确认添加。
-   *
-   * 幂等与作用域（与替换确认同一套口径）：
-   * 1. 提交中禁止二次确认 → 慢保存下不会重复入队；
-   * 2. commitId + sessionId 双重归属 → 旧回调不关新配置、不写错提示；
-   * 3. 失败后重试**只重试保存**（submitted=true），绝不再次调用领域添加函数
-   *    → 不会出现「重试一次多一个动作」；
-   * 4. 成功提示只以**真实保存结果**为准（saved 才提示成功）。
-   */
-  const confirmAdd = useCallback(async () => {
-    const cfg = addConfig;
-    if (!cfg) return;
-    if (!canConfirmCommit(cfg)) return;
-    const commitId = cfg.commitId;
-    const owner = { sessionId: cfg.sessionId, commitId };
-    // 同步在途锁：同一 commitId 只允许一次在途提交（防连点重复添加）
-    if (addInFlightRef.current === commitId) return;
-
-    const retryDecision = decideCommitRetry(cfg, '添加');
-    if (retryDecision.action === 'reject-busy') return;
-    if (retryDecision.action === 'retry-save-only') {
-      addInFlightRef.current = commitId;
-      setAddConfig((prev) =>
-        prev && !isStaleExerciseCommit(cfg.sessionId, commitId, prev) ? { ...prev, phase: 'submitting' } : prev,
-      );
-      const retried = await retryUnsavedDraftForReplace('添加');
-      addInFlightRef.current = null;
-      setAddConfig((prev) => {
-        if (!prev || isStaleExerciseCommit(owner.sessionId, commitId, prev)) return prev;
-        if (retried.ok) {
-          pushToast(addSuccessRef.current ?? `已添加「${prev.intent.name}」`);
-          addConfigFormApi.resetAll();
-          return null;
-        }
-        setAddConfigError(
-          `这次添加还没有保存成功：${retried.message}。配置已保留，可再试，或放弃这份改动。`,
-        );
-        return { ...prev, phase: 'failed' };
-      });
-      return;
-    }
-
-    // 用**当前 raw 文本草稿**校验并取值，不依赖 blur（与转换/替换表单同一契约）
-    const flushed = addConfigFormApi.flushAll();
-    if (!flushed.ok) {
-      setAddConfigError(`有字段还不合法：${Object.values(flushed.errors)[0]}`);
-      return;
-    }
-    const merged = mergeFlushedValues(cfg.draft, flushed.values, {
-      sets: 'addcfg.sets',
-      repsMin: 'addcfg.repsMin',
-      repsMax: 'addcfg.repsMax',
-      restSec: 'addcfg.rest',
-    });
-    const intent: LooseExerciseConfig = {
-      name: cfg.intent.name,
-      sets: merged.sets,
-      repsMin: merged.repsMin,
-      repsMax: merged.repsMax,
-      restSec: merged.restSec,
-    };
-    // 领域同一条校验（UI 与领域边界一致，拒绝而非静默截断）
-    const checked = checkLooseExerciseConfig(intent);
-    if (!checked.ok) {
-      setAddConfigError(checked.message);
-      return;
-    }
-
-    setAddConfigError(null);
-    addInFlightRef.current = commitId;
-    // 冻结本次意图：此后重试只保存这一份
-    setAddConfig((prev) =>
-      prev && !isStaleExerciseCommit(owner.sessionId, commitId, prev)
-        ? { ...prev, intent, draft: intent, phase: 'submitting' }
-        : prev,
-    );
-
-    const outcome = applyChange((prev) => {
-      const r = addConfiguredLooseExercise(prev, intent);
-      if (!r.added) {
-        addRejectRef.current = r.message;
-        return prev;
-      }
-      addRejectRef.current = null;
-      addSuccessRef.current = r.message;
-      return r.session;
-    });
-
-    if (outcome === 'not-executed') {
-      addInFlightRef.current = null;
-      const reject = addRejectRef.current;
-      setAddConfig((prev) => {
-        if (!prev || isStaleExerciseCommit(owner.sessionId, commitId, prev)) return prev;
-        if (reject) {
-          // 领域明确拒绝（容量/非法值）：本次没有写入，回到可编辑态
-          setAddConfigError(reject);
-          return { ...prev, phase: 'editing' };
-        }
-        setAddConfigError(
-          hasPendingDraft
-            ? '还有改动没存进本机，所以这次添加没有写入。可以先在这里重试保存，或关闭弹层去处理。'
-            : '本页当前只读（编辑权在另一页或锁已失效），这次添加没有写入。',
-        );
-        return { ...prev, phase: 'failed' };
-      });
-      if (reject) pushToast(reject, 'error');
-      return;
-    }
-
-    const result = await outcome;
-    addInFlightRef.current = null;
-    const mapped: CommitOutcome =
-      result.status === 'saved'
-        ? { kind: 'saved' }
-        : result.status === 'failed'
-          ? { kind: 'failed', message: result.message }
-          : { kind: 'not-attempted' };
-
-    setAddConfig((prev) => {
-      if (!prev || isStaleExerciseCommit(owner.sessionId, commitId, prev)) return prev;
-      const effect = commitPhaseAfterOutcome(prev, mapped, '添加');
-      if (effect.error) setAddConfigError(effect.error);
-      if (effect.close) {
-        pushToast(addSuccessRef.current ?? `已添加「${prev.intent.name}」`);
-        addConfigFormApi.resetAll();
-        return null;
-      }
-      return effect.next ? { ...prev, ...effect.next } : prev;
-    });
-    if (mapped.kind !== 'saved') {
-      pushToast('这次添加没有保存成功，配置已保留。', 'error');
-    }
-  }, [
-    addConfig,
-    addConfigFormApi,
-    applyChange,
-    pushToast,
-    retryUnsavedDraftForReplace,
-    hasPendingDraft,
-  ]);
-
-  /* ── 问题三：从本次训练移除整个动作 ──────────────────────────────
-     这是整项动作移除，不是删单组、不是删计划、也不是「跳过剩余组」。
-     有实际输入/记录的动作必须保护：保留记录并提示可「跳过剩余组」。 */
-
-  /** 打开移除确认：只准备状态，不修改本次训练 */
-  const openRemoveExercise = useCallback(
-    (exId: string) => {
-      const cur = latestRef.current?.exercises.find((e) => e.id === exId);
-      if (!cur) {
-        pushToast('找不到要移除的动作', 'error');
-        return;
-      }
-      setRemoveError(null);
-      setRemoveEx({
-        commitId: newCommitId('remove'),
-        sessionId,
-        exerciseId: exId,
-        name: cur.name,
-        phase: 'editing',
-        submitted: false,
-      });
-    },
-    [pushToast, sessionId],
-  );
-
-  const closeRemoveExercise = useCallback(
-    (reason: 'user' | 'settled') => {
-      const cfg = removeEx;
-      if (!cfg) return;
-      if (!canCloseCommitSheet(cfg, reason)) {
-        pushToast('正在移除这个动作，请稍候再关闭。');
-        return;
-      }
-      setRemoveError(null);
-      setRemoveEx(null);
-    },
-    [removeEx, pushToast],
-  );
-
-  /**
-   * 确认移除。
-   *
-   * 关键：**在点击确认的这一刻**重新读取最新 session 并按稳定 ID 复核，
-   * 不用打开确认时的旧快照 —— 否则中间新填的输入会被误删。
-   * 保存仍走 applyChange → persist（锁/版本 CAS 照旧，不绕过）。
-   */
-  const confirmRemoveExercise = useCallback(async () => {
-    const cfg = removeEx;
-    if (!cfg) return;
-    if (!canConfirmCommit(cfg)) return;
-    const commitId = cfg.commitId;
-    const owner = { sessionId: cfg.sessionId, commitId };
-    // 同步在途锁：同一 commitId 只允许一次在途提交（防连点重复移除）
-    if (removeInFlightRef.current === commitId) return;
-
-    const retryDecision = decideCommitRetry(cfg, '移除');
-    if (retryDecision.action === 'reject-busy') return;
-    if (retryDecision.action === 'retry-save-only') {
-      removeInFlightRef.current = commitId;
-      setRemoveEx((prev) =>
-        prev && !isStaleExerciseCommit(owner.sessionId, commitId, prev) ? { ...prev, phase: 'submitting' } : prev,
-      );
-      const retried = await retryUnsavedDraftForReplace('移除');
-      removeInFlightRef.current = null;
-      setRemoveEx((prev) => {
-        if (!prev || isStaleExerciseCommit(owner.sessionId, commitId, prev)) return prev;
-        if (retried.ok) {
-          pushToast(removeSuccessRef.current ?? '已从本次训练移除');
-          return null;
-        }
-        setRemoveError(`这次移除还没有保存成功：${retried.message}。可再试，或放弃这份改动。`);
-        return { ...prev, phase: 'failed' };
-      });
-      return;
-    }
-
-    // 最新状态复核（按 ID；动作可能已被另一处移除/替换）
-    const latest = latestRef.current;
-    const cur = latest?.exercises.find((e) => e.id === cfg.exerciseId);
-    if (!latest || !cur) {
-      setRemoveError('这个动作已经不在本次训练里了（可能另一处已保存过移除或替换）。请关闭后重新操作。');
-      return;
-    }
-    // 保护判据：用最新记录重新判定，含未提交 raw 风险
-    const protection = exerciseRemovalProtection(cur, { hasRawDraft: hasRawRisk(cfg.exerciseId) });
-    if (protection.protected) {
-      setRemoveError(
-        `「${cur.name}」${protection.reasons.join('、')}，所以没有移除。记录已保留；如果只是不想继续做，可以用「跳过剩余组」。`,
-      );
-      return;
-    }
-
-    setRemoveError(null);
-    removeInFlightRef.current = commitId;
-    setRemoveEx((prev) =>
-      prev && !isStaleExerciseCommit(owner.sessionId, commitId, prev) ? { ...prev, phase: 'submitting' } : prev,
-    );
-
-    const outcome = applyChange((prev) => {
-      // 领域侧再按 ID 复核一次：只移除当前这条记录，其他动作身份/数据/顺序不变
-      const live = prev.exercises.find((e) => e.id === cfg.exerciseId);
-      if (!live) {
-        removeRejectRef.current = '这个动作已经不在本次训练里了。';
-        return prev;
-      }
-      const liveProtection = exerciseRemovalProtection(live, { hasRawDraft: hasRawRisk(cfg.exerciseId) });
-      if (liveProtection.protected) {
-        removeRejectRef.current = `「${live.name}」${liveProtection.reasons.join('、')}，所以没有移除。`;
-        return prev;
-      }
-      const r = removeExerciseFromSession(prev, cfg.exerciseId);
-      if (!r.removed) {
-        removeRejectRef.current = '这个动作已经不在本次训练里了。';
-        return prev;
-      }
-      removeRejectRef.current = null;
-      removeSuccessRef.current = `已从本次训练移除「${r.name}」`;
-      return r.session;
-    });
-
-    if (outcome === 'not-executed') {
-      removeInFlightRef.current = null;
-      const reject = removeRejectRef.current;
-      setRemoveEx((prev) => {
-        if (!prev || isStaleExerciseCommit(owner.sessionId, commitId, prev)) return prev;
-        if (reject) {
-          setRemoveError(reject);
-          return { ...prev, phase: 'editing' };
-        }
-        setRemoveError(
-          hasPendingDraft
-            ? '还有改动没存进本机，所以这次移除没有写入。可以先在这里重试保存，或关闭弹层去处理。'
-            : '本页当前只读（编辑权在另一页或锁已失效），这次移除没有写入。',
-        );
-        return { ...prev, phase: 'failed' };
-      });
-      if (reject) pushToast(reject, 'error');
-      return;
-    }
-
-    const result = await outcome;
-    removeInFlightRef.current = null;
-    const mapped: CommitOutcome =
-      result.status === 'saved'
-        ? { kind: 'saved' }
-        : result.status === 'failed'
-          ? { kind: 'failed', message: result.message }
-          : { kind: 'not-attempted' };
-
-    setRemoveEx((prev) => {
-      if (!prev || isStaleExerciseCommit(owner.sessionId, commitId, prev)) return prev;
-      const effect = commitPhaseAfterOutcome(prev, mapped, '移除');
-      if (effect.error) setRemoveError(effect.error);
-      if (effect.close) {
-        pushToast(removeSuccessRef.current ?? `已从本次训练移除「${prev.name}」`);
-        // 关闭相关工具层并清理展开项，避免留下幽灵面板/错把同名新动作当原动作
-        setToolsFor((curTools) => (curTools === prev.exerciseId ? null : curTools));
-        setExpandedId((curExpanded) => (curExpanded === prev.exerciseId ? null : curExpanded));
-        return null;
-      }
-      return effect.next ? { ...prev, ...effect.next } : prev;
-    });
-    if (mapped.kind !== 'saved') {
-      pushToast('这次移除没有保存成功，记录仍保留。', 'error');
-    }
-  }, [
-    removeEx,
-    applyChange,
-    pushToast,
-    retryUnsavedDraftForReplace,
-    hasPendingDraft,
-    hasRawRisk,
-  ]);
-
   /**
    * 「上次表现」（V3-05 + V4-04 A）。
    * · 键 = 动作身份 + 计量口径：负重 +20kg 与辅助 70kg 不再互相冒充；
@@ -2917,6 +3179,94 @@ export function SessionPage({ sessionId }: { sessionId: string }) {
     }
     return map;
   }, [sessions, session]);
+
+  /* ── F10：补位（FLIP）与生命周期清理 ───────────────────────── */
+
+  /**
+   * 补位只在这一批「卡真的被移除」的重渲染里消费一次。
+   *
+   * 用 useLayoutEffect 而不是 useEffect：DOM 已经改动、但浏览器还没绘制，
+   * 在这里把反向位移写回去，用户第一帧看到的就是**旧位置**，不会先跳到终点。
+   * 失败路径不会有成员变化（错误横幅只会把卡片往下推），而 reflowShift 只接受
+   * 向上位移，因此失败时这里自然什么都不做 —— 不会出现假补位。
+   */
+  useLayoutEffect(() => {
+    const pending = pendingReflowRef.current;
+    if (!pending) return;
+    /**
+     * F10-FIX1：补位时机不能由"有卡向上移动"推断。
+     *
+     * 慢提交期间用户仍可折叠/展开记录、输入数值，列表本来就会动；
+     * 必须等**这一次删除的已提交快照**真的不含该对象（dissolveAttribution）才播放。
+     * `wait` 表示还没到那一帧（继续等，慢事务/排队都在这一类），
+     * `reject` 表示这次捕获已失效或变化与本删除无关（立即释放批次）。
+     */
+    const verdict = dissolveAttribution({
+      pending,
+      epoch: dissolveEpochRef.current,
+      session,
+    });
+    if (verdict === 'wait') return;
+    if (verdict === 'reject' || !canPlayDissolve(pending.epoch)) {
+      disarmReflowPending();
+      return;
+    }
+    const cleanup = applyReflowAnimation(pending.tops);
+    // 批次已经被这一次提交消费：无论有没有可动画的位移都要释放
+    disarmReflowPending();
+    if (!cleanup) return;
+    cancelReflow();
+    reflowCleanupRef.current = cleanup;
+  }, [session, canPlayDissolve, cancelReflow, disarmReflowPending]);
+
+  /**
+   * 卸载 / 切 session / 页面隐藏 / 失锁：一律收尾。
+   * epoch 递增让**迟到的**保存回调无法再向当前页面注入效果。
+   */
+  useEffect(() => {
+    dissolveEpochRef.current += 1;
+    resetDissolve();
+    const onVisibility = () => {
+      // 隐藏：不仅收掉正在播的效果，还要让**已开始的捕获**作废（晚到的 saved 不得复活）
+      if (document.visibilityState !== 'visible') invalidateFeedback();
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibility);
+      dissolveEpochRef.current += 1;
+      resetDissolve();
+      dissolvePlayedRef.current.clear();
+    };
+  }, [sessionId, resetDissolve, invalidateFeedback]);
+
+  /* ── F11：删除成功音/准备触感的页面归属与开关 ───────────────── */
+
+  /**
+   * 绑定当前页面所属 session。
+   *
+   * 卸载、换 session 都会解绑并递增世代：慢事务的 saved 晚到时，
+   * 那条意图已经属于"旧页面"，模块内部核对归属后**不会**响。
+   */
+  useEffect(() => {
+    bindDeleteFeedback(sessionId);
+    return () => invalidateDeleteFeedback('session-unbind');
+  }, [sessionId]);
+
+  /**
+   * 音效开关跟随设置（默认开启）。
+   *
+   * 关闭会立刻停止/作废尚未播放的那一次；重新打开不会补播已错过的删除，
+   * 因为成功音只属于它自己那次真实提交。
+   */
+  const soundEnabled = settings.soundEnabled !== false;
+  useEffect(() => {
+    setDeleteFeedbackEnabled(soundEnabled);
+  }, [soundEnabled]);
+
+  useEffect(() => {
+    // 失锁：本页已不可写，同样让已开始的反馈捕获失效（恢复可见/重新持锁都不复活旧意图）
+    if (lockBlocked) invalidateFeedback();
+  }, [lockBlocked, invalidateFeedback]);
 
   // ⚠ 所有 hook 必须在任何 early return 之前，否则 session 状态变化会导致
   // hook 数量不一致（React #300）。这个 effect 原来是放在 return 之后的，已上移。
@@ -2969,7 +3319,6 @@ export function SessionPage({ sessionId }: { sessionId: string }) {
   /** 本次训练的有氧项目（力量追加与独立有氧共用同一结构） */
   const sessionCardio = session.cardio ?? [];
   const toolsEx = session.exercises.find((e) => e.id === toolsFor);
-  const libraryResults = addQuery.trim() ? searchExercises(addQuery) : EXERCISE_LIBRARY.slice(0, 12);
 
   async function finish() {
     if (!session) return;
@@ -3360,7 +3709,11 @@ export function SessionPage({ sessionId }: { sessionId: string }) {
       ) : null}
 
       {/* 动作 */}
-      <div style={{ marginTop: 6 }}>
+      <div style={{ marginTop: 6, position: 'relative' }} data-reorder-zone="strength">
+        {/* F10：消散层是分区容器的第一个子节点（真实卡按 DOM 顺序画在它上面，
+            补位上来的邻卡会盖住正在消散的幽灵 —— 不遮挡邻卡内容）。
+            只在真实删除保存成功后出现；absolute、不参与布局与滚动范围。 */}
+        <DeleteDissolveLayer ghosts={dissolveGhosts.filter((g) => g.kind === 'exercise')} />
         {session.exercises.map((ex, i) => (
           <div key={ex.id}>
             <ExerciseCard
@@ -3378,6 +3731,9 @@ export function SessionPage({ sessionId }: { sessionId: string }) {
               latestRef={latestRef}
               timer={timer}
               onOpenTools={() => setToolsFor(ex.id)}
+              onEditExercise={() => openEditEditor(ex.id)}
+              onDeleteExercise={() => requestDeleteItem(ex.id)}
+              deleteRequiresConfirm={() => checkDeleteRequiresConfirm(ex.id)}
               onRequestRemoveRound={(id) => {
                 pendingRemoveRound.current = id;
                 setConfirmRemoveRoundOpen(true);
@@ -3390,6 +3746,9 @@ export function SessionPage({ sessionId }: { sessionId: string }) {
               rawResetToken={rawResetEpochs[ex.id] ?? 0}
               hasRawRisk={hasRawRisk(ex.id)}
               onDiscardRawDraft={() => discardRawDrafts(ex.id)}
+              reorderIds={strengthIds}
+              drag={dragSnapshot && dragSnapshot.kind === 'strength' ? dragSnapshot : null}
+              onReorderCommit={(ordered, startIds) => void commitReorder('strength', ordered, startIds)}
             />
           </div>
         ))}
@@ -3412,23 +3771,50 @@ export function SessionPage({ sessionId }: { sessionId: string }) {
           )}
         </div>
 
-        {sessionCardio.map((entry) => (
-          <CardioPanel
+        <div style={{ position: 'relative' }} data-reorder-zone="cardio">
+        {/* F10：有氧分区同一套局部消散（同样画在卡片之下、不参与布局） */}
+        <DeleteDissolveLayer ghosts={dissolveGhosts.filter((g) => g.kind === 'cardio')} />
+        {sessionCardio.map((entry, i) => (
+          <SwipeActionCard
             key={entry.id}
-            entry={entry}
+            testId={`cardio-card-${entry.id}`}
+            reorderId={entry.id}
+            reorderKind="cardio"
+            reorderIndex={i}
+            reorderIds={cardioIds}
+            drag={dragSnapshot && dragSnapshot.kind === 'cardio' ? dragSnapshot : null}
+            onReorderCommit={(ordered, startIds) => void commitReorder('cardio', ordered, startIds)}
+            /**
+             * F07：有氧左滑**只保留删除**。原来的「编辑」只是 scrollIntoView，
+             * 对用户没有实际编辑作用，还占掉一半操作区形成蓝色空位；
+             * 这里不传 onEdit，操作层按单按钮宽度渲染，不留蓝色空位。
+             * 有氧的参数/分段/滑杆/计时入口仍在卡片内容里原位可用。
+             */
+            onDelete={() => requestDeleteItem(entry.id)}
+            deleteRequiresConfirm={() => checkDeleteRequiresConfirm(entry.id)}
             disabled={inputPaused}
-            pushToast={pushToast}
-            registerFlush={registerCardioFlush}
-            apply={(fn) =>
-              applyChange((prev) => {
-                const cur = (prev.cardio ?? []).find((c) => c.id === entry.id);
-                if (!cur) return prev;
-                // fn 收到**最新** entry 与 session；返回 null 表示拒绝（不改数据）
-                return fn(cur, prev) ?? prev;
-              })
-            }
-          />
+          >
+            <CardioPanel
+              entry={entry}
+              disabled={inputPaused}
+              pushToast={pushToast}
+              registerFlush={registerCardioFlush}
+              registerRawSignature={(getter) => {
+                const map = cardioRawSignatureGettersRef.current;
+                if (getter) map.set(entry.id, getter); else map.delete(entry.id);
+              }}
+              apply={(fn) =>
+                applyChange((prev) => {
+                  const cur = (prev.cardio ?? []).find((c) => c.id === entry.id);
+                  if (!cur) return prev;
+                  // fn 收到**最新** entry 与 session；返回 null 表示拒绝（不改数据）
+                  return fn(cur, prev) ?? prev;
+                })
+              }
+            />
+          </SwipeActionCard>
         ))}
+        </div>
 
         {!sessionCardio.length ? (
           <p style={{ fontSize: 13, color: 'var(--ink-3)', lineHeight: 1.65, marginTop: 6 }}>
@@ -3470,6 +3856,58 @@ export function SessionPage({ sessionId }: { sessionId: string }) {
         </div>
       </section>
 
+      {/*
+        F08：撤销从"列表末尾的文档流横幅"改为**固定在屏幕底部**、
+        导航/安全区之上的纵向堆叠（最新在最下面，最多 3 条高度，更多在区域内滚动）。
+        因此不再需要滚动到列表末尾，也不会随列表位置漂移。
+      */}
+      <UndoStack
+        items={deleteUndoStackItems}
+        undoneCount={deleteUndoneCount}
+        busy={deleteBusy}
+        onUndo={(token) => void undoDeleteEntry(token)}
+      />
+
+      {addFailed ? (
+        <div
+          data-testid="add-retry-bar"
+          style={{
+            marginTop: 12,
+            padding: '10px 12px',
+            background: 'var(--paper-3)',
+            borderLeft: '3px solid var(--brick)',
+            display: 'flex',
+            gap: 8,
+            alignItems: 'center',
+            flexWrap: 'wrap',
+          }}
+        >
+          <span style={{ fontSize: 13, flex: 1, minWidth: 180 }}>
+            「{addFailed.entry.exercise.name}」还没有保存成功；配置已保留，可重试。
+          </span>
+          <button
+            className="btn btn-sm btn-primary"
+            data-testid="add-retry"
+            disabled={addRetryBusy}
+            aria-busy={addRetryBusy}
+            onClick={() => {
+              if (addRetryBusy) return;
+              setAddRetryBusy(true);
+              void commitAddExercise(addFailed.entry, addFailed.payload).finally(() => setAddRetryBusy(false));
+            }}
+          >
+            {addRetryBusy ? '重试中…' : '重试添加'}
+          </button>
+          <button
+            className="btn btn-sm btn-ghost"
+            data-testid="add-retry-discard"
+            onClick={() => { setAddFailed(null); addCommitRef.current = null; }}
+          >
+            放弃
+          </button>
+        </div>
+      ) : null}
+
       <div style={{ display: 'flex', gap: 8, marginTop: 16 }}>
         <button
           className="btn btn-ghost"
@@ -3479,8 +3917,7 @@ export function SessionPage({ sessionId }: { sessionId: string }) {
               pausedNotice();
               return;
             }
-            setPicker({ mode: 'add' });
-            setAddQuery('');
+            setAddNameOpen(true);
           }}
           disabled={inputPaused}
         >
@@ -3517,60 +3954,6 @@ export function SessionPage({ sessionId }: { sessionId: string }) {
       <Sheet open={!!toolsEx} title={toolsEx ? toolsEx.name : ''} onClose={() => setToolsFor(null)}>
         {toolsEx ? (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-            <div style={{ display: 'flex', gap: 8 }}>
-              <button
-                className="btn btn-ghost"
-                style={{ flex: 1 }}
-                disabled={session.exercises.findIndex((e) => e.id === toolsEx.id) === 0}
-                onClick={() => applyChange((prev) => moveExercise(prev, toolsEx.id, -1))}
-              >
-                ↑ 上移
-              </button>
-              <button
-                className="btn btn-ghost"
-                style={{ flex: 1 }}
-                disabled={session.exercises.findIndex((e) => e.id === toolsEx.id) === session.exercises.length - 1}
-                onClick={() => applyChange((prev) => moveExercise(prev, toolsEx.id, 1))}
-              >
-                ↓ 下移
-              </button>
-            </div>
-            <button
-              className="btn btn-ghost"
-              style={{ width: '100%' }}
-              onClick={() => {
-                // C01 路径 B：训练中调整训练形式（只影响本次）
-                setConvertFor(toolsEx.id);
-                // V3-05：从普通组转递减时要保留负重模式与哑铃单只/合计
-                setConvertDraft(
-                  toolsEx.target.kind === 'dropSet'
-                    ? dropTargetToDraft(toolsEx.target)
-                    : straightToDropDraft(toolsEx.target),
-                );
-                setConvertForm(toolsEx.target.kind === 'dropSet' ? 'dropSet' : 'straight');
-                // 组数初值：递减组按轮数，普通组按组数（用户可改，且会被真正使用）
-                setConvertStraightSets(
-                  toolsEx.target.kind === 'dropSet' ? toolsEx.target.rounds : toolsEx.target.sets,
-                );
-                setConvertError(null);
-                convertFormApi.resetAll();
-                setToolsFor(null);
-              }}
-            >
-              调整训练形式（普通组 / 递减组）
-            </button>
-            <button
-              className="btn btn-ghost"
-              style={{ width: '100%' }}
-              onClick={() => {
-                // 关键：把「要替换谁」明确带进选择状态，而不是清空后当成新增
-                setPicker({ mode: 'replace', sessionExerciseId: toolsEx.id });
-                setAddQuery('');
-                setToolsFor(null);
-              }}
-            >
-              用另一个动作替换
-            </button>
             <button
               className="btn btn-ghost"
               style={{ width: '100%' }}
@@ -3598,41 +3981,6 @@ export function SessionPage({ sessionId }: { sessionId: string }) {
             >
               重置为未完成
             </button>
-            {toolsEx.replacedFrom ? (
-              <button
-                className="btn btn-ghost"
-                style={{ width: '100%' }}
-                onClick={() => {
-                  /**
-                   * 预审反馈 1：「恢复原动作」也是**真正的动作替换**，
-                   * 必须与「用另一个动作替换」走同一个确认步骤（组数/休息），
-                   * 不能绕过配置 Sheet 直接调用领域函数。
-                   * 取消 → 不改变本次训练。
-                   */
-                  const prevName = toolsEx.replacedFrom!;
-                  openReplaceConfig(toolsEx.id, prevName);
-                  setToolsFor(null);
-                }}
-              >
-                恢复原动作「{toolsEx.replacedFrom}」
-              </button>
-            ) : null}
-            {/*
-              问题三：整项动作移除入口。
-              与「跳过剩余组」严格区分：跳过保留记录，移除才真正把这一项移出本次训练。
-              有实际输入/记录时不会直接移除，确认层会说明原因并指引「跳过剩余组」。
-            */}
-            <button
-              className="btn btn-ghost"
-              style={{ width: '100%', color: 'var(--brick)' }}
-              onClick={() => {
-                const id = toolsEx.id;
-                openRemoveExercise(id);
-                setToolsFor(null);
-              }}
-            >
-              从本次训练移除这个动作
-            </button>
             <p style={{ fontSize: 13, color: 'var(--ink-3)', lineHeight: 1.6, margin: '4px 0 0' }}>
               这里的改动只影响本次训练，不会改计划。需要长期修改请到「计划」页。
             </p>
@@ -3640,1032 +3988,6 @@ export function SessionPage({ sessionId }: { sessionId: string }) {
         ) : null}
       </Sheet>
 
-      {/* 动作选择弹层：add / replace 意图明确，取消不改变训练 */}
-      <Sheet
-        open={picker !== null}
-        title={picker?.mode === 'replace' ? '替换为' : '添加动作'}
-        onClose={() => {
-          setPicker(null);
-          setAddQuery('');
-        }}
-        autoFocusPanel={false}
-      >
-        <input
-          className="input"
-          placeholder="搜索或输入新动作名"
-          value={addQuery}
-          onChange={(e) => setAddQuery(e.target.value)}
-          aria-label="搜索动作"
-          autoComplete="off"
-          autoCorrect="off"
-          autoCapitalize="off"
-          spellCheck={false}
-          enterKeyHint="search"
-        />
-        {picker?.mode === 'replace' ? (
-          <p style={{ fontSize: 13, color: 'var(--ink-3)', lineHeight: 1.6, margin: '8px 0 0' }}>
-            将替换「{session.exercises.find((e) => e.id === picker.sessionExerciseId)?.name ?? ''}」，动作位置不变。
-            若该动作已有实际记录，原记录会保留，只替换剩余未完成部分。
-          </p>
-        ) : null}
-        <div style={{ maxHeight: '46dvh', overflow: 'auto', marginTop: 10 }}>
-          {libraryResults.map((lib) => (
-            <button
-              key={lib.name}
-              className="row"
-              style={{ borderBottom: '1px dashed var(--rule)', alignItems: 'flex-start', minHeight: 52 }}
-              onClick={() => {
-                const intent = picker;
-                if (!intent) return;
-                if (intent.mode === 'replace') {
-                  // 需求 1：先进入「确认组数与休息」步骤，确认后才真正替换
-                  openReplaceConfig(intent.sessionExerciseId, lib.name);
-                } else {
-                  /**
-                   * 问题二：**先配置**组数/每组目标次数/组间休息，确认后才添加。
-                   * 这里只准备配置草稿，不写 session；取消不产生任何动作。
-                   */
-                  openAddConfig(lib.name);
-                }
-                setPicker(null);
-                setAddQuery('');
-              }}
-            >
-              <span className="row-main" style={{ minWidth: 0 }}>
-                <span className="row-title" style={{ display: 'block', whiteSpace: 'normal' }}>
-                  {lib.name}
-                </span>
-                <span className="row-sub" style={{ display: 'block', marginTop: 3 }}>
-                  {lib.group}
-                </span>
-              </span>
-            </button>
-          ))}
-        </div>
-        {addQuery.trim() && !libraryResults.some((x) => x.name === addQuery.trim()) ? (
-          <button
-            className="btn btn-primary"
-            style={{ width: '100%', marginTop: 10 }}
-            onClick={() => {
-              const name = addQuery.trim();
-              const intent = picker;
-              if (!intent) return;
-              if (intent.mode === 'replace') {
-                // 需求 1：自定义名称同样先走确认步骤
-                openReplaceConfig(intent.sessionExerciseId, name);
-              } else {
-                // 问题二：自定义名称走**同一个**配置步骤
-                openAddConfig(name);
-              }
-              setPicker(null);
-              setAddQuery('');
-            }}
-          >
-            使用「{addQuery.trim()}」
-          </button>
-        ) : null}
-      </Sheet>
-
-      {/* 问题二：添加动作前先配置组数 / 每组目标次数 / 组间休息（取消不改变训练） */}
-      <Sheet
-        open={addConfig !== null}
-        title="添加动作的设置"
-        onClose={() => closeAddConfig('user')}
-        autoFocusPanel={false}
-      >
-        {addConfig ? (
-          (() => {
-            const locked = addConfig.phase === 'submitting' || addConfig.submitted;
-            const atCapacity = session.exercises.length >= MAX_EXERCISES;
-            return (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                <p style={{ fontSize: 14, lineHeight: 1.65, margin: 0 }}>
-                  添加「{addConfig.intent.name}」。先设定这次训练的组数、每组目标次数和组间休息。
-                </p>
-                <div
-                  style={{
-                    padding: '8px 10px',
-                    background: 'var(--paper-3)',
-                    borderLeft: '3px solid var(--warn)',
-                    fontSize: 12.5,
-                    lineHeight: 1.6,
-                  }}
-                >
-                  只影响本次训练，不会改计划。目标次数只是目标，实际次数留空由你记录。
-                </div>
-
-                {atCapacity ? (
-                  <div role="alert" style={{ color: 'var(--brick)', fontSize: 12.5, lineHeight: 1.6 }}>
-                    本次训练已经有 {MAX_EXERCISES} 个动作，达到上限（备份也只支持这个范围）。
-                    请先移除或合并动作，再添加。
-                  </div>
-                ) : null}
-
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0,1fr))', gap: 8 }}>
-                  <DraftNumberField
-                    label="组数"
-                    value={addConfig.draft.sets}
-                    min={1}
-                    max={MAX_STRAIGHT_SETS}
-                    form={addConfigFormApi}
-                    fieldId="addcfg.sets"
-                    disabled={locked}
-                    onCommit={(v) =>
-                      setAddConfig((prev) =>
-                        prev && !isStaleExerciseCommit(prev.sessionId, prev.commitId, prev)
-                          ? { ...prev, draft: { ...prev.draft, sets: v } }
-                          : prev,
-                      )
-                    }
-                  />
-                  <DraftNumberField
-                    label="组间休息"
-                    value={addConfig.draft.restSec}
-                    min={0}
-                    max={MAX_REST}
-                    unit="秒"
-                    form={addConfigFormApi}
-                    fieldId="addcfg.rest"
-                    disabled={locked}
-                    onCommit={(v) =>
-                      setAddConfig((prev) =>
-                        prev ? { ...prev, draft: { ...prev.draft, restSec: v } } : prev,
-                      )
-                    }
-                  />
-                </div>
-
-                {/* 每组目标次数：两输入 + 分隔 + 只出现一次「次」；窄屏不挤成四列 */}
-                <div>
-                  <div
-                    style={{
-                      fontSize: 12,
-                      color: 'var(--ink-3)',
-                      marginBottom: 6,
-                      letterSpacing: '0.02em',
-                    }}
-                  >
-                    每组目标次数
-                  </div>
-                  <div
-                    style={{
-                      display: 'grid',
-                      gridTemplateColumns: 'minmax(0,1fr) auto minmax(0,1fr) auto',
-                      alignItems: 'center',
-                      gap: 8,
-                    }}
-                  >
-                    <DraftNumberField
-                      label="次数下限"
-                      value={addConfig.draft.repsMin}
-                      min={0}
-                      max={MAX_REPS}
-                      form={addConfigFormApi}
-                      fieldId="addcfg.repsMin"
-                      disabled={locked}
-                      onCommit={(v) =>
-                        setAddConfig((prev) =>
-                          prev ? { ...prev, draft: { ...prev.draft, repsMin: v } } : prev,
-                        )
-                      }
-                    />
-                    <span style={{ color: 'var(--ink-4)', fontSize: 14 }} aria-hidden="true">
-                      —
-                    </span>
-                    <DraftNumberField
-                      label="次数上限"
-                      value={addConfig.draft.repsMax}
-                      min={0}
-                      max={MAX_REPS}
-                      form={addConfigFormApi}
-                      fieldId="addcfg.repsMax"
-                      disabled={locked}
-                      onCommit={(v) =>
-                        setAddConfig((prev) =>
-                          prev ? { ...prev, draft: { ...prev.draft, repsMax: v } } : prev,
-                        )
-                      }
-                    />
-                    <span style={{ fontSize: 13, color: 'var(--ink-3)' }}>次</span>
-                  </div>
-                  <p style={{ fontSize: 11.5, color: 'var(--ink-4)', lineHeight: 1.6, margin: '6px 0 0' }}>
-                    固定次数可把上下限填成相同值；默认 3 组 × 8–12 次、休息 120 秒。
-                  </p>
-                </div>
-
-                {addConfigError ? (
-                  <div role="alert" style={{ color: 'var(--brick)', fontSize: 12.5, lineHeight: 1.6 }}>
-                    {addConfigError}
-                  </div>
-                ) : null}
-
-                {addConfig.phase === 'failed' && addConfig.submitted ? (
-                  <div
-                    style={{
-                      padding: '8px 10px',
-                      background: 'var(--paper-3)',
-                      borderLeft: '3px solid var(--brick)',
-                      fontSize: 12.5,
-                      lineHeight: 1.65,
-                    }}
-                  >
-                    这次添加已记在本页，但还没写进本机。可以重试保存；重试不会重复添加动作。
-                  </div>
-                ) : null}
-
-                <button
-                  className="btn btn-primary"
-                  style={{ width: '100%' }}
-                  disabled={addConfig.phase === 'submitting' || atCapacity}
-                  aria-busy={addConfig.phase === 'submitting'}
-                  onClick={() => void confirmAdd()}
-                >
-                  {addConfig.phase === 'submitting'
-                    ? '正在保存…'
-                    : addConfig.phase === 'failed' && addConfig.submitted
-                      ? '重试保存这次添加'
-                      : '确认添加'}
-                </button>
-                {addConfig.phase === 'failed' && addConfig.submitted ? (
-                  <button
-                    className="btn btn-ghost"
-                    style={{ width: '100%' }}
-                    disabled={isCommittedBusy}
-                    onClick={() => {
-                      // 复用既有「放弃这份改动」语义（唯一允许丢弃用户输入的入口）
-                      discardPendingDraft();
-                      closeAddConfig('settled');
-                    }}
-                  >
-                    放弃这份改动
-                  </button>
-                ) : (
-                  <button
-                    className="btn btn-ghost"
-                    style={{ width: '100%' }}
-                    disabled={addConfig.phase === 'submitting'}
-                    onClick={() => closeAddConfig('user')}
-                  >
-                    取消
-                  </button>
-                )}
-              </div>
-            );
-          })()
-        ) : null}
-      </Sheet>
-
-      {/* 问题三：从本次训练移除整个动作（按 ID，确认后才移除） */}
-      <Sheet
-        open={removeEx !== null}
-        title="从本次训练移除"
-        onClose={() => closeRemoveExercise('user')}
-        autoFocusPanel={false}
-      >
-        {removeEx ? (
-          (() => {
-            const cur = session.exercises.find((e) => e.id === removeEx.exerciseId);
-            // submitted 是已经形成的删除意图，不是仍在途；重试必须可进入 retry-save-only。
-            const locked = removeEx.phase === 'submitting' || removeEx.submitted;
-            if (!cur) {
-              return (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                  <p style={{ fontSize: 14, lineHeight: 1.65, margin: 0 }}>
-                    「{removeEx.name}」已经不在本次训练里了
-                    {removeEx.submitted ? '，这次移除可能已经保存。' : '。'}
-                  </p>
-                  <button
-                    className="btn btn-primary"
-                    style={{ width: '100%' }}
-                    disabled={isCommittedBusy}
-                    onClick={() => closeRemoveExercise('user')}
-                  >
-                    关闭
-                  </button>
-                </div>
-              );
-            }
-            const protection = exerciseRemovalProtection(cur, { hasRawDraft: hasRawRisk(removeEx.exerciseId) });
-            return (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                <p style={{ margin: 0, fontSize: 14, lineHeight: 1.65, overflowWrap: 'anywhere' }}>
-                  要从本次训练移除「{cur.name}」吗？
-                </p>
-                <div
-                  style={{
-                    padding: '8px 10px',
-                    background: 'var(--paper-3)',
-                    borderLeft: `3px solid ${protection.protected ? 'var(--brick)' : 'var(--warn)'}`,
-                    fontSize: 12.5,
-                    lineHeight: 1.65,
-                  }}
-                >
-                  {protection.protected ? (
-                    <>
-                      <strong>这个动作已经有记录，不能直接移除。</strong>
-                      <div style={{ marginTop: 4 }}>
-                        原因：{protection.reasons.join('、')}。
-                      </div>
-                      <div style={{ marginTop: 4 }}>
-                        记录会保留。如果只是不想继续做，可以用工具里的「跳过剩余组」。
-                      </div>
-                    </>
-                  ) : (
-                    <>
-                      只移除这次训练里的这一项动作，其他动作、原计划和历史记录都不变。
-                      没有实际输入或记录，可以安全移除。
-                    </>
-                  )}
-                </div>
-
-                {removeError ? (
-                  <div role="alert" style={{ color: 'var(--brick)', fontSize: 12.5, lineHeight: 1.6 }}>
-                    {removeError}
-                  </div>
-                ) : null}
-
-                {removeEx.phase === 'failed' && removeEx.submitted ? (
-                  <div
-                    style={{
-                      padding: '8px 10px',
-                      background: 'var(--paper-3)',
-                      borderLeft: '3px solid var(--brick)',
-                      fontSize: 12.5,
-                      lineHeight: 1.65,
-                    }}
-                  >
-                    这次移除已记在本页，但还没写进本机。可以重试保存；记录暂时仍在。
-                  </div>
-                ) : null}
-
-                <div style={{ display: 'flex', gap: 10 }}>
-                  <button
-                    className="btn btn-ghost"
-                    style={{ flex: 1 }}
-                    disabled={locked}
-                    onClick={() => closeRemoveExercise('user')}
-                  >
-                    取消
-                  </button>
-                  <button
-                    className="btn btn-danger"
-                    style={{ flex: 1 }}
-                    disabled={removeEx.phase === 'submitting' || (protection.protected && !removeEx.submitted)}
-                    aria-busy={removeEx.phase === 'submitting'}
-                    onClick={() => void confirmRemoveExercise()}
-                  >
-                    {removeEx.phase === 'submitting'
-                      ? '正在移除…'
-                      : removeEx.phase === 'failed' && removeEx.submitted
-                        ? '重试保存这次移除'
-                        : '确认移除'}
-                  </button>
-                </div>
-                {removeEx.phase === 'failed' && removeEx.submitted ? (
-                  <button
-                    className="btn btn-ghost"
-                    style={{ width: '100%' }}
-                    disabled={isCommittedBusy}
-                    onClick={() => {
-                      discardPendingDraft();
-                      closeRemoveExercise('settled');
-                    }}
-                  >
-                    放弃这份改动
-                  </button>
-                ) : null}
-              </div>
-            );
-          })()
-        ) : null}
-      </Sheet>
-
-      {/* 需求 1：替换后确认组数与休息（只影响本次训练，取消不改变训练） */}
-      <Sheet
-        open={replaceConfig !== null}
-        title="替换后的设置"
-        onClose={() => closeReplaceConfig('user')}
-        autoFocusPanel={false}
-      >
-        {replaceConfig ? (
-          (() => {
-            const origin = session.exercises.find((e) => e.id === replaceConfig.sessionExerciseId);
-            /**
-             * REVIEW-1 #7：origin 可能已经不在（另一处已保存过替换）。
-             * 旧实现直接 return null → 弹层变空白，错误与恢复入口一起消失。
-             * 现在保留必要快照显示，并给出明确的可操作出口。
-             */
-            if (!origin) {
-              return (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                  <p style={{ fontSize: 14, lineHeight: 1.65, margin: 0 }}>
-                    原动作「{replaceConfig.originName}」已经不在本次训练里了
-                    {replaceConfig.submitted ? '，这次替换可能已经保存。' : '。'}
-                  </p>
-                  <p style={{ fontSize: 12.5, color: 'var(--ink-3)', lineHeight: 1.6, margin: 0 }}>
-                    替换为「{replaceConfig.name}」{replaceConfig.submitted ? '（已提交，等待保存）' : ''}。
-                    {replaceConfig.submitted
-                      ? ' 可以先重试保存这份改动；如果确实不需要，选择放弃。'
-                      : ' 关闭后可以重新发起一次替换。'}
-                  </p>
-                  {/*
-                    REVIEW-2 #3：这个分支此前不渲染 replaceError，
-                    真实重试失败（例如失锁）后弹层只显示"可能已保存"，
-                    用户看不到失败原因。现在把真实错误与忙态一并显示。
-                  */}
-                  {replaceConfig.phase === 'submitting' ? (
-                    <div role="status" style={{ fontSize: 12.5, color: 'var(--ink-3)' }}>
-                      正在保存这次替换…
-                    </div>
-                  ) : null}
-                  {replaceError ? (
-                    <div
-                      role="alert"
-                      style={{
-                        padding: '8px 10px',
-                        background: 'var(--paper-3)',
-                        borderLeft: '3px solid var(--brick)',
-                        fontSize: 12.5,
-                        lineHeight: 1.65,
-                        color: 'var(--brick)',
-                      }}
-                    >
-                      {replaceError}
-                    </div>
-                  ) : null}
-                  {replaceConfig.submitted ? (
-                    <>
-                      <button
-                        className="btn btn-primary"
-                        style={{ width: '100%' }}
-                        disabled={replaceConfig.phase === 'submitting'}
-                        onClick={() => void confirmReplace()}
-                      >
-                        {replaceConfig.phase === 'submitting' ? '正在保存…' : '重试保存这次替换'}
-                      </button>
-                      <button
-                        className="btn btn-ghost"
-                        style={{ width: '100%' }}
-                        disabled={isCommittedBusy}
-                        onClick={() => {
-                          discardPendingDraft();
-                          closeReplaceConfig('settled');
-                        }}
-                      >
-                        放弃这份改动
-                      </button>
-                    </>
-                  ) : (
-                    <button
-                      className="btn btn-primary"
-                      style={{ width: '100%' }}
-                      onClick={() => closeReplaceConfig('user')}
-                    >
-                      关闭
-                    </button>
-                  )}
-                </div>
-              );
-            }
-            const isDrop = origin.target.kind === 'dropSet';
-            const maxGroups = isDrop ? MAX_ROUNDS : MAX_STRAIGHT_SETS;
-            return (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                <p style={{ fontSize: 14, lineHeight: 1.65, margin: 0 }}>
-                  把「{origin.name}」剩余未开始的部分替换为「{replaceConfig.name}」。
-                </p>
-                <div
-                  style={{
-                    padding: '8px 10px',
-                    background: 'var(--paper-3)',
-                    borderLeft: '3px solid var(--warn)',
-                    fontSize: 12.5,
-                    lineHeight: 1.6,
-                  }}
-                >
-                  已记录的原动作数据继续归属「{origin.name}」，不会被删除、改名或归到新动作。
-                  这里只改本次训练，不会回写计划。
-                </div>
-
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0,1fr))', gap: 8 }}>
-                  <DraftNumberField
-                    label={isDrop ? '轮数' : '组数'}
-                    value={replaceConfig.sets}
-                    min={1}
-                    max={maxGroups}
-                    form={replaceFormApi}
-                    fieldId="replace.sets"
-                    disabled={replaceConfig.phase === 'submitting' || replaceConfig.submitted}
-                    onCommit={(v) => setReplaceConfig((prev) => (prev ? { ...prev, sets: v } : prev))}
-                  />
-                  <DraftNumberField
-                    label="休息秒"
-                    value={replaceConfig.restSec}
-                    min={0}
-                    max={MAX_REST}
-                    unit="秒"
-                    form={replaceFormApi}
-                    fieldId="replace.rest"
-                    disabled={replaceConfig.phase === 'submitting' || replaceConfig.submitted}
-                    onCommit={(v) => setReplaceConfig((prev) => (prev ? { ...prev, restSec: v } : prev))}
-                  />
-                </div>
-
-                <p style={{ fontSize: 12.5, color: 'var(--ink-3)', lineHeight: 1.6, margin: 0 }}>
-                  {isDrop
-                    ? '轮数指新动作本次要做的轮数；阶段结构沿用原动作，这里改的是「完成整轮后」的休息。'
-                    : '组数指新动作本次要做的组数，不是原动作剩下的组数。'}
-                </p>
-
-                {/*
-                  B4 用户新增：**每组目标次数**。
-                  布局原则（保持美观）：组数/休息两列在上，次数范围单独一行，
-                  两输入 + 分隔 + 只出现一次「次」；窄屏不挤成四列。
-                */}
-                {replaceConfig.reps.kind === 'straight' ? (
-                  <div>
-                    <div
-                      style={{
-                        fontSize: 12,
-                        color: 'var(--ink-3)',
-                        marginBottom: 6,
-                        letterSpacing: '0.02em',
-                      }}
-                    >
-                      每组目标次数
-                    </div>
-                    <div
-                      style={{
-                        display: 'grid',
-                        gridTemplateColumns: 'minmax(0,1fr) auto minmax(0,1fr) auto',
-                        alignItems: 'center',
-                        gap: 8,
-                      }}
-                    >
-                      <DraftNumberField
-                        label="次数下限"
-                        value={replaceConfig.reps.repsMin}
-                        min={0}
-                        max={MAX_REPS}
-                        form={replaceFormApi}
-                        fieldId="replace.repsMin"
-                        disabled={replaceConfig.phase === 'submitting' || replaceConfig.submitted}
-                        onCommit={(v) =>
-                          setReplaceConfig((prev) =>
-                            prev && prev.reps.kind === 'straight'
-                              ? { ...prev, reps: { ...prev.reps, repsMin: v } }
-                              : prev,
-                          )
-                        }
-                      />
-                      <span style={{ color: 'var(--ink-4)', fontSize: 14 }} aria-hidden="true">
-                        —
-                      </span>
-                      <DraftNumberField
-                        label="次数上限"
-                        value={replaceConfig.reps.repsMax}
-                        min={0}
-                        max={MAX_REPS}
-                        form={replaceFormApi}
-                        fieldId="replace.repsMax"
-                        disabled={replaceConfig.phase === 'submitting' || replaceConfig.submitted}
-                        onCommit={(v) =>
-                          setReplaceConfig((prev) =>
-                            prev && prev.reps.kind === 'straight'
-                              ? { ...prev, reps: { ...prev.reps, repsMax: v } }
-                              : prev,
-                          )
-                        }
-                      />
-                      <span style={{ fontSize: 13, color: 'var(--ink-3)' }}>次</span>
-                    </div>
-                    <p
-                      style={{
-                        fontSize: 11.5,
-                        color: 'var(--ink-4)',
-                        lineHeight: 1.6,
-                        margin: '6px 0 0',
-                      }}
-                    >
-                      固定次数可把上下限填成相同值；默认沿用原动作本次的目标。
-                    </p>
-                  </div>
-                ) : (
-                  <details style={{ marginTop: 2 }}>
-                    <summary
-                      style={{
-                        fontSize: 12.5,
-                        color: 'var(--ink-2)',
-                        cursor: 'pointer',
-                        lineHeight: 1.6,
-                      }}
-                    >
-                      每轮各阶段目标（{replaceConfig.reps.stages.length} 个阶段）
-                      <span style={{ color: 'var(--ink-4)', marginLeft: 6 }}>
-                        {replaceConfig.reps.stages
-                          .map((st) =>
-                            st.toFailure
-                              ? '力竭'
-                              : st.repsMin !== null && st.repsMax !== null
-                                ? st.repsMin === st.repsMax
-                                  ? `${st.repsMin}`
-                                  : `${st.repsMin}–${st.repsMax}`
-                                : '—',
-                          )
-                          .join(' / ')}
-                      </span>
-                    </summary>
-                    <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 10 }}>
-                      {replaceConfig.reps.stages.map((st, i) => (
-                        <div
-                          key={i}
-                          style={{
-                            paddingTop: i === 0 ? 0 : 10,
-                            borderTop: i === 0 ? 'none' : '1px solid var(--rule)',
-                          }}
-                        >
-                          <div
-                            style={{
-                              display: 'flex',
-                              alignItems: 'baseline',
-                              justifyContent: 'space-between',
-                              gap: 8,
-                              fontSize: 12,
-                              color: 'var(--ink-3)',
-                              marginBottom: 6,
-                            }}
-                          >
-                            <span>第 {i + 1} 阶段</span>
-                            <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}>
-                              <input
-                                type="checkbox"
-                                checked={st.toFailure}
-                                disabled={replaceConfig.phase === 'submitting' || replaceConfig.submitted}
-                                onChange={(e) =>
-                                  setReplaceConfig((prev) =>
-                                    prev && prev.reps.kind === 'dropSet'
-                                      ? {
-                                          ...prev,
-                                          reps: {
-                                            ...prev.reps,
-                                            stages: prev.reps.stages.map((x, xi) =>
-                                              xi === i ? { ...x, toFailure: e.target.checked } : x,
-                                            ),
-                                          },
-                                        }
-                                      : prev,
-                                  )
-                                }
-                              />
-                              技术性力竭
-                            </label>
-                          </div>
-                          {st.toFailure ? (
-                            <p
-                              style={{
-                                fontSize: 11.5,
-                                color: 'var(--ink-4)',
-                                margin: 0,
-                                lineHeight: 1.6,
-                              }}
-                            >
-                              力竭阶段不设目标次数（实际仍会记录完成次数）。
-                            </p>
-                          ) : (
-                            <div
-                              style={{
-                                display: 'grid',
-                                gridTemplateColumns: 'minmax(0,1fr) auto minmax(0,1fr) auto',
-                                alignItems: 'center',
-                                gap: 8,
-                              }}
-                            >
-                              <DraftNumberField
-                                label={`第 ${i + 1} 阶段下限`}
-                                value={st.repsMin ?? 0}
-                                min={0}
-                                max={MAX_REPS}
-                                form={replaceFormApi}
-                                fieldId={`replace.stage${i}.repsMin`}
-                                disabled={replaceConfig.phase === 'submitting' || replaceConfig.submitted}
-                                onCommit={(v) =>
-                                  setReplaceConfig((prev) =>
-                                    prev && prev.reps.kind === 'dropSet'
-                                      ? {
-                                          ...prev,
-                                          reps: {
-                                            ...prev.reps,
-                                            stages: prev.reps.stages.map((x, xi) =>
-                                              xi === i ? { ...x, repsMin: v } : x,
-                                            ),
-                                          },
-                                        }
-                                      : prev,
-                                  )
-                                }
-                              />
-                              <span style={{ color: 'var(--ink-4)', fontSize: 14 }} aria-hidden="true">
-                                —
-                              </span>
-                              <DraftNumberField
-                                label={`第 ${i + 1} 阶段上限`}
-                                value={st.repsMax ?? 0}
-                                min={0}
-                                max={MAX_REPS}
-                                form={replaceFormApi}
-                                fieldId={`replace.stage${i}.repsMax`}
-                                disabled={replaceConfig.phase === 'submitting' || replaceConfig.submitted}
-                                onCommit={(v) =>
-                                  setReplaceConfig((prev) =>
-                                    prev && prev.reps.kind === 'dropSet'
-                                      ? {
-                                          ...prev,
-                                          reps: {
-                                            ...prev.reps,
-                                            stages: prev.reps.stages.map((x, xi) =>
-                                              xi === i ? { ...x, repsMax: v } : x,
-                                            ),
-                                          },
-                                        }
-                                      : prev,
-                                  )
-                                }
-                              />
-                              <span style={{ fontSize: 13, color: 'var(--ink-3)' }}>次</span>
-                            </div>
-                          )}
-                        </div>
-                      ))}
-                    </div>
-                  </details>
-                )}
-
-                {replaceError ? (
-                  <div role="alert" style={{ color: 'var(--brick)', fontSize: 12.5, lineHeight: 1.6 }}>
-                    {replaceError}
-                  </div>
-                ) : null}
-
-                {/* 失败/暂停时：直接在 Sheet 内给出可操作入口，避免被外层横幅遮住而锁死 */}
-                {replaceConfig.phase === 'failed' && replaceConfig.submitted ? (
-                  <div
-                    style={{
-                      padding: '8px 10px',
-                      background: 'var(--paper-3)',
-                      borderLeft: '3px solid var(--brick)',
-                      fontSize: 12.5,
-                      lineHeight: 1.65,
-                    }}
-                  >
-                    这次替换已记在本页，但还没写进本机。可以重试保存；若与另一页冲突，会提示而不会覆盖。
-                  </div>
-                ) : null}
-
-                {/*
-                  REVIEW-1 #7：failed 且 submitted=false 时（输入被暂停/只读），
-                  不能只给一个仍会被暂停挡住的"确认替换"。这里改成明确的处理入口。
-                */}
-                {replaceConfig.phase === 'failed' && !replaceConfig.submitted ? (
-                  <>
-                    <button
-                      className="btn btn-primary"
-                      style={{ width: '100%' }}
-                      disabled={isCommittedBusy}
-                      onClick={() => {
-                        // 有草稿：先在这里把草稿存进本机，存完再重新确认替换
-                        void (async () => {
-                          if (hasPendingDraft) {
-                            const r = await retryUnsavedDraftForReplace();
-                            if (!r.ok) {
-                              setReplaceError(`待存改动还没保存成功：${r.message}。可再试一次。`);
-                              return;
-                            }
-                          }
-                          // 草稿已处理：回到可编辑态，让用户重新确认
-                          setReplaceError(null);
-                          setReplaceConfig((prev) =>
-                            prev && prev.commitId === replaceConfig.commitId
-                              ? { ...prev, phase: 'editing', submitted: false }
-                              : prev,
-                          );
-                        })();
-                      }}
-                    >
-                      {hasPendingDraft ? '先保存待存改动，再确认替换' : '返回并重新确认'}
-                    </button>
-                    <button
-                      className="btn btn-ghost"
-                      style={{ width: '100%' }}
-                      onClick={() => closeReplaceConfig('user')}
-                    >
-                      关闭
-                    </button>
-                  </>
-                ) : (
-                  <button
-                    className="btn btn-primary"
-                    style={{ width: '100%' }}
-                    disabled={replaceConfig.phase === 'submitting'}
-                    aria-busy={replaceConfig.phase === 'submitting'}
-                    onClick={() => void confirmReplace()}
-                  >
-                    {replaceConfig.phase === 'submitting'
-                      ? '正在保存…'
-                      : replaceConfig.phase === 'failed' && replaceConfig.submitted
-                        ? '重试保存这次替换'
-                        : '确认替换'}
-                  </button>
-                )}
-                {replaceConfig.phase === 'failed' && replaceConfig.submitted ? (
-                  <button
-                    className="btn btn-ghost"
-                    style={{ width: '100%' }}
-                    disabled={isCommittedBusy}
-                    onClick={() => {
-                      // 复用既有「放弃这份改动」语义（唯一允许丢弃用户输入的入口）
-                      discardPendingDraft();
-                      closeReplaceConfig('settled');
-                    }}
-                  >
-                    放弃这份改动
-                  </button>
-                ) : (
-                  <button
-                    className="btn btn-ghost"
-                    style={{ width: '100%' }}
-                    disabled={replaceConfig.phase === 'submitting'}
-                    onClick={() => closeReplaceConfig('user')}
-                  >
-                    取消
-                  </button>
-                )}
-              </div>
-            );
-          })()
-        ) : null}
-      </Sheet>
-
-      {/* C01 路径 B：训练中调整训练形式（只影响本次训练） */}
-      <Sheet
-        open={!!convertFor}
-        title="调整训练形式"
-        onClose={() => setConvertFor(null)}
-        autoFocusPanel={false}
-      >
-        {convertFor ? (
-          (() => {
-            const target = session.exercises.find((e) => e.id === convertFor);
-            if (!target) return null;
-            const hasRecord = roundsOf(target).some((r) => !groupHasNoRecords(target, r));
-            return (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                <div className="segmented" role="group" aria-label="训练形式">
-                  <button aria-pressed={convertForm === 'straight'} onClick={() => setConvertForm('straight')}>
-                    普通组
-                  </button>
-                  <button aria-pressed={convertForm === 'dropSet'} onClick={() => setConvertForm('dropSet')}>
-                    递减组
-                  </button>
-                </div>
-
-                {hasRecord ? (
-                  <div
-                    style={{
-                      padding: '8px 10px',
-                      background: 'var(--paper-3)',
-                      borderLeft: '3px solid var(--warn)',
-                      fontSize: 12.5,
-                      lineHeight: 1.6,
-                    }}
-                  >
-                    这个动作已经有记录。转换只作用于**未开始**的组/轮，已记录的数据会保留。
-                  </div>
-                ) : null}
-
-                {convertForm === 'dropSet' ? (
-                  <DropSetEditor
-                    draft={convertDraft}
-                    onChange={setConvertDraft}
-                    form={convertFormApi}
-                    fieldPrefix="convert"
-                  />
-                ) : (
-                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0,1fr))', gap: 8 }}>
-                    <DraftNumberField
-                      label="组数"
-                      value={convertStraightSets}
-                      min={1}
-                      max={MAX_STRAIGHT_SETS}
-                      form={convertFormApi}
-                      fieldId="convert.sets"
-                      onCommit={(v) => setConvertStraightSets(v)}
-                    />
-                  </div>
-                )}
-
-                {convertError ? (
-                  <div role="alert" style={{ color: 'var(--brick)', fontSize: 12.5, lineHeight: 1.6 }}>
-                    {convertError}
-                  </div>
-                ) : null}
-
-                <button
-                  className="btn btn-primary"
-                  style={{ width: '100%' }}
-                  onClick={() => {
-                    /**
-                     * V4-03（修复 F4-I03）：flushAll 返回 values 之后，
-                     * **必须用 values 同步构造 nextDraft 局部变量**，不能继续读
-                     * convertDraft / convertStraightSets 这两个父 state ——
-                     * 「文本已是 5、state 还是 3」时那会存成 3。
-                     */
-                    const flushed = convertFormApi.flushAll();
-                    if (!flushed.ok) {
-                      setConvertError(`有字段还不合法：${Object.values(flushed.errors)[0]}`);
-                      return;
-                    }
-                    const nextDraft = mergeFlushedDropDraft(convertDraft, flushed.values, 'convert');
-                    const nextSets = mergeFlushedValues({ sets: convertStraightSets }, flushed.values, {
-                      sets: 'convert.sets',
-                    }).sets;
-                    if (convertForm === 'dropSet') {
-                      const found = validateDropDraft(nextDraft);
-                      if (found.length) {
-                        setConvertError(`递减组配置还有 ${found.length} 处需要修正：${found[0].message}`);
-                        return;
-                      }
-                    } else if (!Number.isInteger(nextSets) || nextSets < 1 || nextSets > MAX_STRAIGHT_SETS) {
-                      setConvertError(`组数必须是 1–${MAX_STRAIGHT_SETS} 的整数`);
-                      return;
-                    }
-                    setConvertError(null);
-                    const id = convertFor;
-                    if (convertForm === 'dropSet') {
-                      applyChange((prev) => {
-                        const r = convertExerciseToDropSet(prev, id, draftToDropTarget(nextDraft));
-                        if (!r.converted) {
-                          pushToast(r.message, 'error');
-                          return prev;
-                        }
-                        pushToast(r.message);
-                        return r.session;
-                      });
-                    } else {
-                      applyChange((prev) => {
-                        const cur = prev.exercises.find((e) => e.id === id);
-                        if (!cur) return prev;
-                        /**
-                         * V3-04：组数用用户输入（nextSets，来自 flush 的当前文本草稿），
-                         * 不再从旧 target 取。
-                         * V3-05：计量口径原样保留 —— weightMode / dumbbellBasis /
-                         * suggestedWeightKg 都从当前目标继承，不擅自改成 external。
-                         */
-                        const base = cur.target;
-                        const firstStage = base.kind === 'dropSet' ? base.stages[0] : undefined;
-                        const straight = {
-                          kind: 'straight' as const,
-                          sets: nextSets,
-                          setsMax: nextSets,
-                          repsMin: base.kind === 'dropSet' ? (firstStage?.repsMin ?? 8) : base.repsMin,
-                          repsMax: base.kind === 'dropSet' ? (firstStage?.repsMax ?? 12) : base.repsMax,
-                          weightMode: base.weightMode,
-                          dumbbellBasis: base.dumbbellBasis,
-                          suggestedWeightKg:
-                            base.kind === 'dropSet' ? (firstStage?.weightKg ?? null) : base.suggestedWeightKg,
-                        };
-                        const r = convertExerciseToStraight(prev, id, straight);
-                        if (!r.converted) {
-                          pushToast(r.message, 'error');
-                          return prev;
-                        }
-                        pushToast(r.message);
-                        return r.session;
-                      });
-                    }
-                    setConvertFor(null);
-                  }}
-                >
-                  {convertForm === 'dropSet' ? '应用递减组' : '应用普通组'}
-                </button>
-                <button
-                  className="btn btn-ghost"
-                  style={{ width: '100%' }}
-                  onClick={() => {
-                    // 取消：清草稿与错误，重新进入不残留 disabled
-                    convertFormApi.resetAll();
-                    setConvertError(null);
-                    setConvertFor(null);
-                  }}
-                >
-                  取消
-                </button>
-              </div>
-            );
-          })()
-        ) : null}
-      </Sheet>
-
-      {/* 结束摘要 */}
       <Sheet
         open={summaryOpen}
         title="结束训练"
@@ -4785,6 +4107,79 @@ export function SessionPage({ sessionId }: { sessionId: string }) {
           setConfirmRemoveRoundOpen(false);
           pendingRemoveRound.current = null;
         }}
+      />
+
+      <ExerciseNamePicker
+        open={addNameOpen}
+        templates={exerciseTemplates}
+        onSelect={handleAddName}
+        onClose={() => setAddNameOpen(false)}
+      />
+
+      {editorState ? (
+        <ExerciseEditor
+          key={editorState.key}
+          open
+          mode={editorState.mode}
+          initial={editorState.initial}
+          templates={exerciseTemplates}
+          templateError={exerciseTemplateError}
+          onSubmit={handleEditorSubmit}
+          onDirtyChange={(dirty) => { editorDirtyRef.current = dirty; }}
+          onClose={(reason) => {
+            const closing = editorState;
+            // 明确放弃/无改动关闭：只清理属于本次添加实例的失败重试意图
+            if (closing?.mode === 'add' && reason !== 'saved') {
+              const closingId = addCommitRef.current?.exercise.id;
+              if (closingId) discardedAddIds.current.add(closingId);
+              setAddFailed((prev) => (prev && closingId && prev.entry.exercise.id === closingId ? null : prev));
+            }
+            editorDirtyRef.current = false;
+            setEditorState(null);
+            addCommitRef.current = null;
+            addInFlightRef.current = null;
+          }}
+        />
+      ) : null}
+
+      <Confirm
+        open={editorConfirm !== null}
+        title={editorConfirm?.title ?? '确认修改影响'}
+        body={editorConfirm?.body ?? ''}
+        confirmText="确认并保存"
+        danger={Boolean(editorConfirm?.body.includes('删除'))}
+        onCancel={() => setEditorConfirm(null)}
+        onConfirm={() => {
+          const pending = editorConfirm;
+          const ownerKey = editorStateRef.current?.key ?? null;
+          const ownerExId = pending?.exId ?? null;
+          setEditorConfirm(null);
+          if (!pending) return;
+          void commitEditPayload(pending.payload, pending.exId).then((r) => {
+            const live = editorStateRef.current;
+            if (r.ok) {
+              // P1：旧 A 的延迟 oncomplete 绝不能关闭后来打开的 B，也不能清 B 的编辑状态
+              if (live && ownerKey !== null && live.key === ownerKey && live.exId === ownerExId) {
+                setEditorState(null);
+                addCommitRef.current = null;
+                addInFlightRef.current = null;
+              }
+            } else if (live && (ownerKey === null || live.key === ownerKey)) {
+              pushToast(r.message ?? '保存失败', 'error');
+            }
+          });
+        }}
+      />
+
+      <Confirm
+        open={deletePreview !== null}
+        title="删除这个项目？"
+        body={deletePreview ? `将删除「${deletePreview.name}」。${deletePreview.reasons.join('；')}。确认后才能删除，取消会完整保留。` : ''}
+        confirmText="确认删除"
+        danger
+        busy={deleteBusy}
+        onCancel={() => setDeletePreview(null)}
+        onConfirm={confirmDeletePreview}
       />
 
       <Confirm

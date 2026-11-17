@@ -537,11 +537,22 @@ public class RestCountdownService extends Service {
         PendingIntent cancelPi = PendingIntent.getService(this, requestCode, cancel, flags);
 
         /**
-         * A5 #4：正文**不再写固定的初始数字**（旧实现写死"剩余 00:15"，
-         * 与系统 chronometer 的实时值并列矛盾）。实时数值由 chronometer 承担，
-         * 正文只说明"当前休息 / 可取消"。
+         * N01：正文点击 → 打开/带回**已有**的 MOTION Activity（与「取消」是不同动作）。
+         *
+         * <p>用系统启动 Intent 指向本应用唯一 MainActivity（launchMode=singleTask）：
+         * 应用已在后台则把原任务带回前台，保留 WebView 与会话状态；不 CLEAR_TASK、
+         * 不重建任务、不跳到具体训练卡。取消仍是下方独立 action，两者互不复用。
          */
-        String text = "休息进行中（点此取消）";
+        PendingIntent contentPi = buildContentIntent();
+
+        /**
+         * A5 #4：正文**不再写固定的初始数字**（旧实现写死"剩余 00:15"，
+         * 与系统 chronometer 的实时值并列矛盾）。实时数值由 chronometer 承担。
+         *
+         * N01：正文点击现在**打开/带回应用**（见 {@link #buildContentIntent()}），
+         * 取消是下方独立 action 按钮；因此正文不能再写「点此取消」，避免误指取消动作。
+         */
+        String text = "休息进行中（点此返回应用）";
         /**
          * A3 #6：必须用**系统倒计时**（chronometer）而不是静态文本。
          *
@@ -564,6 +575,11 @@ public class RestCountdownService extends Service {
             .setOnlyAlertOnce(true)
             .setSilent(true)
             .addAction(0, "取消", cancelPi);
+        /**
+         * N01：正文点击打开/带回应用（Activity PendingIntent）。
+         * 与「取消」是不同动作：取消走上面的 getService + ACTION_CANCEL_FROM_NOTIFICATION。
+         */
+        if (contentPi != null) b.setContentIntent(contentPi);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             // 系统自己走秒：无需 App 轮询
             b.setUsesChronometer(true)
@@ -575,6 +591,39 @@ public class RestCountdownService extends Service {
             b.setShowWhen(false);
         }
         return b.build();
+    }
+
+    /**
+     * N01：构造「点击通知正文 → 打开/带回 MOTION」的 Activity PendingIntent。
+     *
+     * <h2>为什么这样写</h2>
+     * <ul>
+     *   <li>用系统的启动 Intent（{@link android.content.pm.PackageManager#getLaunchIntentForPackage}）
+     *       指向本应用唯一 {@code MainActivity}（manifest 里 {@code launchMode=singleTask}）。
+     *       应用已在后台时，会把原任务带回前台并投递 onNewIntent，**保留 WebView 与会话状态**。</li>
+     *   <li>**不**使用 {@code CLEAR_TASK} / {@code TaskStackBuilder} / {@code FLAG_ACTIVITY_CLEAR}
+     *       —— 那类示例会清空/重建任务，等于把正在计时的训练页重置掉。</li>
+     *   <li>不新增到具体训练卡的深链：正文只回到应用，由应用自身恢复当前路由。</li>
+     *   <li>极端情况下拿不到启动 Intent 时，兜底显式指向 {@code MainActivity}，
+     *       保证正文一定有可打开的应用入口（不会出现“点了没反应”）。</li>
+     * </ul>
+     *
+     * <p><b>与取消的区别</b>：取消是 {@code getService} + {@link #ACTION_CANCEL_FROM_NOTIFICATION}
+     * 且携带 token/generation；本方法只是打开应用，不取消、不启动/停止计时、不改当前代次。
+     *
+     * @return 始终非 null 的 Activity PendingIntent（用于 {@code setContentIntent}）
+     */
+    private PendingIntent buildContentIntent() {
+        Intent launch = getPackageManager().getLaunchIntentForPackage(getPackageName());
+        if (launch == null) {
+            // 兜底：显式指向唯一 MainActivity，确保正文一定有打开入口
+            launch = new Intent(this, app.motion.personal.MainActivity.class);
+            launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        }
+        int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) flags |= PendingIntent.FLAG_IMMUTABLE;
+        return PendingIntent.getActivity(
+            this, RestForegroundPolicy.contentRequestCode(), launch, flags);
     }
 
     /**

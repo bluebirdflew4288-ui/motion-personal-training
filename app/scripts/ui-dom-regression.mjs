@@ -280,6 +280,22 @@ async function runSingleSuite(suiteName, baseEvidenceDir) {
         s,
       );
 
+      await page.evaluate(() => window.api.start(30, { sessionExerciseId: 'ex-rest', setId: 'set-rest' }));
+      await page.waitForFunction(() => window.api?.active && window.api.source?.sessionExerciseId === 'ex-rest');
+      let sourceSnap = await page.evaluate(() => JSON.parse(sessionStorage.getItem('motion-rest-timer:audit-rest-session')));
+      check('G3A1 start carries source metadata', sourceSnap?.source?.sessionExerciseId === 'ex-rest' && sourceSnap?.source?.setId === 'set-rest', sourceSnap);
+      await page.reload();
+      await page.waitForFunction(() => window.api?.active && window.api.source?.sessionExerciseId === 'ex-rest');
+      s = await state();
+      check('G3A1 reload retains source metadata', s.source?.sessionExerciseId === 'ex-rest', s);
+      await page.evaluate(() => window.api.stop());
+      await sleep(25);
+      s = await state();
+      check('G3A1 stop clears source', s.source == null && (await page.evaluate(() => sessionStorage.getItem('motion-rest-timer:audit-rest-session'))) === null, s);
+      // 恢复原测试链最后一步的 stop 断言
+      await page.evaluate(() => window.api.start(60));
+      await sleep(20);
+      s = await state();
       const deadline = s.endsAt;
       await page.evaluate(() => window.api.adjust(15));
       await sleep(25);

@@ -7,6 +7,33 @@
 export type WeightMode = 'external' | 'bodyweight' | 'bodyweight_plus' | 'assisted';
 export type DumbbellBasis = 'per_hand' | 'total';
 
+/**
+ * 训练形式（产品语义，G1 新增）。
+ *
+ * 关键设计（根决策）：**不新增 `ExerciseTarget.kind` 联合成员**。
+ * 超级组与递减组在数据结构上同形（轮数 × 多阶段），因此继续使用
+ * `kind: 'dropSet'` 作为底层兼容载体，用显式 `form` 字段区分
+ * `'dropSet'`（递减组）与 `'superset'`（超级组）。
+ * 这样既满足"明确形式"，又不会让 summary / identity / backup / 旧 UI 的
+ * 既有 `kind` 分支出现 half support。普通组仍为 `kind: 'straight'`。
+ */
+export type TrainingForm = 'straight' | 'superset' | 'dropSet';
+
+/**
+ * 普通组中**单组**的独立配置（G1）。
+ * 旧数据没有该数组时按 `StraightTarget` 全局字段读取（旧语义）。
+ * `null` 表示"未设置参考次数"，与数值 `0` 严格区分。
+ */
+export interface StraightSetConfig {
+  /** 组序号，从 1 开始；与 SessionSet.roundIndex 稳定对应 */
+  setIndex: number;
+  repsMin: number | null;
+  repsMax: number | null;
+  suggestedWeightKg: number | null;
+  /** 该组独立力竭开关；力竭不注销/禁用次数输入 */
+  toFailure: boolean;
+}
+
 export interface WarmupTarget {
   id: string;
   name: string;
@@ -26,29 +53,99 @@ export interface StraightTarget {
   weightMode: WeightMode;
   suggestedWeightKg: number | null;
   dumbbellBasis?: DumbbellBasis;
+  /**
+   * 全部组共用的默认力竭开关（G1，可选）。
+   * 旧数据缺失 → false（旧语义）；`perSetConfigs` 中同组条目优先。
+   * 力竭只表示不要求目标次数，**不注销/禁用次数输入**，也不清空已填参考范围。
+   */
+  toFailure?: boolean;
+  /**
+   * 每组独立配置（G1，可选）。存在时按 `setIndex` 覆盖全局
+   * `repsMin/repsMax/suggestedWeightKg/toFailure`；`null` = 未设置。
+   */
+  perSetConfigs?: StraightSetConfig[];
 }
 
 export interface DropStageTarget {
+  /**
+   * 阶段稳定 ID（G1，可选）。
+   * 新配置写入时必填；旧数据缺失时按数组位置读取（旧语义），不回写旧计划/历史。
+   */
+  id?: string;
   label: string;
   weightKg: number | null;
   repsMin: number | null;
   repsMax: number | null;
-  /** 目标是「技术性力竭」时，实际仍记录完成次数 */
+  /** 该阶段独立力竭开关；力竭不注销/禁用次数输入 */
   toFailure: boolean;
+  /**
+   * 该阶段结束后的短间歇（秒，G1，可选）。
+   * 末阶段忽略此值，直接接整轮休息 `restAfterSec`（不叠加两段）。
+   * 旧数据缺失 → 回退到 `restInSec`（旧语义）。
+   */
+  restAfterSec?: number;
   targetText: string;
+}
+
+/**
+ * 多阶段动作的**逐轮覆盖**（R02，可选）。
+ *
+ * `DropSetTarget.stages` 是默认阶段模板；本数组只保存与默认不同的轮。
+ * 旧 JSON 没有该字段 → 所有轮沿用 `stages`（旧语义），不扫描/重写历史。
+ * `stages.length` 即该轮 stageCount；轮内阶段 ID 必须唯一。
+ */
+export interface DropRoundConfig {
+  /** 轮序号，从 1 开始；必须落在 1..rounds 且不可重复 */
+  roundIndex: number;
+  /** 该轮完整阶段配置；替换默认 `stages` 用于该轮 */
+  stages: DropStageTarget[];
+  /** 该轮阶段间默认短间歇（秒）；缺省回退 `DropSetTarget.restInSec` */
+  restInSec?: number;
 }
 
 export interface DropSetTarget {
   kind: 'dropSet';
+  /**
+   * 显式训练形式（G1，可选）：缺省 = 'dropSet'（旧数据语义）。
+   * 'superset' = 超级组，仍共用本多阶段结构，避免新增 kind 联合成员。
+   */
+  form?: 'dropSet' | 'superset';
   rounds: number;
+  /** 默认阶段配置；没有逐轮覆盖的轮沿用这里（旧语义唯一来源） */
   stages: DropStageTarget[];
+  /** 逐轮覆盖（R02，可选）：同一组第一轮 3 阶段、第二轮 2 阶段时只写差异轮 */
+  roundConfigs?: DropRoundConfig[];
+  /** 阶段间默认短间歇（旧字段；单阶段 `restAfterSec` 优先） */
   restInSec: number;
+  /** 整轮休息（完成最后一阶段后触发，替代末阶段短间歇） */
   restAfterSec: number;
   weightMode: WeightMode;
   dumbbellBasis?: DumbbellBasis;
 }
 
 export type ExerciseTarget = StraightTarget | DropSetTarget;
+
+/**
+ * 动作配置记忆（G1）。
+ *
+ * 只保存**纯配置原型**，不得包含 actual / status / runningSinceAt /
+ * planExerciseId 等运行态或历史归属字段。持久化在 meta store 的
+ * `exercise-template:<exerciseId>` 键下。
+ */
+export interface ExerciseTemplate {
+  /** 存储键：`exercise-template:` + exerciseId（与 meta row 的 key 一致） */
+  key: string;
+  schemaVersion: 1;
+  exerciseId: string;
+  name: string;
+  en?: string;
+  /** 完整纯配置；阶段必须带稳定 id */
+  target: ExerciseTarget;
+  restSec: number;
+  /** 模板 revision：每次显式更新 +1，用于 expected revision 冲突保护 */
+  revision: number;
+  updatedAt: number;
+}
 
 export interface PlanExercise {
   /** 计划条目 ID（planExerciseId 的来源） */
@@ -190,6 +287,11 @@ export interface SessionSet {
   roundIndex: number;
   /** 递减组阶段序号从 1 开始；直练恒为 1 */
   stageIndex: number;
+  /**
+   * 阶段稳定 ID（G1，可选）：与 target.stages[].id 对应。
+   * 旧数据缺失时按 roundIndex/stageIndex 位置读取（旧语义）。
+   */
+  stageId?: string;
   /** 实际次数。null = 未填写；0 = 实际做了 0 次 */
   reps: number | null;
   /** 实际重量（kg）。null = 未记录。自重动作可为 null */
@@ -334,6 +436,8 @@ export interface SessionSummary {
   skippedGroups: number;
   /** 实际完成的完整有效正式组数（不受原计划组数封顶） */
   completedSets: number;
+  /** R02：完整大组对应的真实阶段行数（按每个完整轮自己的 stageCount 求和） */
+  completedStages: number;
   /** 已做但缺数据、不计入完整有效组的组数 */
   incompleteSets: number;
   /** 部分完成的递减大组数 */
@@ -342,6 +446,8 @@ export interface SessionSummary {
   targetSets: number;
   /** 本次实际安排的组数（含临时加组、减去临时删组） */
   plannedSets: number;
+  /** R02：本次实际安排的阶段行数（按各轮真实 stageCount 求和） */
+  plannedStages: number;
   /** 动作：完整有效完成 / 部分完成 / 跳过 / 未记录 */
   exercisesDone: number;
   exercisesPartial: number;

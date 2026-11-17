@@ -6,7 +6,7 @@
      只填了部分阶段时算 1 个「部分完成大组」，不伪装成完整组。
    · 直练动作按组计数，只算 status='done' 且在计划组数范围内的组。 */
 
-import { exerciseIdFromName, resolveExerciseId } from './identity';
+import { resolveExerciseId } from './identity';
 import {
   CARDIO_PRESET_LABEL,
   cardioTotalMs,
@@ -16,18 +16,20 @@ import {
 } from './cardio';
 import { adhocDayId } from './sessionKind';
 import {
-  MAX_CARDIO_ENTRIES,
-  MAX_EXERCISES,
-  MAX_REPS,
-  MAX_REST,
-  MAX_ROUNDS,
-  MAX_SET_ROWS,
-  MAX_STRAIGHT_SETS,
-  MIN_ROUNDS,
-} from './limits';
+  applyTargetToExercise,
+  groupPlanForTarget,
+  resolveGroupConfig,
+  resolveRoundStageIdentities,
+  resolveStageIdsFromConfigForRound,
+  roundRestInSecOf,
+  roundStagesOf,
+  type TargetApplyImpact,
+} from './exerciseConfig';
+import { MAX_CARDIO_ENTRIES, MAX_ROUNDS, MAX_SET_ROWS } from './limits';
 import type {
   ExerciseCompletion,
   ExerciseTarget,
+  DropStageTarget,
   GroupPlan,
   Plan,
   PlanDay,
@@ -40,10 +42,8 @@ import type {
   CardioEntry,
   CardioParams,
   CardioPreset,
-  DropSetTarget,
   PlanCardio,
   SessionOrigin,
-  StraightTarget,
   WarmupTarget,
 } from './types';
 
@@ -67,7 +67,12 @@ export function targetSetsOfPlan(day: PlanDay): number {
 export function describeTarget(ex: PlanExercise): string {
   const t = ex.target;
   if (t.kind === 'dropSet') {
-    return `${t.rounds} 轮 × ${t.stages.length} 阶段递减`;
+    const counts = groupPlanForTarget(t).map((g) => g.stageCount);
+    const uniform = counts.every((n) => n === counts[0]);
+    const structure = uniform
+      ? `${t.rounds} 轮 × ${t.stages.length} 阶段`
+      : `${t.rounds} 轮 · 每轮阶段 ${counts.join('/')}`;
+    return `${structure}${t.form === 'superset' ? '超级组' : '递减'}`;
   }
   const sets = t.setsMax > t.sets ? `${t.sets}–${t.setsMax}` : `${t.sets}`;
   return `${sets} 组 × ${t.repsMin}–${t.repsMax} 次`;
@@ -76,7 +81,9 @@ export function describeTarget(ex: PlanExercise): string {
 export function weightModeLabel(ex: PlanExercise): string | null {
   const t = ex.target;
   if (t.kind !== 'straight') {
-    return t.dumbbellBasis === 'per_hand' ? '哑铃 · 按单只计' : null;
+    if (t.dumbbellBasis === 'per_hand') return '哑铃 · 按单只计';
+    if (t.dumbbellBasis === 'total') return '哑铃 · 按合计计';
+    return null;
   }
   switch (t.weightMode) {
     case 'bodyweight':
@@ -90,11 +97,17 @@ export function weightModeLabel(ex: PlanExercise): string | null {
   }
 }
 
-function blankSet(roundIndex: number, stageIndex: number, toFailure = false): SessionSet {
+function blankSet(
+  roundIndex: number,
+  stageIndex: number,
+  toFailure = false,
+  stageId?: string,
+): SessionSet {
   return {
     id: newId('set'),
     roundIndex,
     stageIndex,
+    ...(stageId ? { stageId } : {}),
     reps: null,
     weightKg: null,
     status: 'blank',
@@ -102,24 +115,22 @@ function blankSet(roundIndex: number, stageIndex: number, toFailure = false): Se
   };
 }
 
-/** 由目标推导组结构（普通组每组件 1 阶段；递减组每轮 = 阶段数） */
+/** 由目标推导组结构（普通组每组件 1 阶段；递减组/超级组每轮 = 阶段数） */
 export function groupsFromTarget(t: ExerciseTarget): GroupPlan[] {
-  if (t.kind === 'straight') {
-    return Array.from({ length: t.sets }, (_, i) => ({ index: i + 1, stageCount: 1 }));
-  }
-  const stages = Math.max(1, t.stages.length);
-  return Array.from({ length: t.rounds }, (_, i) => ({ index: i + 1, stageCount: stages }));
+  return groupPlanForTarget(t);
 }
 
-/** 为动作生成与组结构匹配的空记录 */
+/** 为动作生成与组结构匹配的空记录（每组件/阶段独立力竭标记；仅写真实 id，不给旧数据造 ID） */
 function initialSetsFor(ex: PlanExercise, groups: GroupPlan[]): SessionSet[] {
   const t = ex.target;
   const sets: SessionSet[] = [];
   for (const g of groups) {
     for (let si = 1; si <= g.stageCount; si++) {
-      const toFailure =
-        t.kind === 'dropSet' ? Boolean(t.stages[si - 1]?.toFailure) : false;
-      sets.push(blankSet(g.index, si, toFailure));
+      const resolved = resolveGroupConfig(t, g.index, si);
+      // 旧数据只写真实持久化的 id，不在开始训练时给旧计划/旧历史“造身份”；
+      // 缺失身份在运行时由 resolveMissingStageIdsFromConfig / 统一解析按
+      // “可证明同源”口径确定性补齐，不会被随机分裂或按位置硬配。
+      sets.push(blankSet(g.index, si, resolved.toFailure, resolved.stageId ?? undefined));
     }
   }
   return sets;
@@ -291,8 +302,8 @@ export function createRestSession(args: {
 /* ── 组状态 ─────────────────────────────── */
 
 export function needsWeight(ex: SessionExercise): boolean {
-  const t = ex.target;
-  if (t.kind === 'straight') return t.weightMode === 'external' || t.weightMode === 'bodyweight_plus' || t.weightMode === 'assisted';
+  // W02：训练页不再因旧 bodyweight 隐藏重量输入；所有力量动作均显示重量（kg）。
+  void ex;
   return true;
 }
 
@@ -382,6 +393,283 @@ export function roundsOf(ex: SessionExercise): number[] {
   return rounds.length ? rounds : [];
 }
 
+/* ── R01：未完成轮沿用上一完整轮（多阶段：超级组/递减组）────────── */
+
+/** 「未完成轮沿用上一完整轮」的结果（R01） */
+export interface InheritPrevRoundOutcome {
+  session: Session;
+  /** 实际补写的字段数（reps / weightKg 各算一个） */
+  filledFields: number;
+  /** 至少补写了一个字段的 set 数 */
+  filledSets: number;
+  /** 因「之前没有完整已完成轮」而未能沿用的目标轮号 */
+  noSourceRounds: number[];
+  /** 因「阶段结构无法可靠对应」而整轮跳过的目标轮号 */
+  mismatchRounds: number[];
+  /** R02：逐轮配置下按稳定身份仍无来源、保持空白的阶段数 */
+  unmatchedStages: number;
+}
+
+/**
+ * 对**已经由旧 addSetTo 产生的缺失 stageId 轮**做确定性兼容解析（R02a）。
+ *
+ * 仅当某轮满足全部条件才补：
+ * 1. 该轮 GroupPlan.stageCount 与 target 当前轮配置的阶段数一致；
+ * 2. 配置中每个阶段都有非空且轮内唯一的 id；
+ * 3. 该轮现有行的 stageIndex 恰好覆盖 1..stageCount 且无重复；
+ * 4. 已存在的 stageId（若有）必须与配置给出的 id 一致（不允许“部分串轮”）。
+ *
+ * 不能证明唯一对应（配置阶段数不同 / id 缺失或重复 / 行残缺）→ 该轮保持原样，
+ * 绝不按位置硬配不同动作或不同结构的阶段。返回新对象，不修改入参。
+ */
+export function resolveMissingStageIdsFromConfig(ex: SessionExercise): { exercise: SessionExercise; changedRounds: number[] } {
+  if (ex.target.kind !== 'dropSet') return { exercise: ex, changedRounds: [] };
+  const changedRounds: number[] = [];
+  const updatedById = new Map<string, SessionSet>();
+  for (const g of ex.groups) {
+    const sets = dropRoundSets(ex, g.index);
+    if (!stageRowsComplete(sets, g.stageCount)) continue;
+    // 只处理「整轮都没有 stageId」的旧 addSetTo 产物；
+    // 部分有、部分无的混合轮不解析，保持原有严格跳过语义（绝不猜）。
+    if (sets.some((s) => Boolean(s.stageId))) continue;
+    const resolution = resolveStageIdsFromConfigForRound(ex.target, g.index, g.stageCount);
+    if (!resolution.ok) continue;
+    changedRounds.push(g.index);
+    for (const s of sets) {
+      updatedById.set(s.id, { ...s, stageId: resolution.byIndex.get(s.stageIndex)! });
+    }
+  }
+  if (!updatedById.size) return { exercise: ex, changedRounds: [] };
+  return {
+    exercise: { ...ex, sets: ex.sets.map((s) => updatedById.get(s.id) ?? s) },
+    changedRounds,
+  };
+}
+
+/**
+ * 目标/来源某轮的行是否**完整且位置唯一**：行数 = requiredStages，stageIndex 恰好覆盖 1..required 各一次。
+ * 缺阶段（残行）或重复位置都不可靠 —— 不能凭空补阶段，也不能把残行硬配。
+ */
+function stageRowsComplete(sets: SessionSet[], required: number): boolean {
+  if (required <= 0 || sets.length !== required) return false;
+  const seen = new Set<number>();
+  for (const s of sets) {
+    if (s.stageIndex < 1 || s.stageIndex > required) return false;
+    if (seen.has(s.stageIndex)) return false;
+    seen.add(s.stageIndex);
+  }
+  return seen.size === required;
+}
+
+/**
+ * 逐阶段建立「目标阶段 → 来源阶段」的可靠映射（R01）。
+ *
+ * <p>只有两种形态被认为**可靠**：
+ * <ul>
+ *   <li>两侧都带稳定 `stageId`：必须**各自唯一**（无重复），按 stageId 一一对应；</li>
+ *   <li>两侧都没有稳定 ID（旧数据）：按 `stageIndex` 位置一一对应。</li>
+ * </ul>
+ * 其余情况（任一侧「混合」——部分阶段有 ID 部分没有；或单侧有 ID、单侧无 ID）
+ * 都视为**不可靠**，返回 null → 调用方整轮 skip，绝不硬配。
+ *
+ * @return 逐阶段配对；不可靠/缺对应 → null（整轮不可可靠对应）
+ */
+function mapTargetStagesToSource(
+  targetSets: SessionSet[],
+  sourceSets: SessionSet[],
+  opts: { allowPartialById?: boolean } = {},
+): { pairs: Array<[SessionSet, SessionSet]>; unmatchedTargets: number } | null {
+  if (targetSets.length === 0 || sourceSets.length === 0) return null;
+  const tgtWithId = targetSets.filter((s) => Boolean(s.stageId)).length;
+  const srcWithId = sourceSets.filter((s) => Boolean(s.stageId)).length;
+  const tgtAllIds = tgtWithId === targetSets.length;
+  const srcAllIds = srcWithId === sourceSets.length;
+  const tgtNoIds = tgtWithId === 0;
+  const srcNoIds = srcWithId === 0;
+
+  const byStageId = tgtAllIds && srcAllIds;
+  const byStageIndex = tgtNoIds && srcNoIds;
+  if (!byStageId && !byStageIndex) return null; // 混合 ID / 单侧有 ID → 不可靠
+
+  if (byStageId) {
+    const srcIds = sourceSets.map((s) => s.stageId as string);
+    const tgtIds = targetSets.map((s) => s.stageId as string);
+    // 稳定 ID 必须唯一；重复（如 a,a,c）会让 find 产生歧义配对 → 整轮 skip
+    if (new Set(srcIds).size !== srcIds.length) return null;
+    if (new Set(tgtIds).size !== tgtIds.length) return null;
+    const pairs: Array<[SessionSet, SessionSet]> = [];
+    let unmatchedTargets = 0;
+    for (const tgt of targetSets) {
+      const match = sourceSets.find((s) => s.stageId === tgt.stageId);
+      if (!match) {
+        // R02：只有“逐轮配置”启用时才允许部分对应：稳定身份明确对应的阶段沿用，
+        // 无对应阶段保持空白；旧 R01（无逐轮配置）仍整轮 skip，保持旧语义。
+        if (!opts.allowPartialById) return null;
+        unmatchedTargets += 1;
+        continue;
+      }
+      pairs.push([tgt, match]);
+    }
+    if (!pairs.length) return null;
+    return { pairs, unmatchedTargets };
+  }
+
+  // 旧数据：按 stageIndex 位置唯一对应；阶段数不一致不能按位置硬配
+  if (targetSets.length !== sourceSets.length) return null;
+  const srcIdx = sourceSets.map((s) => s.stageIndex);
+  const tgtIdx = targetSets.map((s) => s.stageIndex);
+  if (new Set(srcIdx).size !== srcIdx.length) return null;
+  if (new Set(tgtIdx).size !== tgtIdx.length) return null;
+  const pairs: Array<[SessionSet, SessionSet]> = [];
+  for (const tgt of targetSets) {
+    const match = sourceSets.find((s) => s.stageIndex === tgt.stageIndex);
+    if (!match) return null;
+    pairs.push([tgt, match]);
+  }
+  return { pairs, unmatchedTargets: 0 };
+}
+
+/**
+ * 单个多阶段动作：把「未完成且未跳过」的目标轮，按阶段沿用**它之前最近的、
+ * 非跳过的完整已完成轮**的实际 reps / weightKg（R01，规则：只补空白、保留已填）。
+ *
+ * 关键边界（与「普通组沿用」语义刻意不同）：
+ * <ul>
+ *   <li>只处理 `kind: 'dropSet'`（超级组/递减组共用）；普通组一律不碰。</li>
+ *   <li>来源轮必须是完整、**且未被跳过**的已完成轮；跳过轮即便有残留 done 行也不作来源。</li>
+ *   <li>目标/来源的 `requiredStages` 必须一致，且阶段行完整、位置唯一；缺阶段/重复位置 → 整轮 skip。</li>
+ *   <li>逐阶段对应复制，**不**把最后一阶段的值套到全部阶段。</li>
+ *   <li>每字段**只在 null 时补**：0 是有效值；已填 reps/weight 一律保留。</li>
+ *   <li>**已完成（status=done）的阶段整条不动**，即使它还有 null 的 weight 也不补。</li>
+ *   <li>不改 status/note/toFailure/结构/ID/顺序，不动已完成轮与跳过轮，不启动/结束计时。</li>
+ * </ul>
+ */
+export function inheritPreviousCompleteRoundForExercise(ex: SessionExercise): {
+  exercise: SessionExercise;
+  filledFields: number;
+  filledSets: number;
+  noSourceRounds: number[];
+  mismatchRounds: number[];
+  unmatchedStages: number;
+} {
+  // 只对多阶段（超级组/递减组）生效；普通组语义不动
+  if (ex.target.kind !== 'dropSet') {
+    return { exercise: ex, filledFields: 0, filledSets: 0, noSourceRounds: [], mismatchRounds: [], unmatchedStages: 0 };
+  }
+  // R02a legacy 兼容：旧 addSetTo 生成的缺失 stageId 轮，只在配置可唯一证明时补齐；
+  // 不补也继续按原有严格规则处理（会进入 mismatch，不会硬配）。
+  ex = resolveMissingStageIdsFromConfig(ex).exercise;
+  const rounds = roundsOf(ex).slice().sort((a, b) => a - b);
+  const updatedById = new Map<string, SessionSet>();
+  const noSourceRounds: number[] = [];
+  const mismatchRounds: number[] = [];
+  let filledFields = 0;
+  let unmatchedStages = 0;
+
+  for (let ri = 0; ri < rounds.length; ri++) {
+    const r = rounds[ri];
+    if (dropRoundComplete(ex, r)) continue; // 已完成轮不改
+    if (isGroupSkipped(ex, r)) continue; // 跳过轮不改
+    const required = requiredStages(ex, r);
+    const tgtSets = dropRoundSets(ex, r);
+    // 目标轮阶段行必须完整且位置唯一；残行（缺阶段）不能硬配、也不能凭空补
+    if (!stageRowsComplete(tgtSets, required)) {
+      mismatchRounds.push(r);
+      continue;
+    }
+    // 找「之前最近的、非跳过的完整已完成轮」作为唯一来源
+    let sourceRound: number | undefined;
+    for (let i = ri - 1; i >= 0; i--) {
+      const rr = rounds[i];
+      if (isGroupSkipped(ex, rr)) continue; // 跳过轮不得作来源（即便有残留 done 行）
+      if (dropRoundComplete(ex, rr)) {
+        sourceRound = rr;
+        break;
+      }
+    }
+    if (sourceRound === undefined) {
+      noSourceRounds.push(r);
+      continue;
+    }
+    const srcRequired = requiredStages(ex, sourceRound);
+    const srcSets = dropRoundSets(ex, sourceRound);
+    // 来源轮必须阶段行完整、位置唯一；R02 逐轮配置允许跨不同阶段数按稳定 ID 部分对应。
+    if (!stageRowsComplete(srcSets, srcRequired)) {
+      mismatchRounds.push(r);
+      continue;
+    }
+    const allowPartialById = Boolean(ex.target.kind === 'dropSet' && ex.target.roundConfigs?.length);
+    if (srcRequired !== required && !allowPartialById) {
+      mismatchRounds.push(r);
+      continue;
+    }
+    const mapped = mapTargetStagesToSource(tgtSets, srcSets, { allowPartialById });
+    if (!mapped) {
+      mismatchRounds.push(r);
+      continue;
+    }
+    unmatchedStages += mapped.unmatchedTargets;
+    for (const [tgt, src] of mapped.pairs) {
+      if (tgt.status === 'done') continue; // 已完成阶段整条不动
+      let reps = tgt.reps;
+      let weightKg = tgt.weightKg;
+      let changed = false;
+      // 只补 null：0 是有效值，已填一律保留
+      if (reps === null && src.reps !== null) {
+        reps = src.reps;
+        changed = true;
+        filledFields++;
+      }
+      if (weightKg === null && src.weightKg !== null) {
+        weightKg = src.weightKg;
+        changed = true;
+        filledFields++;
+      }
+      if (changed) updatedById.set(tgt.id, { ...tgt, reps, weightKg });
+    }
+  }
+
+  const filledSets = updatedById.size;
+  if (filledSets === 0) {
+    return { exercise: ex, filledFields, filledSets: 0, noSourceRounds, mismatchRounds, unmatchedStages };
+  }
+  const sets = ex.sets.map((s) => updatedById.get(s.id) ?? s);
+  return { exercise: { ...ex, sets }, filledFields, filledSets, noSourceRounds, mismatchRounds, unmatchedStages };
+}
+
+/** 会话级：对指定动作执行「未完成轮沿用上一完整轮」（R01，纯函数，返回新会话） */
+export function inheritPreviousCompleteRound(
+  session: Session,
+  exId: string,
+): InheritPrevRoundOutcome {
+  const ex = session.exercises.find((e) => e.id === exId);
+  if (!ex) {
+    return { session, filledFields: 0, filledSets: 0, noSourceRounds: [], mismatchRounds: [], unmatchedStages: 0 };
+  }
+  const out = inheritPreviousCompleteRoundForExercise(ex);
+  if (out.filledSets === 0) {
+    return {
+      session,
+      filledFields: 0,
+      filledSets: 0,
+      noSourceRounds: out.noSourceRounds,
+      mismatchRounds: out.mismatchRounds,
+      unmatchedStages: out.unmatchedStages,
+    };
+  }
+  return {
+    session: {
+      ...session,
+      exercises: session.exercises.map((e) => (e.id === exId ? out.exercise : e)),
+    },
+    filledFields: out.filledFields,
+    filledSets: out.filledSets,
+    noSourceRounds: out.noSourceRounds,
+    mismatchRounds: out.mismatchRounds,
+    unmatchedStages: out.unmatchedStages,
+  };
+}
+
 /**
  * 从本次训练快照读取休息配置（R09）。
  * · 递减组：阶段之间用 target.restInSec，完成整轮用 target.restAfterSec
@@ -400,16 +688,23 @@ export function restConfigFor(
 
 /**
  * 某个 set 完成后应该休息多久（自动计时与手动「计时」共用同一份快照）。
- * · 递减组：该 set 是本轮最后一个必需阶段 → target.restAfterSec；否则 → target.restInSec
+ * · 递减组：该 set 是本轮最后一个必需阶段 → target.restAfterSec；否则 → 该轮阶段短歇
  * · 普通组 → ex.restSec
  * 只读本次训练快照（ex.target / ex.restSec），不读计划当前值，也不硬编码。
  */
 export function restAfterSet(ex: SessionExercise, set: SessionSet): number {
-  if (ex.target.kind === 'dropSet') {
-    const need = requiredStages(ex, set.roundIndex);
-    return set.stageIndex >= need ? ex.target.restAfterSec : ex.target.restInSec;
-  }
-  return ex.restSec;
+  const t = ex.target;
+  if (t.kind !== 'dropSet') return ex.restSec;
+  /**
+   * G2A 兼容回归：末阶段判定必须用**本组 GroupPlan.stageCount 快照**
+   * （requiredStages），不能用 target.stages.length。
+   * 合法旧数据可能有 target 3 阶段、但某组快照只要求 2 阶段：
+   * 该组第 2 阶段就是组尾，应取整轮休息，而不是阶段短间歇。
+   */
+  const need = requiredStages(ex, set.roundIndex);
+  if (set.stageIndex >= need) return t.restAfterSec;
+  const stages = roundStagesOf(t, set.roundIndex);
+  return stages[set.stageIndex - 1]?.restAfterSec ?? roundRestInSecOf(t, set.roundIndex);
 }
 
 /**
@@ -481,6 +776,8 @@ export function skippedGroupCount(ex: SessionExercise): number {
  */
 export function summarizeSession(session: Session, now = Date.now()): SessionSummary {
   let completedSets = 0;
+  let completedStages = 0;
+  let plannedStages = 0;
   let incompleteSets = 0;
   let partialGroups = 0;
   let targetSets = 0;
@@ -506,15 +803,21 @@ export function summarizeSession(session: Session, now = Date.now()): SessionSum
     plannedSets += rounds.length;
 
     for (const r of rounds) {
+      const stagesInRound = requiredStages(ex, r);
+      plannedStages += stagesInRound;
       if (isGroupSkipped(ex, r)) {
         // 跳过的组：只有确实没有任何记录时才算「跳过」
         if (groupHasNoRecords(ex, r)) skippedGroups++;
-        else if (dropRoundComplete(ex, r)) completedSets++;
-        else partialGroups++;
+        else if (dropRoundComplete(ex, r)) {
+          completedSets++;
+          completedStages += stagesInRound;
+        } else partialGroups++;
         continue;
       }
-      if (dropRoundComplete(ex, r)) completedSets++;
-      else if (dropRoundPartial(ex, r)) partialGroups++;
+      if (dropRoundComplete(ex, r)) {
+        completedSets++;
+        completedStages += stagesInRound;
+      } else if (dropRoundPartial(ex, r)) partialGroups++;
     }
 
     // 缺数据的组（点了完成却没填次数）单独统计
@@ -525,11 +828,13 @@ export function summarizeSession(session: Session, now = Date.now()): SessionSum
 
   return {
     completedSets,
+    completedStages,
     incompleteSets,
     partialGroups,
     // R03.3：分母用开始时的快照，替换/加组不会把 20 改成 22
     targetSets: session.targetSetsAtStart ?? targetSets,
     plannedSets,
+    plannedStages,
     arrangedGroups,
     skippedGroups,
     exercisesDone,
@@ -611,173 +916,6 @@ export function skipRemaining(session: Session, exId: string): Session {
 }
 
 /**
- * 训练中把动作改成递减组（C01 路径 B），只影响本次训练。
- * 规则：
- * · 完全无记录 → 直接整条转换，保留动作身份与位置。
- * · 已有记录 → 旧结构收尾（有记录的组保持原样，未开始的组关闭），
- *   在原动作之后插入一个新的递减组实例承接剩余轮次。
- * · 已有实际数据绝不因转换而消失。
- */
-export function convertExerciseToDropSet(
-  session: Session,
-  exId: string,
-  target: DropSetTarget,
-): { session: Session; converted: boolean; message: string } {
-  const idx = session.exercises.findIndex((e) => e.id === exId);
-  if (idx < 0) return { session, converted: false, message: '找不到这个动作' };
-  const old = session.exercises[idx];
-  const rounds = roundsOf(old);
-  // 只有「真未开始」的组才能转换：填了 reps/weight/status 的组一律算已开始
-  const notStarted = rounds.filter((r) => !groupHasActualInput(old, r));
-
-  // 所有组都真未开始：整条转换
-  if (notStarted.length === rounds.length) {
-    const newGroups = groupsFromTarget(target);
-    const sets: SessionSet[] = [];
-    for (const g of newGroups) {
-      for (let si = 1; si <= g.stageCount; si++) {
-        sets.push(blankSet(g.index, si, Boolean(target.stages[si - 1]?.toFailure)));
-      }
-    }
-    const next: SessionExercise = {
-      ...old,
-      target: structuredClone(target),
-      groups: newGroups,
-      sets,
-      status: 'pending',
-    };
-    const exercises = [...session.exercises];
-    exercises[idx] = next;
-    return {
-      session: { ...session, exercises },
-      converted: true,
-      message: `已把「${old.name}」改为 ${target.rounds} 轮 × ${target.stages.length} 阶段递减组`,
-    };
-  }
-
-  // 有已开始的组：旧结构保留（含只有 reps 的组），剩余未开始的轮次转成一个新的递减组实例
-  if (notStarted.length === 0) {
-    return {
-      session,
-      converted: false,
-      message: `「${old.name}」的每一组都已经记录，没有可转换的剩余部分。`,
-    };
-  }
-
-  const keptOld: SessionExercise = {
-    ...old,
-    status: 'done',
-    groups: old.groups.map((g) => ({
-      ...g,
-      skipped: groupHasActualInput(old, g.index) ? false : true,
-    })),
-    // 已开始的组保留全部原始 set 行（含空阶段），未开始的组不留在旧动作上
-    sets: old.sets.filter((s) => groupHasActualInput(old, s.roundIndex)),
-    note: `${old.note ? old.note + ' · ' : ''}剩余部分已转为递减组`,
-  };
-
-  const carried = Math.min(notStarted.length, target.rounds);
-  const carriedTarget: DropSetTarget = { ...structuredClone(target), rounds: carried };
-  const newGroups = groupsFromTarget(carriedTarget);
-  const sets: SessionSet[] = [];
-  for (const g of newGroups) {
-    for (let si = 1; si <= g.stageCount; si++) {
-      sets.push(blankSet(g.index, si, Boolean(target.stages[si - 1]?.toFailure)));
-    }
-  }
-  const fresh: SessionExercise = {
-    id: newId('sex'),
-    exerciseId: old.exerciseId,
-    planExerciseId: null,
-    name: old.name,
-    restSec: old.restSec,
-    target: carriedTarget,
-    status: 'pending',
-    groups: newGroups,
-    sets,
-    note: `承接未开始的 ${carried} 轮，改为递减组`,
-  };
-
-  const exercises = [...session.exercises];
-  exercises.splice(idx, 1, keptOld, fresh);
-  return {
-    session: { ...session, exercises },
-    converted: true,
-    message: `「${old.name}」已记录部分保留，未开始的 ${carried} 轮改为递减组`,
-  };
-}
-
-/** 训练中把递减组改回普通组（同样只影响未开始部分） */
-export function convertExerciseToStraight(
-  session: Session,
-  exId: string,
-  straight: StraightTarget,
-): { session: Session; converted: boolean; message: string } {
-  const idx = session.exercises.findIndex((e) => e.id === exId);
-  if (idx < 0) return { session, converted: false, message: '找不到这个动作' };
-  const old = session.exercises[idx];
-  const rounds = roundsOf(old);
-  // 只有「真未开始」的组才能转换：填了 reps/weight/status 的组一律算已开始
-  const notStarted = rounds.filter((r) => !groupHasActualInput(old, r));
-
-  // 所有组都真未开始：整条转换
-  if (notStarted.length === rounds.length) {
-    const groups = groupsFromTarget(straight);
-    const next: SessionExercise = {
-      ...old,
-      target: structuredClone(straight),
-      groups,
-      sets: groups.map((g) => blankSet(g.index, 1)),
-      status: 'pending',
-    };
-    const exercises = [...session.exercises];
-    exercises[idx] = next;
-    return {
-      session: { ...session, exercises },
-      converted: true,
-      message: `已把「${old.name}」改为普通组 ${straight.sets} 组`,
-    };
-  }
-
-  if (notStarted.length === 0) {
-    return { session, converted: false, message: `「${old.name}」没有可转换的剩余组。` };
-  }
-
-  const keptOld: SessionExercise = {
-    ...old,
-    status: 'done',
-    groups: old.groups.map((g) => ({ ...g, skipped: !groupHasActualInput(old, g.index) })),
-    // 已开始的组保留全部原始 set 行（含只有 reps 的组），未开始的组不留在旧动作上
-    sets: old.sets.filter((s) => groupHasActualInput(old, s.roundIndex)),
-  };
-  const carriedStraight: StraightTarget = {
-    ...structuredClone(straight),
-    sets: Math.min(notStarted.length, straight.sets),
-    setsMax: Math.min(notStarted.length, straight.sets),
-  };
-  const groups = groupsFromTarget(carriedStraight);
-  const fresh: SessionExercise = {
-    id: newId('sex'),
-    exerciseId: old.exerciseId,
-    planExerciseId: null,
-    name: old.name,
-    restSec: old.restSec,
-    target: carriedStraight,
-    status: 'pending',
-    groups,
-    sets: groups.map((g) => blankSet(g.index, 1)),
-    note: `承接未开始的 ${groups.length} 组，改为普通组`,
-  };
-  const exercises = [...session.exercises];
-  exercises.splice(idx, 1, keptOld, fresh);
-  return {
-    session: { ...session, exercises },
-    converted: true,
-    message: `已记录部分保留，未开始的 ${groups.length} 组改为普通组`,
-  };
-}
-
-/**
  * 撤销跳过：只清掉 groups 上的 skipped 标记，已做数据一律不动。
  * 动作级 status 按实际记录重算（不再无脑重置为 pending，
  * 否则「做完 1 组再跳过 → 取消跳过」会把已有记录的动作降级成未开始）。
@@ -795,378 +933,6 @@ export function unskipExercise(session: Session, exId: string): Session {
   };
 }
 
-/**
- * 标记整个动作完成：只改动作级状态，**绝不**凭空把空白组写成已完成。
- * 空白组保持 blank；已有缺次数的组保持 partial。
- */
-export function replaceExerciseInSession(
-  session: Session,
-  exId: string,
-  name: string,
-  opts: { exerciseId?: string; config?: ReplaceExerciseConfig } = {},
-): { session: Session; replaced: boolean; message: string } {
-  const idx = session.exercises.findIndex((e) => e.id === exId);
-  if (idx < 0) return { session, replaced: false, message: '找不到要替换的动作' };
-  const old = session.exercises[idx];
-  const newExerciseId = opts.exerciseId ?? exerciseIdFromName(name);
-  const kind = old.target.kind;
-
-  const rounds = roundsOf(old);
-  const fullyDone = rounds.filter((r) => dropRoundComplete(old, r));
-  // 「已开始」= 有任何实际输入（reps / weight / status / 备注），不只是「计入完成量」的那些
-  const startedRounds = rounds.filter((r) => groupHasActualInput(old, r));
-  const notStartedRounds = rounds.filter((r) => !groupHasActualInput(old, r));
-
-  /**
-   * 新动作本次的组数/轮数（需求 1）。
-   * · 未指定 → 沿用「可承接的完整组数」（保持旧行为，替换不凭空增减量）。
-   * · 指定 → 用用户确认的值，按目标类型夹紧到合法上限（不静默截断成非法值）。
-   * 注意：这只决定**新动作**的组数，原动作的组结构一个都不改。
-   */
-  const carriedCount = notStartedRounds.length;
-  const wantedGroups = clampGroupCount(kind, opts.config?.sets ?? carriedCount);
-
-  /**
-   * 新动作的休息配置（预审反馈 3）。
-   *
-   * 缺省值必须**按目标类型取该动作真正使用的休息字段**，不能一律读 ex.restSec：
-   * · 普通组：休息就是 ex.restSec。
-   * · 递减组：ex.restSec 是历史遗留、实际不参与计时（见 restConfigFor）；
-   *   真正的「轮间/组间休息」是 target.restAfterSec。若缺省取 ex.restSec，
-   *   原 restSec=120 / restAfterSec=90 的动作会在替换后被**无意改成 120**。
-   * 这与 replaceConfigSeedFor 的取法保持一致（同一份规则，两处不能分叉）。
-   */
-  const defaultRestSec =
-    kind === 'dropSet'
-      ? clampRestSec((old.target as DropSetTarget).restAfterSec)
-      : clampRestSec(old.restSec);
-  const nextRestSec =
-    opts.config?.restSec === undefined ? defaultRestSec : clampRestSec(opts.config.restSec);
-
-  /** 递减组阶段结构沿用原动作（阶段数、力竭标记都不改） */
-  const stageCountOf = (round: number): number => {
-    if (kind !== 'dropSet') return 1;
-    const fromSnapshot = requiredStages(old, round);
-    return Math.max(1, fromSnapshot);
-  };
-  /** 新建轮次（超出原未开始组数时）沿用第一个可承接轮的结构，否则用目标阶段数 */
-  const fallbackStageCount =
-    kind === 'dropSet'
-      ? Math.max(
-          1,
-          carriedCount > 0
-            ? requiredStages(old, notStartedRounds[0])
-            : (old.target as DropSetTarget).stages.length,
-        )
-      : 1;
-
-  /**
-   * B4：把用户设置的**每组目标次数**应用到新动作 target（两分支共用）。
-   *
-   * 规则（产品裁决）：
-   *   · 普通组：沿用既有 target 模型，只改 repsMin/repsMax；固定次数=上下限相同；
-   *   · 递减组：**逐阶段**只覆盖 repsMin/repsMax/toFailure，
-   *     保留阶段数量/顺序/label/weightKg/其它结构；
-   *   · 只改 target（目标），**绝不改 actual**（新记录 reps/weight 仍 null/blank）；
-   *   · 同步更新派生文案 targetText，避免数字已改但摘要仍显示旧次数。
-   */
-  /**
-   * B4-R1：目标次数覆盖的**合法性校验**（domain 层）。
-   *
-   * UI 校验不能替代领域校验：非法值若进入 session，会生成**无法备份恢复**的记录
-   * （validate.ts 会拒绝整份备份）。这里按既有 limits 真源逐项检查，
-   * 非法直接**拒绝替换**（返回原 session，不静默夹紧）。
-   */
-  const repsOverrideError = (ov: ReplaceRepsOverride | undefined): string | null => {
-    if (!ov) return null;
-    /**
-     * B4-R2（已证缺口 4）：**kind 不匹配必须最先拒绝**。
-     *
-     * <p>真实失败（22 例 20 PASS / 2 FAIL）：
-     * <ul>
-     *   <li>普通 target + dropSet override → 走到 dropSet 分支读
-     *       {@code old.target.stages.length} → **TypeError**（未捕获的崩溃）；</li>
-     *   <li>dropSet target + straight override → 通过范围校验，但
-     *       {@code applyRepsOverride} 返回**原样**的 drop target，
-     *       外层却报 {@code replaced:true} —— 假称成功且静默忽略用户目标。</li>
-     * </ul>
-     *
-     * <p>两者都是公开 union 的合法成员组合，属于 API 边界缺口。
-     * 这里在读任何 shape-specific 字段**之前**先比 kind，
-     * 返回明确失败（调用方据此返回原 session、replaced:false）。
-     * 不盲 catch、不改既有断言。
-     */
-    if (ov.kind !== old.target.kind) {
-      return '目标次数类型与动作目标类型不一致，无法应用';
-    }
-    const okInt = (n: unknown): n is number =>
-      typeof n === 'number' && Number.isInteger(n) && n >= 0 && n <= MAX_REPS;
-    if (ov.kind === 'straight') {
-      if (!okInt(ov.repsMin) || !okInt(ov.repsMax)) {
-        return `每组目标次数必须是 0–${MAX_REPS} 的整数`;
-      }
-      if (ov.repsMin > ov.repsMax) return '每组目标次数的下限不能大于上限';
-      return null;
-    }
-    // dropSet：阶段数量必须与目标一致
-    const base = old.target as DropSetTarget;
-    if (ov.stages.length !== base.stages.length) {
-      return '阶段数量与目标不一致，无法应用目标次数';
-    }
-    for (let i = 0; i < ov.stages.length; i += 1) {
-      const st = ov.stages[i];
-      const baseSt = base.stages[i];
-      const toFailure = st.toFailure ?? baseSt.toFailure;
-      if (toFailure) continue; // 力竭阶段不要求次数
-      const min = st.repsMin ?? baseSt.repsMin;
-      const max = st.repsMax ?? baseSt.repsMax;
-      if (!okInt(min) || !okInt(max)) {
-        return `第 ${i + 1} 阶段的目标次数必须是 0–${MAX_REPS} 的整数`;
-      }
-      if (min > max) return `第 ${i + 1} 阶段的下限不能大于上限`;
-    }
-    return null;
-  };
-
-  const applyRepsOverride = (base: StraightTarget | DropSetTarget): StraightTarget | DropSetTarget => {
-    const ov = opts.config?.reps;
-    if (!ov) return base;
-    if (base.kind === 'straight') {
-      /**
-       * 理论上不可达：kind 不匹配已在 repsOverrideError 早拒。
-       * 保留返回原 target 作为防御，但**绝不能**让外层报 replaced:true
-       * （外层只在 repsErr 为空时才继续，因此不会走到这里）。
-       */
-      if (ov.kind !== 'straight') return base;
-      const t = base as StraightTarget;
-      return {
-        ...t,
-        repsMin: ov.repsMin,
-        repsMax: ov.repsMax,
-      };
-    }
-    if (ov.kind !== 'dropSet') return base;
-    const t = base as DropSetTarget;
-    const stages = t.stages.map((st, i) => {
-      const patch = ov.stages[i];
-      if (!patch) return st; // 未覆盖的阶段原样保留
-      const toFailure = patch.toFailure ?? st.toFailure;
-      const repsMin = toFailure ? null : (patch.repsMin ?? st.repsMin);
-      const repsMax = toFailure ? null : (patch.repsMax ?? st.repsMax);
-      return {
-        ...st,
-        repsMin,
-        repsMax,
-        toFailure,
-        // 更新派生文案：力竭阶段写「技术性力竭」，否则「下限–上限 次」
-        targetText: toFailure
-          ? '技术性力竭'
-          : repsMin !== null && repsMax !== null
-            ? repsMin === repsMax
-              ? `${repsMin} 次`
-              : `${repsMin}–${repsMax} 次`
-            : st.targetText,
-      };
-    });
-    return { ...t, stages };
-  };
-
-  /** B4-R1：非法目标次数直接拒绝（不生成无法备份的 session） */
-  const repsErr = repsOverrideError(opts.config?.reps);
-  if (repsErr) return { session, replaced: false, message: repsErr };
-
-  /**
-   * 已应用目标次数覆盖的基准 target（供 buildGroupsAndSets 取力竭标志）。
-   * 未提供 reps 时等价于原 target。
-   */
-  const effectiveTarget = applyRepsOverride(
-    kind === 'dropSet'
-      ? structuredClone(old.target as DropSetTarget)
-      : { ...(old.target as StraightTarget) },
-  );
-
-  /** 按「用户确认的组数」构造新动作的组结构 + 空记录行 */
-  const buildGroupsAndSets = (): { groups: GroupPlan[]; sets: SessionSet[] } => {
-    const groups: GroupPlan[] = [];
-    const sets: SessionSet[] = [];
-    for (let i = 0; i < wantedGroups; i += 1) {
-      const srcRound = notStartedRounds[i];
-      const stageCount = srcRound !== undefined ? stageCountOf(srcRound) : fallbackStageCount;
-      groups.push({ index: i + 1, stageCount });
-      for (let si = 1; si <= stageCount; si += 1) {
-        // 力竭标记只在递减组有意义，且必须跟随原结构，不能靠位置猜
-        /**
-         * B4-R1：新空 set 的力竭标志必须来自**新目标**（可能已被用户切换），
-         * 不能用旧 target —— 否则 UI 勾了力竭、记录行却仍按旧标志构造。
-         */
-        const toFailure =
-          kind === 'dropSet'
-            ? Boolean(
-                (effectiveTarget as DropSetTarget | null)?.stages[si - 1]?.toFailure ??
-                  (old.target as DropSetTarget).stages[si - 1]?.toFailure,
-              )
-            : false;
-        sets.push({
-          id: newId('set'),
-          roundIndex: i + 1,
-          stageIndex: si,
-          reps: null,
-          weightKg: null,
-          status: 'blank' as SetStatus,
-          ...(toFailure ? { toFailure: true } : {}),
-        });
-      }
-    }
-    return { groups, sets };
-  };
-
-  // ── 情况 1：所有组都真未开始 → 原地替换（位置不变，组数/休息按用户确认值） ──
-  if (notStartedRounds.length === rounds.length) {
-    const { groups, sets } = buildGroupsAndSets();
-    /**
-     * 预审反馈 4：联合上限校验。超限**拒绝替换**（返回原 session 不变），
-     * 不静默裁剪轮数，也不生成备份无法恢复的记录。
-     */
-    const budget = checkGroupRowBudget(
-      groups.length,
-      groups.map((g) => g.stageCount),
-    );
-    if (!budget.ok) return { session, replaced: false, message: budget.message };
-    const replacement: SessionExercise = {
-      ...old,
-      id: newId('sex'),
-      exerciseId: newExerciseId,
-      planExerciseId: null,
-      name,
-      status: 'pending',
-      restSec: nextRestSec,
-      // 递减组：轮数随用户确认值；阶段结构原样保留，只更新轮间休息
-      target: applyRepsOverride(
-        kind === 'dropSet'
-          ? {
-              ...structuredClone(old.target as DropSetTarget),
-              rounds: groups.length,
-              restAfterSec: nextRestSec,
-            }
-          : {
-              ...(old.target as StraightTarget),
-              sets: groups.length,
-              setsMax: groups.length,
-            },
-      ),
-      groups,
-      sets,
-      note: old.note ?? '',
-      replacedFrom: old.name,
-    };
-    const exercises = [...session.exercises];
-    exercises[idx] = replacement;
-    return {
-      session: { ...session, exercises },
-      replaced: true,
-      message:
-        opts.config?.sets === undefined && opts.config?.restSec === undefined
-          ? `已替换为「${name}」，位置与结构不变`
-          : `已替换为「${name}」，本次 ${groups.length} ${kind === 'dropSet' ? '轮' : '组'}、休息 ${nextRestSec} 秒`,
-    };
-  }
-
-  // ── 情况 2：有记录，但没有「未开始的完整组」可承接 ──
-  if (notStartedRounds.length === 0) {
-    return {
-      session,
-      replaced: false,
-      message: `「${old.name}」的每一组都已经开始记录，没有可承接的完整组。请用「临时加动作」另加「${name}」。`,
-    };
-  }
-
-  // ── 情况 3：有已开始的组 + 有未开始的组 → 旧动作收尾，新动作承接 ──
-  // 旧动作：保留全部实际数据（含只有 reps 的组）；未开始的组标记 skipped
-  // 硬要求：已有原动作数据继续归属原动作，不删除、不改名、不迁移到新动作。
-  const keptGroups: GroupPlan[] = old.groups.map((g) => ({
-    ...g,
-    // 只对「无实际输入」的组标记 skip；有输入但未完成的组保持原样（部分大组）
-    skipped: !groupHasActualInput(old, g.index),
-  }));
-
-  const keptSets = old.sets.filter((s) => {
-    const g = old.groups.find((x) => x.index === s.roundIndex);
-    if (!g) return false;
-    // 保留有输入的组的所有阶段行（含空阶段，便于看出缺哪个阶段）
-    return groupHasActualInput(old, g.index);
-  });
-
-  const keptOld: SessionExercise = {
-    ...old,
-    status: 'done',
-    groups: keptGroups,
-    sets: keptSets,
-    note: `${old.note ? old.note + ' · ' : ''}剩余部分已替换为「${name}」`,
-  };
-
-  const { groups: carriedGroups, sets: freshSets } = buildGroupsAndSets();
-
-  /**
-   * 预审反馈 4：承接路径同样要过联合上限。
-   * 此时**尚未构造任何新 session**，直接返回原 session，保证「拒绝且不改数据」。
-   */
-  const carriedBudget = checkGroupRowBudget(
-    carriedGroups.length,
-    carriedGroups.map((g) => g.stageCount),
-  );
-  if (!carriedBudget.ok) return { session, replaced: false, message: carriedBudget.message };
-
-  /**
-   * 新动作的目标：普通组按确认组数；递减组按确认轮数 + 原有阶段结构。
-   * B4：**两个分支共用同一目标构造规则** —— 这里同样应用每组目标次数覆盖。
-   */
-  const newTarget: ExerciseTarget = applyRepsOverride(
-    kind === 'straight'
-      ? {
-          ...(old.target as StraightTarget),
-          sets: carriedGroups.length,
-          setsMax: carriedGroups.length,
-        }
-      : {
-          ...structuredClone(old.target as DropSetTarget),
-          rounds: carriedGroups.length,
-          restAfterSec: nextRestSec,
-        },
-  ) as ExerciseTarget;
-
-  const fresh: SessionExercise = {
-    id: newId('sex'),
-    exerciseId: newExerciseId,
-    planExerciseId: null,
-    name,
-    restSec: nextRestSec,
-    target: newTarget,
-    status: 'pending',
-    groups: carriedGroups,
-    sets: freshSets,
-    note: `承接「${old.name}」未开始的部分，本次 ${carriedGroups.length} ${
-      kind === 'dropSet' ? '轮' : '组'
-    }`,
-    replacedFrom: old.name,
-  };
-
-  const exercises = [...session.exercises];
-  exercises.splice(idx, 1, keptOld, fresh);
-
-  const keptSummary =
-    kind === 'dropSet'
-      ? `${fullyDone.length} 轮完整、${startedRounds.length - fullyDone.length} 轮部分`
-      : `${startedRounds.length} 组已开始`;
-
-  return {
-    session: { ...session, exercises },
-    replaced: true,
-    message: `「${old.name}」保留 ${keptSummary}；「${name}」本次 ${carriedGroups.length} ${
-      kind === 'dropSet' ? '轮' : '组'
-    }、休息 ${nextRestSec} 秒`,
-  };
-}
-
 export function markExerciseDone(session: Session, exId: string): Session {
   return {
     ...session,
@@ -1174,25 +940,125 @@ export function markExerciseDone(session: Session, exId: string): Session {
   };
 }
 
+/**
+ * 新增一组/一轮的容量阻断（R02 FIX3）。
+ *
+ * 领域层必须先于 UI 阻止非法增长，绝不能“先写坏、导出/备份时再失败”：
+ * · 多阶段动作的轮数上限 MAX_ROUNDS（20）；
+ * · 单动作总行数上限 MAX_SET_ROWS（200，按各轮真实 stageCount 求和）。
+ * 普通组保持既有语义（不在此改变），其它门禁不变。
+ */
+export interface AddSetBlock {
+  kind: 'rounds' | 'rows';
+  message: string;
+}
+
+export function addSetBlocker(ex: SessionExercise): AddSetBlock | null {
+  if (ex.target.kind !== 'dropSet') return null;
+  const maxRound = ex.groups.reduce((m, g) => Math.max(m, g.index), 0);
+  const newRound = maxRound + 1;
+  if (newRound > MAX_ROUNDS) {
+    return {
+      kind: 'rounds',
+      message: `已达 ${MAX_ROUNDS} 轮上限，不能再加一轮。`,
+    };
+  }
+  const prevGroup = ex.groups.find((g) => g.index === maxRound);
+  const fallbackSc = groupPlanForTarget(ex.target).reduce((m, g) => Math.max(m, g.stageCount), 0);
+  const stageCount = Math.max(1, prevGroup?.stageCount ?? fallbackSc ?? 1);
+  const currentRows = ex.groups.reduce((n, g) => n + Math.max(1, g.stageCount), 0);
+  const nextRows = currentRows + stageCount;
+  if (nextRows > MAX_SET_ROWS) {
+    return {
+      kind: 'rows',
+      message: `再加一轮会生成 ${nextRows} 行，超过单动作上限 ${MAX_SET_ROWS} 行（当前 ${currentRows} 行）。`,
+    };
+  }
+  return null;
+}
+
+/**
+ * 在当前动作末尾新增一组/一轮（R02a）。
+ *
+ * 用户规则：新增轮必须继承**紧邻上一轮**的小组数量、阶段配置与身份；
+ * 实际 reps/weightKg 一律 null、status blank、生成全新 set.id，
+ * **绝不复制** done/skipped/actual/note 等运行态。
+ * 第一轮/旧数据无可靠来源时兼容回退到目标配置；普通组保持原语义（1 阶段）。
+ *
+ * R02 FIX2（F1）：新增轮的生效配置必须**物化**到 `target.roundConfigs`
+ * （roundIndex = 新轮），否则 `roundStagesOf` 会回退到默认 stages / 更早的
+ * override，跨训练页、重新打开编辑器、模板/备份都会丢失“紧邻上一轮”的配置。
+ * 物化后的 target.rounds 同步覆盖到新轮，保证配置是合法、可导出的纯配置。
+ */
 export function addSetTo(session: Session, exId: string): Session {
   return {
     ...session,
     exercises: session.exercises.map((ex) => {
       if (ex.id !== exId) return ex;
-      const maxRound = ex.groups.reduce((m, g) => Math.max(m, g.index), 0);
-      const stageCount = ex.target.kind === 'dropSet' ? Math.max(1, ex.target.stages.length) : 1;
-      const groups = [...ex.groups, { index: maxRound + 1, stageCount }];
+      // 领域层硬门禁：超轮数/超行数直接拒绝增长（返回原动作，不产生半套数据）。
+      if (addSetBlocker(ex)) return ex;
+      // 旧 addSetTo 可能留下缺失 stageId 的轮；先做可证明的确定性解析，
+      // 让“上一轮”的身份来源可靠（不可证明的轮保持原样，不硬配）。
+      const base = resolveMissingStageIdsFromConfig(ex).exercise;
+      const maxRound = base.groups.reduce((m, g) => Math.max(m, g.index), 0);
+      const prevRound = maxRound > 0 ? maxRound : 1;
+      const prevGroup = base.groups.find((g) => g.index === prevRound);
+      const fallbackGroup = groupPlanForTarget(base.target)[Math.max(0, prevRound - 1)];
+      const stageCount = Math.max(1, prevGroup?.stageCount ?? fallbackGroup?.stageCount ?? 1);
+      const prevSets = dropRoundSets(base, prevRound);
+      const newRound = maxRound + 1;
+      // 上一轮的真实生效阶段配置（逐轮 override → 默认 stages 的统一解析）。
+      const prevStages = base.target.kind === 'dropSet' ? roundStagesOf(base.target, prevRound) : [];
+      const prevIdentities = base.target.kind === 'dropSet' ? resolveRoundStageIdentities(base.target, prevRound) : [];
+      const newStages: DropStageTarget[] = Array.from({ length: stageCount }, (_, i) => {
+        const stageIndex = i + 1;
+        const prevSet = prevSets.find((s) => s.stageIndex === stageIndex);
+        const source = prevStages[stageIndex - 1];
+        const copy: DropStageTarget = source
+          ? (structuredClone(source) as DropStageTarget)
+          : {
+              label: `第 ${stageIndex} 阶段`,
+              weightKg: null,
+              repsMin: null,
+              repsMax: null,
+              toFailure: false,
+              targetText: '',
+            };
+        // 身份优先取上一轮真实 set.stageId；旧数据行里没有时取统一解析出的
+        // 上一轮身份（含旧数据 stage-pos-N / 可证明的 override 同源身份）；
+        // 新轮继承上一轮身份，保证“加一轮后沿用上一轮”按阶段精确对应。
+        if (prevSet?.stageId) copy.id = prevSet.stageId;
+        else if (prevIdentities[stageIndex - 1]?.id) copy.id = prevIdentities[stageIndex - 1].id;
+        if (prevSet?.toFailure !== undefined) copy.toFailure = prevSet.toFailure;
+        return copy;
+      });
+      let target = base.target;
+      if (base.target.kind === 'dropSet') {
+        const clone = structuredClone(base.target);
+        const prevOverride = clone.roundConfigs?.find((r) => r.roundIndex === prevRound);
+        const entry = {
+          roundIndex: newRound,
+          stages: newStages,
+          // 上一轮的轮级短歇若为显式覆盖，新轮一并继承；否则沿用 target.restInSec。
+          ...(prevOverride?.restInSec !== undefined ? { restInSec: prevOverride.restInSec } : {}),
+        };
+        clone.roundConfigs = [...(clone.roundConfigs ?? []).filter((r) => r.roundIndex !== newRound), entry].sort(
+          (a, b) => a.roundIndex - b.roundIndex,
+        );
+        clone.rounds = Math.max(clone.rounds, newRound);
+        target = clone;
+      }
+      const groups = [...base.groups, { index: newRound, stageCount }];
       const sets = [
-        ...ex.sets,
-        ...Array.from({ length: stageCount }, (_, i) =>
-          blankSet(
-            maxRound + 1,
-            i + 1,
-            ex.target.kind === 'dropSet' ? Boolean(ex.target.stages[i]?.toFailure) : false,
-          ),
-        ),
+        ...base.sets,
+        ...Array.from({ length: stageCount }, (_, i) => {
+          const stageIndex = i + 1;
+          const resolved = resolveGroupConfig(target, newRound, stageIndex);
+          const stageId = resolved.stageId ?? newStages[stageIndex - 1]?.id ?? undefined;
+          return blankSet(newRound, stageIndex, resolved.toFailure, stageId);
+        }),
       ];
-      return { ...ex, groups, sets };
+      return { ...base, target, groups, sets };
     }),
   };
 }
@@ -1204,9 +1070,12 @@ export function removeSetFrom(session: Session, exId: string, setId: string): Se
       if (ex.id !== exId) return ex;
       const target = ex.sets.find((s) => s.id === setId);
       if (!target) return ex;
-      // 递减组按整轮删除，普通组删单组
-      const drop = ex.target.kind === 'dropSet' ? ex.sets.filter((s) => s.roundIndex === target.roundIndex) : [target];
-      const dropIds = new Set(drop.map((s) => s.id));
+      // 递减组/超级组按整轮删除；普通组删单组（保持既有语义）。
+      const isDrop = ex.target.kind === 'dropSet';
+      if (isDrop && ex.groups.length <= 1) return ex;
+      const dropIds = isDrop
+        ? new Set(ex.sets.filter((s) => s.roundIndex === target.roundIndex).map((s) => s.id))
+        : new Set([target.id]);
       const groups = ex.groups.filter((g) => g.index !== target.roundIndex);
       // 重排组序号，保持连续
       const reindexed = groups.map((g, i) => ({ ...g, index: i + 1 }));
@@ -1214,7 +1083,20 @@ export function removeSetFrom(session: Session, exId: string, setId: string): Se
       const sets = ex.sets
         .filter((s) => !dropIds.has(s.id))
         .map((s) => ({ ...s, roundIndex: remap.get(s.roundIndex) ?? s.roundIndex }));
-      return { ...ex, groups: reindexed, sets };
+      if (!isDrop) return { ...ex, groups: reindexed, sets };
+      // R02 FIX3：删中间整轮后 groups/sets 已重排，target.rounds 与逐轮配置
+      // 必须按同一 remap 跟随，不能简单 filter(index <= 新长度) 丢掉别的轮配置。
+      const clone = structuredClone(ex.target) as Extract<ExerciseTarget, { kind: 'dropSet' }>;
+      const nextConfigs = (clone.roundConfigs ?? [])
+        .flatMap((rc) => {
+          const nextIndex = remap.get(rc.roundIndex);
+          return nextIndex === undefined ? [] : [{ ...rc, roundIndex: nextIndex }];
+        })
+        .sort((a, b) => a.roundIndex - b.roundIndex);
+      clone.rounds = Math.max(1, Math.min(MAX_ROUNDS, reindexed.length));
+      if (nextConfigs.length) clone.roundConfigs = nextConfigs;
+      else delete clone.roundConfigs;
+      return { ...ex, groups: reindexed, sets, target: clone };
     }),
   };
 }
@@ -1222,6 +1104,9 @@ export function removeSetFrom(session: Session, exId: string, setId: string): Se
 /**
  * 删除递减组的整轮（审计任务 K-9：删已记录轮前需确认，UI 负责）。
  * 直练动作等价于删最后一组。
+ *
+ * R02 FIX3：与 addSetTo 对称，必须同步清理 target.rounds 与已删除轮的
+ * roundConfigs，否则训练卡轮数与提取模板会保留幽灵轮。
  */
 export function removeLastRound(session: Session, exId: string): Session {
   return {
@@ -1231,11 +1116,18 @@ export function removeLastRound(session: Session, exId: string): Session {
       const rounds = roundsOf(ex);
       if (rounds.length <= 1) return ex;
       const last = rounds[rounds.length - 1];
-      return {
-        ...ex,
-        groups: ex.groups.filter((g) => g.index !== last),
-        sets: ex.sets.filter((s) => s.roundIndex !== last),
-      };
+      const groups = ex.groups.filter((g) => g.index !== last);
+      const sets = ex.sets.filter((s) => s.roundIndex !== last);
+      if (ex.target.kind !== 'dropSet') {
+        return { ...ex, groups, sets };
+      }
+      const clone = structuredClone(ex.target) as Extract<ExerciseTarget, { kind: 'dropSet' }>;
+      const nextConfigs = (clone.roundConfigs ?? []).filter((rc) => rc.roundIndex !== last);
+      const maxGroup = groups.reduce((m, g) => Math.max(m, g.index), 0);
+      clone.rounds = Math.max(1, Math.min(MAX_ROUNDS, maxGroup || clone.rounds - 1));
+      clone.roundConfigs = nextConfigs.filter((rc) => rc.roundIndex <= clone.rounds);
+      if (!clone.roundConfigs.length) delete clone.roundConfigs;
+      return { ...ex, groups, sets, target: clone };
     }),
   };
 }
@@ -1248,139 +1140,6 @@ export function lastRoundHasRecords(ex: SessionExercise): boolean {
   return ex.sets
     .filter((s) => s.roundIndex === last)
     .some((s) => s.status !== 'blank' || s.reps !== null || s.weightKg !== null);
-}
-
-export function moveExercise(session: Session, exId: string, dir: -1 | 1): Session {
-  const idx = session.exercises.findIndex((e) => e.id === exId);
-  const swap = idx + dir;
-  if (idx < 0 || swap < 0 || swap >= session.exercises.length) return session;
-  const next = [...session.exercises];
-  const a = next[idx];
-  const b = next[swap];
-  next[idx] = b;
-  next[swap] = a;
-  return { ...session, exercises: next };
-}
-
-/* ── 临时添加力量动作（本次训练）：先配置，确认后才追加 ──────────
-   用户反馈问题二：旧行为是「选动作/输入名字 → 直接添加」，组数固定 3、
-   次数固定 8–12、休息固定 120 秒，用户无法先设定本次目标。
-
-   现在改成两段式：
-     ① UI 收集「组数 / 每组目标次数 / 组间休息」草稿（不写 session）；
-     ② 用户确认后，用**当前 raw 输入**构造一份完整配置，交给本函数追加一次。
-
-   领域约束（与 limits.ts 唯一真源一致，超限明确拒绝，绝不静默裁剪）：
-   · 组数 1–MAX_STRAIGHT_SETS；次数 0–MAX_REPS 且下限 ≤ 上限；
-     固定次数 = 上下限相等（沿用既有模型，不新增字段）。
-   · 休息 0–MAX_REST（0 合法 = 不休息）。
-   · 动作数受 MAX_EXERCISES 约束，与备份校验同一条边界。
-   · 只追加到本次 session 快照：原计划、历史、循环游标、既有动作记录都不变。
-   · 新动作的 actual 全部为空（reps/weightKg = null、status = 'blank'），
-     目标次数只写进 target，绝不写成实际完成。 */
-
-/** 临时添加动作的完整配置（一次添加意图的全部输入） */
-export interface LooseExerciseConfig {
-  name: string;
-  /** 本次组数（普通组） */
-  sets: number;
-  /** 每组目标次数下限（与上限相等表示固定次数） */
-  repsMin: number;
-  /** 每组目标次数上限 */
-  repsMax: number;
-  /** 组间休息秒数 */
-  restSec: number;
-}
-
-export type LooseExerciseConfigCheck =
-  | { ok: true; config: LooseExerciseConfig }
-  | { ok: false; message: string };
-
-/**
- * 校验并归一化一份「临时添加动作」配置。
- *
- * 纯函数：UI 在确认前调用一次（提示用），领域在追加前再调用一次
- * （真正的边界，防止绕过 UI 直接调用产生非法数据）。
- */
-export function checkLooseExerciseConfig(cfg: LooseExerciseConfig): LooseExerciseConfigCheck {
-  const name = typeof cfg.name === 'string' ? cfg.name.trim() : '';
-  if (!name) return { ok: false, message: '动作名不能为空' };
-  if (!Number.isInteger(cfg.sets) || cfg.sets < 1 || cfg.sets > MAX_STRAIGHT_SETS) {
-    return { ok: false, message: `组数必须是 1–${MAX_STRAIGHT_SETS} 的整数` };
-  }
-  for (const [label, v] of [
-    ['次数下限', cfg.repsMin],
-    ['次数上限', cfg.repsMax],
-  ] as const) {
-    if (!Number.isInteger(v) || v < 0 || v > MAX_REPS) {
-      return { ok: false, message: `${label}必须是 0–${MAX_REPS} 的整数` };
-    }
-  }
-  if (cfg.repsMin > cfg.repsMax) {
-    return { ok: false, message: '每组目标次数的下限不能大于上限' };
-  }
-  if (!Number.isInteger(cfg.restSec) || cfg.restSec < 0 || cfg.restSec > MAX_REST) {
-    return { ok: false, message: `休息秒数必须是 0–${MAX_REST} 的整数` };
-  }
-  return { ok: true, config: { ...cfg, name } };
-}
-
-/**
- * 按配置追加一个临时动作（**只追加一次**，幂等由调用方按提交身份保证）。
- *
- * @returns added=false 时 session 原样返回，message 是明确拒绝原因
- *          （容量已达上限 / 配置不合法），绝不静默截断或部分写入。
- */
-export function addConfiguredLooseExercise(
-  session: Session,
-  cfg: LooseExerciseConfig,
-): { session: Session; added: boolean; message: string } {
-  const checked = checkLooseExerciseConfig(cfg);
-  if (!checked.ok) return { session, added: false, message: checked.message };
-  const c = checked.config;
-
-  // 容量在领域边界核验：与备份校验同一条 MAX_EXERCISES，拒绝而非裁剪
-  if (session.exercises.length >= MAX_EXERCISES) {
-    return {
-      session,
-      added: false,
-      message: `本次训练已经有 ${MAX_EXERCISES} 个动作，达到上限（备份也只支持这个范围）。请先移除或合并动作。`,
-    };
-  }
-
-  const planExercise: PlanExercise = {
-    id: newId('adhoc'),
-    exerciseId: exerciseIdFromName(c.name),
-    name: c.name,
-    restSec: c.restSec,
-    target: {
-      kind: 'straight',
-      sets: c.sets,
-      setsMax: c.sets,
-      repsMin: c.repsMin,
-      repsMax: c.repsMax,
-      weightMode: 'external',
-      suggestedWeightKg: null,
-    },
-  };
-  const ex = sessionExerciseFromPlan(planExercise);
-  const repsText = c.repsMin === c.repsMax ? `${c.repsMin}` : `${c.repsMin}–${c.repsMax}`;
-  return {
-    session: { ...session, exercises: [...session.exercises, { ...ex, added: true }] },
-    added: true,
-    message: `已添加「${c.name}」（${c.sets} 组 × ${repsText} 次 · 休息 ${c.restSec} 秒）`,
-  };
-}
-
-/**
- * 旧签名（组数/次数/休息固定默认值）——**保留给既有测试与历史调用**。
- *
- * 新的 UI 路径一律走 `addConfiguredLooseExercise`（先配置后确认）。
- * 这里委托给新函数，因此同样受 MAX_EXERCISES / limits 约束；
- * 被拒绝时返回原 session（不产生半条记录）。
- */
-export function addLooseExercise(session: Session, name: string, sets = 3, repsMin = 8, repsMax = 12): Session {
-  return addConfiguredLooseExercise(session, { name, sets, repsMin, repsMax, restSec: 120 }).session;
 }
 
 /* ── 从本次训练移除整个动作（用户反馈问题三）──────────────────
@@ -1397,7 +1156,7 @@ export function addLooseExercise(session: Session, name: string, sets = 3, repsM
 export interface ExerciseRemovalCheck {
   /** true = 有需要保护的实际输入/记录，不能直接移除 */
   protected: boolean;
-  /** 保护原因（UI 直接展示；「可跳过剩余组」的指引由 UI 补充） */
+  /** 删除影响原因（UI 预览/确认时展示；有记录时确认后可删除，不是永久禁止） */
   reasons: string[];
 }
 
@@ -1436,125 +1195,6 @@ export function removeExerciseFromSession(
     name: target.name,
   };
 }
-
-/**
- * 替换动作时可配置的「本次训练」参数（需求 1）。
- *
- * 语义边界（必须与需求一致）：
- * · sets  = **新动作本次要做的组数/轮数**，不是原动作剩余组数。
- * · restSec = 新动作本次的组间休息秒数（普通组写 ex.restSec；
- *             递减组写 target.restAfterSec —— 那是「完成整轮」后的休息，
- *             阶段间 restInSec 沿用原结构，不在这里改）。
- * · 两者都只影响本次 session 快照，**绝不回写计划**。
- *
- * 只允许「未开始的完整组」被承接：已有原动作数据继续归属原动作。
- */
-export interface ReplaceExerciseConfig {
-  /** 新动作本次的组数（普通组=组数，递减组=轮数）。undefined → 沿用可承接的组数 */
-  sets?: number;
-  /** 新动作本次的休息秒数。undefined → 沿用原动作的休息配置 */
-  restSec?: number;
-  /**
-   * B4 用户新增：**每组目标次数**（只作用于新动作的 target，不碰 actual）。
-   *
-   * 用区分普通/递减的联合类型，避免拿整份 target 覆盖（那会顺带改重量、
-   * 阶段结构、休息或模式）。缺省 → 完全保持旧行为。
-   */
-  reps?: ReplaceRepsOverride;
-}
-
-/**
- * 替换动作的目标次数覆盖（B4）。
- *
- * · `straight`：所有新组共用的次数范围（固定次数 = 上下限相同）；
- * · `dropSet`：**按阶段**给次数/力竭，保留原阶段数量、顺序、重量与其它结构。
- *
- * 只覆盖"用户明确设置的目标次数/力竭"，其余字段从原 target 克隆。
- */
-export type ReplaceRepsOverride =
-  | { kind: 'straight'; repsMin: number; repsMax: number }
-  | {
-      kind: 'dropSet';
-      /** 与目标 stages 等长；只覆盖 repsMin/repsMax/toFailure */
-      stages: Array<{ repsMin?: number; repsMax?: number; toFailure?: boolean }>;
-    };
-
-/** 组数上限按目标类型取：普通组 MAX_STRAIGHT_SETS，递减组 MAX_ROUNDS */
-function clampGroupCount(kind: 'straight' | 'dropSet', n: number): number {
-  const max = kind === 'straight' ? MAX_STRAIGHT_SETS : MAX_ROUNDS;
-  const min = kind === 'straight' ? 1 : MIN_ROUNDS;
-  if (!Number.isFinite(n)) return min;
-  return Math.min(max, Math.max(min, Math.trunc(n)));
-}
-
-/** 休息秒数的唯一合法化入口（0 合法 = 不休息；上限 MAX_REST） */
-export function clampRestSec(n: number): number {
-  if (!Number.isFinite(n)) return 0;
-  return Math.min(MAX_REST, Math.max(0, Math.trunc(n)));
-}
-
-/**
- * 组结构行数（groups.stageCount 之和）的联合上限校验（预审反馈 4）。
- *
- * 为什么需要单独一条：MAX_ROUNDS(20) 与 MAX_STAGES_ACCEPTED(12) 各自合法，
- * 但 20 × 12 = 240 行 > MAX_SET_ROWS(200)。历史数据里 12 阶段的动作本来能通过校验，
- * 替换时若允许把轮数拉到 20，就会生成**新备份无法恢复**的记录
- * （validate.ts 会以「组记录行数超过上限」拒绝整份备份）。
- *
- * 规则：超限时**明确拒绝**（返回错误消息），绝不静默裁剪轮数或阶段数。
- */
-export function checkGroupRowBudget(
-  rounds: number,
-  stageCounts: number[],
-): { ok: true } | { ok: false; message: string } {
-  // 行数 = 每轮阶段数之和（stageCounts 就是按轮给出的 stageCount）
-  const rows = stageCounts.reduce((n, c) => n + Math.max(1, c), 0);
-  if (rows > MAX_SET_ROWS) {
-    const per = stageCounts.length ? Math.max(...stageCounts.map((c) => Math.max(1, c))) : 1;
-    return {
-      ok: false,
-      message: `按 ${rounds} 轮 × ${per} 阶段会生成 ${rows} 行记录，超过单动作上限 ${MAX_SET_ROWS} 行。请减少轮数。`,
-    };
-  }
-  return { ok: true };
-}
-
-/**
- * 替换动作确认步骤的**初始值**（需求 1：初始值继承可承接的原动作配置）。
- *
- * 组数取「可承接的未开始组/轮数」——因为替换只承接这些；若一个都不可承接
- * （已有组全部开始记录），替换会被拒绝，此时组数回退到原动作总组数仅用于展示。
- * 休息取原动作本次快照的休息秒数（普通组 restSec；递减组 restAfterSec = 完成整轮后休息）。
- *
- * 这是纯函数，UI 只用它填初值；真正的上限夹紧发生在 replaceExerciseInSession。
- */
-export function replaceConfigSeedFor(ex: SessionExercise): {
-  sets: number;
-  restSec: number;
-  carriedCount: number;
-  kind: 'straight' | 'dropSet';
-} {
-  const kind = ex.target.kind;
-  const rounds = roundsOf(ex);
-  const carriedCount = rounds.filter((r) => !groupHasActualInput(ex, r)).length;
-  const restSec =
-    kind === 'dropSet' ? clampRestSec((ex.target as DropSetTarget).restAfterSec) : clampRestSec(ex.restSec);
-  const sets = clampGroupCount(kind, carriedCount > 0 ? carriedCount : rounds.length);
-  return { sets, restSec, carriedCount, kind };
-}
-
-/**
- * 替换动作（原地，不追加）。
- * · 未记录任何数据的动作：整条替换成新动作，位置不变。
- * · 已有实际记录：**保留已记录的原动作**，把剩余未完成的部分替换为新动作，
- *   并在新动作上标注来源，避免把旧记录错误归到新动作名下。
- *
- * 需求 1（替换后确认组数与休息）在此实现，全部是「本次训练」快照：
- * · config.sets 决定新动作本次的组数/轮数（不再是「剩余组数」）。
- * · config.restSec 决定新动作本次的休息秒数。
- * · 已有原动作数据（含部分组）绝不删除、不改名、不归到新动作。
- */
-
 
 /* ── 有氧项目的会话级操作（第2阶段）───────────── */
 
@@ -1609,5 +1249,76 @@ export function resumeCardioForSessionResume(session: Session, now = Date.now())
     ...session,
     cardio: (session.cardio ?? []).map((c) => (set.has(c.id) ? resumeCardio(c, now) : c)),
     cardioPausedBySession: [],
+  };
+}
+
+/* ── G1：把新配置应用到「当前训练」的某个动作 ───────────────
+   这是 G2 统一编辑器的领域入口：
+   · 只改本次 session 快照，不写计划、不改历史、不动循环游标；
+   · actual 与 SessionSet.id 保留；
+   · 删除已输入组/阶段必须先拿到 impact 确认（confirmImpact），不静默丢记录；
+   · 绝不调用旧自动拆卡逻辑。 */
+
+export interface ApplyTargetToSessionResult {
+  session: Session;
+  applied: boolean;
+  impact: TargetApplyImpact;
+  message: string;
+}
+
+export function applyTargetToSessionExercise(
+  session: Session,
+  exId: string,
+  nextTarget: ExerciseTarget,
+  opts: { confirmImpact?: boolean } = {},
+): ApplyTargetToSessionResult {
+  const idx = session.exercises.findIndex((e) => e.id === exId);
+  if (idx < 0) {
+    return {
+      session,
+      applied: false,
+      impact: {
+        formBefore: 'straight',
+        formAfter: 'straight',
+        groupCountBefore: 0,
+        groupCountAfter: 0,
+        stageCountBefore: 1,
+        stageCountAfter: 1,
+        roundStageCountsBefore: [],
+        roundStageCountsAfter: [],
+        weightModeBefore: 'external',
+        weightModeAfter: 'external',
+        dumbbellBasisBefore: 'total',
+        dumbbellBasisAfter: 'total',
+        removedWithData: [],
+        removedBlankCount: 0,
+        addedBlankCount: 0,
+        needsConfirmation: false,
+        messages: ['找不到这个动作'],
+        validationIssues: [],
+      },
+      message: '找不到这个动作',
+    };
+  }
+  const old = session.exercises[idx];
+  const r = applyTargetToExercise(old, nextTarget, { confirmImpact: opts.confirmImpact });
+  if (!r.applied) {
+    return {
+      session,
+      applied: false,
+      impact: r.impact,
+      message: r.impact.messages.join('；') || '配置未应用',
+    };
+  }
+  const exercises = [...session.exercises];
+  exercises[idx] = r.exercise;
+  return {
+    session: { ...session, exercises },
+    applied: true,
+    impact: r.impact,
+    message:
+      r.impact.messages.length > 0
+        ? `「${old.name}」配置已更新（${r.impact.messages.join('；')}）`
+        : `「${old.name}」配置已更新，实际记录保持不变`,
   };
 }

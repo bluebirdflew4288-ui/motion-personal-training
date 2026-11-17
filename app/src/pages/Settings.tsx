@@ -31,6 +31,7 @@ import {
   type RestoredExportResult,
 } from '../lib/exportRestore';
 import { isNativeBuild } from '../lib/platform';
+import { setDeleteFeedbackEnabled } from '../lib/deletionFeedback';
 import { AppLifecycleCoordinator } from '../lib/appLifecycle';
 import { sessionKindOf } from '../domain/sessionKind';
 import {
@@ -131,8 +132,18 @@ function RestStatusRow({
 }
 
 export function SettingsPage() {
-  const { settings, setTheme, patchSettings, refreshSettings, pushToast, sessions, plans, refreshPlans, refreshSessions } =
-    useStore();
+  const {
+    settings,
+    setTheme,
+    patchSettings,
+    refreshSettings,
+    pushToast,
+    sessions,
+    plans,
+    refreshPlans,
+    refreshSessions,
+    refreshExerciseTemplates,
+  } = useStore();
   const fileRef = useRef<HTMLInputElement>(null);
   /** 需求 2：休息提醒的真实授权/渠道状态（不可用时如实显示，不假装已开启） */
   const [restCap, setRestCap] = useState<RestReminderStatus | null>(null);
@@ -145,6 +156,34 @@ export function SettingsPage() {
    */
   const [settingsBusy, setSettingsBusy] = useState<SettingsTarget | null>(null);
   const [settingsMsg, setSettingsMsg] = useState<string | null>(null);
+
+  /* ── F11：删除成功音效开关 ──────────────────────────────── */
+  const soundEnabled = settings.soundEnabled !== false;
+  const [soundBusy, setSoundBusy] = useState(false);
+  /**
+   * 切换删除成功音效。
+   *
+   * 顺序很重要：**先**让反馈通道立即生效（关闭时内部会停掉正在播放/在途的那一次），
+   * 再持久化。这样即使用户在关掉的瞬间正好有一次删除在途，也不会漏出一声。
+   * 持久化失败则回滚内存与通道状态，并如实提示"未保存"，不假报已生效。
+   */
+  const toggleSoundEnabled = useCallback(
+    async (next: boolean) => {
+      if (soundBusy) return;
+      setSoundBusy(true);
+      setDeleteFeedbackEnabled(next);
+      try {
+        await patchSettings({ soundEnabled: next });
+        pushToast(next ? '删除成功音效已开启。' : '删除成功音效已关闭。', 'ok');
+      } catch (err) {
+        setDeleteFeedbackEnabled(!next);
+        pushToast(err instanceof Error ? `音效开关未保存：${err.message}` : '音效开关未保存', 'error');
+      } finally {
+        setSoundBusy(false);
+      }
+    },
+    [patchSettings, pushToast, soundBusy],
+  );
 
   /**
    * 打开系统设置页并给出**如实**提示。
@@ -540,7 +579,7 @@ export function SettingsPage() {
     try {
       await snapshotBeforeRestore(APP_VERSION);
       await restoreBackup(payload);
-      await Promise.all([refreshPlans(), refreshSessions(), refreshSettings()]);
+      await Promise.all([refreshPlans(), refreshSessions(), refreshSettings(), refreshExerciseTemplates()]);
       setPreview(null);
       pushToast('恢复完成，已载入备份数据。');
       navigate('/', true);
@@ -575,6 +614,45 @@ export function SettingsPage() {
         <p style={{ fontSize: 13, color: 'var(--ink-3)', marginTop: 6 }}>
           偏好保存在本机；深色主题单独调整了纸张、油墨与强调色。
         </p>
+      </section>
+
+      {/* F11：交互反馈（与「组间休息提醒」的声音/渠道完全分开） */}
+      <section style={{ marginTop: 22 }}>
+        <h2 className="h-section">交互反馈</h2>
+        <div className="slip" style={{ marginTop: 8, padding: 14 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+            <span style={{ flex: 1, minWidth: 0 }}>
+              <span style={{ display: 'block', fontSize: 15 }}>删除成功音效</span>
+              <span
+                style={{ display: 'block', fontSize: 12.5, color: 'var(--ink-3)', lineHeight: 1.6, marginTop: 3 }}
+              >
+                只在训练页真正删掉一个项目后短促响一次。手机静音、振动或勿扰时自动不响。
+              </span>
+            </span>
+            <button
+              className="btn btn-sm"
+              aria-pressed={soundEnabled}
+              aria-label="删除成功音效开关"
+              disabled={soundBusy}
+              onClick={() => void toggleSoundEnabled(!soundEnabled)}
+              style={{
+                minWidth: 64,
+                minHeight: 34,
+                flex: 'none',
+                background: soundEnabled ? 'var(--brick)' : 'var(--paper-3)',
+                color: soundEnabled ? 'var(--paper)' : 'var(--ink-3)',
+                border: '1px solid var(--rule-strong)',
+                fontVariantNumeric: 'tabular-nums',
+              }}
+            >
+              {soundBusy ? '…' : soundEnabled ? '已开启' : '已关闭'}
+            </button>
+          </div>
+          <p style={{ fontSize: 12.5, color: 'var(--ink-3)', lineHeight: 1.7, margin: '10px 0 0' }}>
+            这个开关只影响删除成功音效，<strong>不影响</strong>组间休息提醒的声音、震动与通知渠道；
+            反之关闭休息提醒也不会改变这里的设置。开关保存在本机，恢复备份不会覆盖它。
+          </p>
+        </div>
       </section>
 
       {/* 备份 */}

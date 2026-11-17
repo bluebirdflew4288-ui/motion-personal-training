@@ -162,6 +162,23 @@ public final class RestForegroundPolicy {
     public static final int CANCEL_REQUEST_BASE = 5200;
 
     /**
+     * 持续通知“正文点击打开/带回应用”的 Activity requestCode 基数（N01）。
+     *
+     * <p>与取消按钮的 requestCode（{@link #CANCEL_REQUEST_BASE} 起、随代次变化、
+     * 覆盖 [5200, 6199]）落在**互不相交**的区间。取消是 {@code getService} 的
+     * Service PendingIntent，正文是 {@code getActivity} 的 Activity PendingIntent，
+     * 本就不同组件；这里再用独立基数，语义清晰且避免任何意外覆盖。
+     *
+     * <p>正文只负责打开应用、不携带代次身份，因此 requestCode 固定，不随 generation 变化。
+     */
+    public static final int CONTENT_REQUEST_BASE = 7300;
+
+    /** 持续通知正文的 Activity requestCode（固定） */
+    public static int contentRequestCode() {
+        return CONTENT_REQUEST_BASE;
+    }
+
+    /**
      * 收尾时是否允许真正停止服务（补充验收 #3）。
      *
      * @param stopForSegment 触发收尾的段标记；-1 表示无条件（用户明确意图）

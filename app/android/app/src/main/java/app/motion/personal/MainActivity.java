@@ -1,23 +1,27 @@
 package app.motion.personal;
 
 import android.os.Bundle;
+import android.view.ActionMode;
+import android.webkit.WebView;
 
+import com.getcapacitor.Bridge;
 import com.getcapacitor.BridgeActivity;
 
 import app.motion.personal.plugins.NativeFileBridgePlugin;
 import app.motion.personal.plugins.RestReminderPlugin;
+import app.motion.personal.plugins.DeletionFeedbackPlugin;
 
 /**
  * MOTION 原生入口。
  *
- * <p>这里只做两件事：
+ * <p>职责：
  * <ol>
- *   <li>注册本地插件 {@link NativeFileBridgePlugin}（JSON 备份的系统文件保存/选择）。</li>
- *   <li>让 WebView 的硬件加速与输入行为保持默认（不做 captureInput，避免中文 IME 组合输入异常）。</li>
+ *   <li>注册本地插件 {@link NativeFileBridgePlugin}、{@link RestReminderPlugin}、{@link DeletionFeedbackPlugin}。</li>
+ *   <li>保持 WebView 硬件加速与默认 InputConnection（不做 captureInput，保证中文 IME 组合输入正常）。</li>
+ *   <li>配合 {@link MotionWebView} 为非输入展示区提供 Activity 级 ActionMode 二次兜底。</li>
  * </ol>
  *
- * <p>返回键不在这里拦截：统一由 {@code @capacitor/app} 的 backButton 事件交给网页调度，
- * 这样“先关最上层弹层、再收键盘、最后页面返回”的优先级只存在一处真源。
+ * <p>返回键统一由 {@code @capacitor/app} 的 backButton 事件交给网页调度。
  */
 public class MainActivity extends BridgeActivity {
 
@@ -27,6 +31,21 @@ public class MainActivity extends BridgeActivity {
         registerPlugin(NativeFileBridgePlugin.class);
         // 需求 2：组间休息到时的原生提醒（AlarmManager + 震动 + 通知）
         registerPlugin(RestReminderPlugin.class);
+        // F11: 独立删除反馈插件
+        registerPlugin(DeletionFeedbackPlugin.class);
         super.onCreate(savedInstanceState);
+    }
+
+    @Override
+    public void onActionModeStarted(ActionMode mode) {
+        super.onActionModeStarted(mode);
+        if (mode == null) {
+            return;
+        }
+        Bridge currentBridge = getBridge();
+        WebView webView = currentBridge != null ? currentBridge.getWebView() : null;
+        if (webView instanceof MotionWebView && !((MotionWebView) webView).isNativeTextUiAllowed()) {
+            mode.finish();
+        }
     }
 }

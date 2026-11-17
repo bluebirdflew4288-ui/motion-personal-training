@@ -46,6 +46,13 @@ export const MAX_REST_IN_SEC = 600;
 export const MAX_TEXT = 2000;
 
 /**
+ * 动作稳定身份 exerciseId 的最大长度（单一真源）。
+ * 与 SessionExercise / PlanExercise 的备份校验边界一致：
+ * 模板库能接受的合法配置，添加成训练后必须仍能被完整备份恢复。
+ */
+export const MAX_EXERCISE_ID = 160;
+
+/**
  * 计划名称上限（单一真源）。
  *
  * <p>新建 / 重命名 / 复制 / 保存入口与备份校验（validate.ts 的 plan.name `{max:200}`）

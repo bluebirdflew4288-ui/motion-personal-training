@@ -1,11 +1,13 @@
-/* 备份版本兼容判定（第2阶段）。
+/* 备份版本兼容判定（G1：v3）。
    ── 边界 ────────────────────────────────────────────────────
-   · v2：当前格式，含计划日类型/有氧目标、会话 kind/origin/cardio/restDate 等
-   · v1：0.1.2 旧格式，**只允许旧字段**；若夹带任何新结构 → 明确拒绝
-     （不能被"按已知字段重建"吞掉后报导入成功）
-   · >2 或非整数 → 拒绝，不猜测读取
+   · v3：当前格式，含动作配置记忆（exerciseTemplates）与 G1 新字段
+     （superSet form / perSetConfigs / stage id / stage restAfterSec）
+   · v2：第2阶段格式；合法旧备份接受，缺省空模板
+   · v1：0.1.2 旧格式，只允许旧字段；若夹带任何新结构 → 明确拒绝
+   · >3 或非整数 → 拒绝，不猜测读取
+   · v1/v2 若夹带 G1 新字段 → 明确拒绝，不能被"按已知字段重建"吞掉后报导入成功
 
-   0.1.2 的 validator 在 `obj.version > 1` 处拒绝 → 旧 App 拒新文件边界成立。 */
+   旧 0.1.8 的 validator 在 `obj.version > 2` 处拒绝 → v3 被旧 App 拒的边界成立。 */
 
 /** v1 中**不允许出现**的新字段（计划侧 + 会话侧 + 嵌套 entry） */
 const FORBIDDEN_IN_V1 = {
@@ -16,6 +18,11 @@ const FORBIDDEN_IN_V1 = {
 
 /** v1 允许的 PlanDay.kind 取值（旧二态） */
 const V1_DAY_KINDS = new Set(['train', 'rest']);
+
+/** G1 新增字段：v1/v2 旧备份不允许夹带（必须用 v3 表达） */
+const G1_STRAIGHT_TARGET_KEYS = ['toFailure', 'perSetConfigs', 'form'] as const;
+const G1_DROP_TARGET_KEYS = ['form', 'roundConfigs'] as const;
+const G1_STAGE_KEYS = ['id', 'restAfterSec'] as const;
 
 export interface CompatIssue {
   path: string;
@@ -86,7 +93,70 @@ export function findV1Contraband(data: unknown): CompatIssue[] {
   return issues;
 }
 
-/** 版本号必须是 1 或 2 的整数 */
-export function isSupportedBackupVersion(v: unknown): v is 1 | 2 {
-  return v === 1 || v === 2;
+/**
+ * G1 新字段 contraband：v1/v2 旧备份中出现即拒绝。
+ * 目的：新字段不能被伪装成旧版本、再被"按已知字段重建"静默吞掉。
+ */
+export function findG1Contraband(data: unknown): CompatIssue[] {
+  const issues: CompatIssue[] = [];
+  if (!isObj(data)) return issues;
+  if ('exerciseTemplates' in data) {
+    issues.push({ path: 'data.exerciseTemplates', message: 'v1/v2 备份不允许包含动作配置记忆（需使用 v3）' });
+  }
+
+  const checkTarget = (target: unknown, path: string) => {
+    if (!isObj(target)) return;
+    const kind = target.kind;
+    if (kind === 'straight') {
+      for (const key of G1_STRAIGHT_TARGET_KEYS) {
+        if (key in target) {
+          issues.push({ path: `${path}.${key}`, message: '旧版本备份不允许包含 G1 新字段（需使用 v3）' });
+        }
+      }
+    } else if (kind === 'dropSet') {
+      for (const key of G1_DROP_TARGET_KEYS) {
+        if (key in target) {
+          issues.push({ path: `${path}.${key}`, message: '旧版本备份不允许包含 G1 新字段（需使用 v3）' });
+        }
+      }
+      const stages = Array.isArray(target.stages) ? target.stages : [];
+      stages.forEach((st, si) => {
+        if (!isObj(st)) return;
+        for (const key of G1_STAGE_KEYS) {
+          if (key in st) {
+            issues.push({
+              path: `${path}.stages[${si}].${key}`,
+              message: '旧版本备份不允许包含 G1 阶段新字段（需使用 v3）',
+            });
+          }
+        }
+      });
+    }
+  };
+
+  const plans = Array.isArray(data.plans) ? data.plans : [];
+  plans.forEach((p, pi) => {
+    if (!isObj(p) || !Array.isArray(p.days)) return;
+    p.days.forEach((d, di) => {
+      if (!isObj(d) || !Array.isArray(d.exercises)) return;
+      d.exercises.forEach((ex, ei) => {
+        if (!isObj(ex)) return;
+        checkTarget(ex.target, `plans[${pi}].days[${di}].exercises[${ei}].target`);
+      });
+    });
+  });
+  const sessions = Array.isArray(data.sessions) ? data.sessions : [];
+  sessions.forEach((s, si) => {
+    if (!isObj(s) || !Array.isArray(s.exercises)) return;
+    s.exercises.forEach((ex, ei) => {
+      if (!isObj(ex)) return;
+      checkTarget(ex.target, `sessions[${si}].exercises[${ei}].target`);
+    });
+  });
+  return issues;
+}
+
+/** 版本号必须是 1、2 或 3 的整数 */
+export function isSupportedBackupVersion(v: unknown): v is 1 | 2 | 3 {
+  return v === 1 || v === 2 || v === 3;
 }

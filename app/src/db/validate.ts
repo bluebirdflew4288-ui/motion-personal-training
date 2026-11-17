@@ -10,6 +10,7 @@ import type {
   CardioParams,
   CardioPreset,
   CardioSegment,
+  DropRoundConfig,
   DropSetTarget,
   PlanCardio,
   ExerciseTarget,
@@ -33,11 +34,13 @@ import {
   MAX_CARDIO_SEGMENTS,
   MAX_DAYS,
   MAX_EXERCISES,
+  MAX_EXERCISE_ID,
   MAX_LOGGED_REPS,
   MAX_PLANS,
   MAX_PLAN_NAME,
   MAX_REPS,
   MAX_REST,
+  MAX_REST_IN_SEC,
   MAX_ROUNDS,
   MAX_SESSIONS,
   MAX_SET_ROWS,
@@ -192,6 +195,58 @@ function validateTarget(c: Ctx, v: unknown, path: string): ExerciseTarget | null
       oneOf(c, v.dumbbellBasis, `${path}.dumbbellBasis`, ['per_hand', 'total'] as const);
       t.dumbbellBasis = v.dumbbellBasis as StraightTarget['dumbbellBasis'];
     }
+    // ── G1 新字段（v3）：按已知字段重建时必须逐层写回，否则备份往返会丢 ──
+    if (typeof v.toFailure === 'boolean') t.toFailure = v.toFailure;
+    if (v.perSetConfigs !== undefined) {
+      if (!Array.isArray(v.perSetConfigs)) {
+        c.add(`${path}.perSetConfigs`, '每组配置必须是数组');
+      } else if (v.perSetConfigs.length > MAX_STRAIGHT_SETS) {
+        c.add(`${path}.perSetConfigs`, `每组配置数量 ${v.perSetConfigs.length} 超过上限 ${MAX_STRAIGHT_SETS}`);
+      } else {
+        t.perSetConfigs = v.perSetConfigs.map((raw, i) => {
+          const cp = `${path}.perSetConfigs[${i}]`;
+          if (!isObj(raw)) {
+            c.add(cp, '每组配置必须是对象');
+            return { setIndex: i + 1, repsMin: null, repsMax: null, suggestedWeightKg: null, toFailure: false };
+          }
+          return {
+            setIndex: num(c, raw.setIndex, `${cp}.setIndex`, {
+              min: 1,
+              max: MAX_STRAIGHT_SETS,
+              integer: true,
+            }) ?? i + 1,
+            repsMin: num(c, raw.repsMin, `${cp}.repsMin`, {
+              min: 0,
+              max: MAX_REPS,
+              integer: true,
+              nullable: true,
+            }),
+            repsMax: num(c, raw.repsMax, `${cp}.repsMax`, {
+              min: 0,
+              max: MAX_REPS,
+              integer: true,
+              nullable: true,
+            }),
+            suggestedWeightKg: num(c, raw.suggestedWeightKg, `${cp}.suggestedWeightKg`, {
+              min: 0,
+              max: MAX_WEIGHT,
+              nullable: true,
+            }),
+            toFailure: typeof raw.toFailure === 'boolean' ? raw.toFailure : false,
+          };
+        });
+        const seenPerSet = new Set<number>();
+        for (const cfg of t.perSetConfigs) {
+          if (seenPerSet.has(cfg.setIndex)) c.add(`${path}.perSetConfigs`, `组序号重复：${cfg.setIndex}`);
+          seenPerSet.add(cfg.setIndex);
+          if ((cfg.repsMin === null) !== (cfg.repsMax === null)) {
+            c.add(`${path}.perSetConfigs`, `组 ${cfg.setIndex} 的参考次数必须同时填写或同时留空`);
+          } else if (cfg.repsMin !== null && cfg.repsMax !== null && cfg.repsMin > cfg.repsMax) {
+            c.add(`${path}.perSetConfigs`, `组 ${cfg.setIndex} 的次数下限 ${cfg.repsMin} 大于上限 ${cfg.repsMax}`);
+          }
+        }
+      }
+    }
     return t;
   }
 
@@ -216,18 +271,35 @@ function validateTarget(c: Ctx, v: unknown, path: string): ExerciseTarget | null
         targetText: '',
       };
     }
+    if (st.id !== undefined && (typeof st.id !== 'string' || !st.id.trim())) {
+      c.add(`${sp}.id`, '阶段 ID 必须是非空文本');
+    }
     return {
+      ...(typeof st.id === 'string' && st.id.trim() ? { id: st.id } : {}),
       label: str(c, st.label, `${sp}.label`, { max: 100 }),
       weightKg: num(c, st.weightKg, `${sp}.weightKg`, { min: 0, max: MAX_WEIGHT, nullable: true }),
       repsMin: num(c, st.repsMin, `${sp}.repsMin`, { min: 0, max: MAX_REPS, integer: true, nullable: true }),
       repsMax: num(c, st.repsMax, `${sp}.repsMax`, { min: 0, max: MAX_REPS, integer: true, nullable: true }),
       toFailure: typeof st.toFailure === 'boolean' ? st.toFailure : false,
+      ...(st.restAfterSec !== undefined
+        ? {
+            restAfterSec:
+              num(c, st.restAfterSec, `${sp}.restAfterSec`, {
+                min: 0,
+                max: MAX_REST_IN_SEC,
+                integer: true,
+              }) ?? undefined,
+          }
+        : {}),
       targetText: str(c, st.targetText, `${sp}.targetText`, { max: 200 }),
     };
   });
-  // 非力竭阶段的次数下限必须 ≤ 上限（R10：20–10 这类反向范围要拒绝）
+  // 次数范围校验：力竭**不**绕过（G1：填写时仍合法；空 = 未设置）
   stages.forEach((st, i) => {
-    if (st.toFailure) return;
+    if ((st.repsMin === null) !== (st.repsMax === null)) {
+      c.add(`${path}.stages[${i}]`, '参考次数必须同时填写上下限，或同时留空（不能半填）');
+      return;
+    }
     if (st.repsMin !== null && st.repsMax !== null && st.repsMin > st.repsMax) {
       c.add(`${path}.stages[${i}]`, `次数下限 ${st.repsMin} 大于上限 ${st.repsMax}`);
     }
@@ -235,6 +307,9 @@ function validateTarget(c: Ctx, v: unknown, path: string): ExerciseTarget | null
 
   const t: DropSetTarget = {
     kind: 'dropSet',
+    ...(v.form !== undefined
+      ? { form: oneOf(c, v.form, `${path}.form`, ['dropSet', 'superset'] as const) ?? 'dropSet' }
+      : {}),
     rounds: num(c, v.rounds, `${path}.rounds`, { min: 1, max: MAX_ROUNDS, integer: true }) ?? 1,
     stages,
     restInSec: num(c, v.restInSec, `${path}.restInSec`, { min: 0, max: MAX_REST, integer: true }) ?? 30,
@@ -251,6 +326,87 @@ function validateTarget(c: Ctx, v: unknown, path: string): ExerciseTarget | null
   if (v.dumbbellBasis !== undefined) {
     oneOf(c, v.dumbbellBasis, `${path}.dumbbellBasis`, ['per_hand', 'total'] as const);
     t.dumbbellBasis = v.dumbbellBasis as DropSetTarget['dumbbellBasis'];
+  }
+  // R02：逐轮覆盖（可选；旧 JSON 没有该字段时所有轮沿用 stages）
+  if (v.roundConfigs !== undefined) {
+    if (!Array.isArray(v.roundConfigs)) {
+      c.add(`${path}.roundConfigs`, '逐轮配置必须是数组');
+    } else if (v.roundConfigs.length > MAX_ROUNDS) {
+      c.add(`${path}.roundConfigs`, `逐轮配置数量 ${v.roundConfigs.length} 超过上限 ${MAX_ROUNDS}`);
+    } else {
+      const seenRounds = new Set<number>();
+      const parsed: DropRoundConfig[] = [];
+      v.roundConfigs.forEach((raw, i) => {
+        const rp = `${path}.roundConfigs[${i}]`;
+        if (!isObj(raw)) {
+          c.add(rp, '逐轮配置必须是对象');
+          return;
+        }
+        const roundIndex = num(c, raw.roundIndex, `${rp}.roundIndex`, { min: 1, max: MAX_ROUNDS, integer: true }) ?? i + 1;
+        if (seenRounds.has(roundIndex)) c.add(`${rp}.roundIndex`, `轮序号重复：${roundIndex}`);
+        seenRounds.add(roundIndex);
+        let roundStages: DropSetTarget['stages'] = [];
+        if (!Array.isArray(raw.stages)) {
+          c.add(`${rp}.stages`, '每轮阶段配置必须是数组');
+        } else if (raw.stages.length > MAX_STAGES_ACCEPTED) {
+          c.add(`${rp}.stages`, `阶段数 ${raw.stages.length} 超过上限 ${MAX_STAGES_ACCEPTED}`);
+        } else {
+          roundStages = raw.stages.map((st, si) => {
+            const sp = `${rp}.stages[${si}]`;
+            if (!isObj(st)) {
+              c.add(sp, '阶段必须是对象');
+              return { label: '', weightKg: null, repsMin: null, repsMax: null, toFailure: false, targetText: '' };
+            }
+            if (st.id !== undefined && (typeof st.id !== 'string' || !st.id.trim())) {
+              c.add(`${sp}.id`, '阶段 ID 必须是非空文本');
+            }
+            return {
+              ...(typeof st.id === 'string' && st.id.trim() ? { id: st.id } : {}),
+              label: str(c, st.label, `${sp}.label`, { max: 100 }),
+              weightKg: num(c, st.weightKg, `${sp}.weightKg`, { min: 0, max: MAX_WEIGHT, nullable: true }),
+              repsMin: num(c, st.repsMin, `${sp}.repsMin`, { min: 0, max: MAX_REPS, integer: true, nullable: true }),
+              repsMax: num(c, st.repsMax, `${sp}.repsMax`, { min: 0, max: MAX_REPS, integer: true, nullable: true }),
+              toFailure: typeof st.toFailure === 'boolean' ? st.toFailure : false,
+              ...(st.restAfterSec !== undefined
+                ? {
+                    restAfterSec:
+                      num(c, st.restAfterSec, `${sp}.restAfterSec`, { min: 0, max: MAX_REST_IN_SEC, integer: true }) ??
+                      undefined,
+                  }
+                : {}),
+              targetText: str(c, st.targetText, `${sp}.targetText`, { max: 200 }),
+            };
+          });
+        }
+        parsed.push({
+          roundIndex,
+          stages: roundStages,
+          ...(raw.restInSec !== undefined
+            ? {
+                restInSec:
+                  num(c, raw.restInSec, `${rp}.restInSec`, { min: 0, max: MAX_REST_IN_SEC, integer: true }) ?? 0,
+              }
+            : {}),
+        });
+        roundStages.forEach((st, si) => {
+          if ((st.repsMin === null) !== (st.repsMax === null)) {
+            c.add(`${rp}.stages[${si}]`, '参考次数必须同时填写上下限，或同时留空（不能半填）');
+          } else if (st.repsMin !== null && st.repsMax !== null && st.repsMin > st.repsMax) {
+            c.add(`${rp}.stages[${si}]`, `次数下限 ${st.repsMin} 大于上限 ${st.repsMax}`);
+          }
+        });
+      });
+      if (parsed.length) t.roundConfigs = parsed;
+    }
+  }
+  // R02：总行数按各轮真实 stageCount 求和
+  let totalRows = 0;
+  for (let ri = 1; ri <= Math.max(1, t.rounds); ri += 1) {
+    const override = t.roundConfigs?.find((r) => r.roundIndex === ri);
+    totalRows += Math.max(1, (override?.stages ?? t.stages).length);
+  }
+  if (totalRows > MAX_SET_ROWS) {
+    c.add(`${path}.rounds`, `组结构会生成 ${totalRows} 行，超过单动作上限 ${MAX_SET_ROWS} 行`);
   }
   return t;
 }
@@ -281,7 +437,7 @@ function validatePlanExercise(c: Ctx, v: unknown, path: string): PlanExercise | 
   if (!target) return null; // target 缺失/损坏直接判失败
   return {
     id: str(c, v.id, `${path}.id`, { max: 120 }),
-    exerciseId: v.exerciseId === undefined ? undefined : str(c, v.exerciseId, `${path}.exerciseId`, { max: 160 }),
+    exerciseId: v.exerciseId === undefined ? undefined : str(c, v.exerciseId, `${path}.exerciseId`, { max: MAX_EXERCISE_ID }),
     name: str(c, v.name, `${path}.name`, { max: 200 }),
     en: v.en === undefined ? undefined : str(c, v.en, `${path}.en`, { max: 200, optional: true }),
     restSec: num(c, v.restSec, `${path}.restSec`, { min: 0, max: MAX_REST, integer: true }) ?? 120,
@@ -427,6 +583,7 @@ function validateSet(c: Ctx, v: unknown, path: string): SessionSet | null {
     // 应用自己生成的合法数据必须能被自己恢复（否则会出现「存得下、导不回」）。
     roundIndex: num(c, v.roundIndex, `${path}.roundIndex`, { min: 1, max: MAX_SET_ROWS, integer: true }) ?? 1,
     stageIndex: num(c, v.stageIndex, `${path}.stageIndex`, { min: 1, max: 20, integer: true }) ?? 1,
+    ...(typeof v.stageId === 'string' && v.stageId.trim() ? { stageId: v.stageId } : {}),
     reps: num(c, v.reps, `${path}.reps`, { min: 0, max: MAX_LOGGED_REPS, integer: true, nullable: true }),
     weightKg: num(c, v.weightKg, `${path}.weightKg`, { min: 0, max: MAX_WEIGHT, nullable: true }),
     status: oneOf(c, v.status, `${path}.status`, ['blank', 'done', 'partial'] as const) ?? 'blank',
@@ -511,7 +668,7 @@ function validateSessionExercise(c: Ctx, v: unknown, path: string): SessionExerc
 
   return {
     id: str(c, v.id, `${path}.id`, { max: 120 }),
-    exerciseId: str(c, v.exerciseId, `${path}.exerciseId`, { max: 160 }),
+    exerciseId: str(c, v.exerciseId, `${path}.exerciseId`, { max: MAX_EXERCISE_ID }),
     planExerciseId: v.planExerciseId === null || v.planExerciseId === undefined
       ? null
       : str(c, v.planExerciseId, `${path}.planExerciseId`, { max: 120 }),

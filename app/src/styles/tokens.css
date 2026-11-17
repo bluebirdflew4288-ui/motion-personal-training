@@ -19,6 +19,9 @@
   --brick: #b23a20;
   --brick-deep: #8e2c17;
   --brick-soft: rgba(178, 58, 32, 0.1);
+  /* G02：删除/危险语义独立于品牌砖红。白字对比度 ≥4.5:1（浅色 6.54:1）。 */
+  --danger-delete: #b3261e;
+  --danger-delete-ink: #ffffff;
   --tape: rgba(226, 205, 150, 0.72);
   --tape-2: rgba(240, 228, 190, 0.7);
   --ok: #3e5a3a;
@@ -112,6 +115,9 @@
   --brick: #e2704c;
   --brick-deep: #f08a68;
   --brick-soft: rgba(226, 112, 76, 0.16);
+  /* G02：深色主题也必须是明确红色，而不是砖橙；白字对比度 4.98:1。 */
+  --danger-delete: #d32f2f;
+  --danger-delete-ink: #ffffff;
   --tape: rgba(150, 130, 86, 0.42);
   --tape-2: rgba(168, 148, 100, 0.38);
   --ok: #8fbf7f;

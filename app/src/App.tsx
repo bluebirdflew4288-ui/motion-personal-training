@@ -11,6 +11,7 @@ import { PlansPage, PlanDayEditor } from './pages/Plans';
 import { SettingsPage } from './pages/Settings';
 import { installViewportGuard } from './lib/storage';
 import { navigate } from './lib/router';
+import { installSelectionGuard } from './ui/selectionGuard';
 
 function Boot() {
   const { ready, initError } = useStore();
@@ -108,6 +109,13 @@ function Routes() {
 }
 
 export function App() {
-  useEffect(() => installViewportGuard(), []);
+  useEffect(() => {
+    const cleanViewport = installViewportGuard();
+    const cleanSelection = installSelectionGuard();
+    return () => {
+      cleanSelection();
+      cleanViewport?.();
+    };
+  }, []);
   return <Boot />;
 }

@@ -84,18 +84,27 @@ export function Sheet({ open, title, onClose, children, footer, autoFocusPanel =
     return backStack.push({ id: `sheet:${layerId}`, handle: () => closeRef.current() });
   }, [open, layerId]);
 
-  // Escape：独立 effect，只随 open 变化挂载/卸载
+  /**
+   * Escape：独立 effect，只随 open 变化挂载/卸载。
+   *
+   * G2A（R5）：嵌套弹层时**只有最上层**处理 Esc。
+   * 旧实现每个 open 实例都在 document 上监听，`stopPropagation()` 无法阻止
+   * 同一 document 上的其他监听器 → 一次 Esc 会同时关闭编辑器、名称选择器
+   * 与离开确认层。现在以返回栈栈顶为准：非栈顶层忽略 Esc，
+   * 一次只关一层；返回键（nativeBack）本来就走 backStack 栈顶，语义一致。
+   */
   useEffect(() => {
     if (!open) return undefined;
+    const selfId = `sheet:${layerId}`;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && !e.isComposing) {
-        e.stopPropagation();
-        closeRef.current();
-      }
+      if (e.key !== 'Escape' || e.isComposing) return;
+      if (backStack.topId !== selfId) return;
+      e.stopPropagation();
+      closeRef.current();
     };
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
-  }, [open]);
+  }, [open, layerId]);
 
   if (!open) return null;
 

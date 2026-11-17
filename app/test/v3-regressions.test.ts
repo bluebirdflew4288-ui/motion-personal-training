@@ -13,15 +13,12 @@ import {
   validateBackup,
 } from '../src/db/repo';
 import {
-  addLooseExercise,
   addSetTo,
-  convertExerciseToDropSet,
   createSession,
   dropRoundComplete,
   dropRoundPartial,
   exerciseCompletion,
   isSetLogged,
-  replaceExerciseInSession,
   restConfigFor,
   roundsOf,
   skipRemaining,
@@ -105,38 +102,7 @@ describe('R02 跳过剩余保留实际记录', () => {
 });
 
 /* ── R03：替换的数据结构 ───────────────────── */
-describe('R03 替换保留结构与目标快照', () => {
-  it('递减组只做 1 阶段后替换：新动作承接 2 个完整轮，每轮 3 阶段', () => {
-    const plan = createV32Plan(NOW);
-    const legsA = plan.days.find((d) => d.name === '腿 A')!;
-    let session = createSession(plan, legsA, NOW);
-    const lateral = session.exercises.find((e) => e.name === '哑铃侧平举')!;
-    // 只做第 1 轮第 1 阶段
-    const firstStage = session.exercises.find((e) => e.id === lateral.id)!.sets.find((s) => s.roundIndex === 1 && s.stageIndex === 1)!;
-    session = withSet(session, lateral.id, firstStage.id, { reps: 12, weightKg: 7.5, status: 'done' });
-
-    const beforeTarget = summarizeSession(session, NOW).targetSets;
-    const r = replaceExerciseInSession(session, lateral.id, '器械推胸');
-    expect(r.replaced).toBe(true);
-
-    const kept = r.session.exercises.find((e) => e.name === '哑铃侧平举')!;
-    const fresh = r.session.exercises.find((e) => e.name === '器械推胸')!;
-
-    // 旧动作保留实际记录与身份
-    expect(kept.sets.filter(isSetLogged)).toHaveLength(1);
-    expect(kept.groups.length).toBe(3);
-    // 新动作承接后 2 轮，每轮仍是完整的 3 阶段
-    expect(fresh.groups).toHaveLength(2);
-    expect(fresh.groups.every((g) => g.stageCount === 3)).toBe(true);
-    expect(fresh.sets).toHaveLength(6);
-    expect(fresh.target.kind).toBe('dropSet');
-    if (fresh.target.kind === 'dropSet') expect(fresh.target.stages).toHaveLength(3);
-
-    // R03.3：目标分母保持开始时的快照（原计划 20），替换不会把它改成 22+
-    expect(summarizeSession(r.session, NOW).targetSets).toBe(beforeTarget);
-    // 但「本次安排」确实增加了（旧动作剩余2轮 + 新动作2轮）
-    expect(summarizeSession(r.session, NOW).plannedSets).toBeGreaterThan(0);
-  });
+describe('R03 替换保留结构与目标快照', () => {;
 
   it('残缺轮不能凭现存行全 done 判完整', () => {
     const plan = createV32Plan(NOW);
@@ -163,36 +129,6 @@ describe('R03 替换保留结构与目标快照', () => {
     // groups 声明 3 阶段 → 只 1 行 done 不能算完整
     expect(dropRoundComplete(ex, 1)).toBe(false);
     expect(dropRoundPartial(ex, 1)).toBe(true);
-  });
-
-  it('替换产物能通过自己的备份校验（不再用 skipped set 状态）', async () => {
-    const plan = createV32Plan(NOW);
-    const legsA = plan.days.find((d) => d.name === '腿 A')!;
-    let session = createSession(plan, legsA, NOW);
-    const lateral = session.exercises.find((e) => e.name === '哑铃侧平举')!;
-    const st = session.exercises.find((e) => e.id === lateral.id)!.sets[0];
-    session = withSet(session, lateral.id, st.id, { reps: 12, status: 'done' });
-    const r = replaceExerciseInSession(session, lateral.id, '器械推胸');
-    expect(r.replaced).toBe(true);
-
-    const finished: Session = { ...r.session, status: 'completed', endedAt: NOW + 60000 };
-    await savePlan(plan);
-    await saveSession(finished);
-    const backup = JSON.parse(JSON.stringify(await buildBackup('1.0.0')));
-    const v = validateBackup(backup);
-    expect(v.ok, v.ok ? '' : (v as { error: string }).error).toBe(true);
-  });
-
-  it('全部做完时替换不复制训练量，给出提示', () => {
-    let { session } = setup();
-    const ex = session.exercises[0];
-    for (const st of ex.sets) {
-      session = withSet(session, ex.id, st.id, { reps: 10, status: 'done' });
-    }
-    const r = replaceExerciseInSession(session, ex.id, '哑铃卧推');
-    expect(r.replaced).toBe(false);
-    expect(r.message).toContain('没有可承接');
-    expect(r.session.exercises).toHaveLength(session.exercises.length);
   });
 });
 
@@ -449,33 +385,7 @@ describe('R10 递减组校验与口径', () => {
 });
 
 /* ── C01：通用递减组 ───────────────────────── */
-describe('C01 通用递减组', () => {
-  it('任意动作都能转成递减组（不依赖名称/预设）', () => {
-    let { session } = setup();
-    session = addLooseExercise(session, '绳索弯举');
-    const ex = session.exercises[session.exercises.length - 1];
-
-    const target = draftToDropTarget({
-      rounds: 2,
-      stages: [
-        { weightKg: 20, repsMin: 8, repsMax: 12, toFailure: false },
-        { weightKg: 15, repsMin: 8, repsMax: 12, toFailure: false },
-        { weightKg: 10, repsMin: 8, repsMax: 12, toFailure: false },
-        { weightKg: 5, repsMin: 8, repsMax: 12, toFailure: false },
-      ],
-      restInSec: 15,
-      restAfterSec: 120,
-      weightMode: 'external',
-    });
-
-    const r = convertExerciseToDropSet(session, ex.id, target);
-    expect(r.converted).toBe(true);
-    const converted = r.session.exercises.find((e) => e.id === ex.id)!;
-    expect(converted.target.kind).toBe('dropSet');
-    expect(converted.groups).toHaveLength(2);
-    expect(converted.groups.every((g) => g.stageCount === 4)).toBe(true);
-    expect(converted.sets).toHaveLength(8);
-  });
+describe('C01 通用递减组', () => {;
 
   it('支持 2 / 3 / 4 阶段，不硬编码 3', () => {
     for (const n of [2, 3, 4]) {
@@ -506,77 +416,6 @@ describe('C01 通用递减组', () => {
       weightMode: 'external',
     };
     expect(validateDropDraft(draft).some((i) => i.message.includes('最多'))).toBe(true);
-  });
-
-  it('端到端样例：2 轮 × 4 阶段，首轮全记、次轮只记 2 阶段', () => {
-    let { session } = setup();
-    session = addLooseExercise(session, '绳索弯举');
-    const ex = session.exercises[session.exercises.length - 1];
-    const target = draftToDropTarget({
-      rounds: 2,
-      stages: [
-        { weightKg: 20, repsMin: 8, repsMax: 12, toFailure: false },
-        { weightKg: 15, repsMin: 8, repsMax: 12, toFailure: false },
-        { weightKg: 10, repsMin: 8, repsMax: 12, toFailure: false },
-        { weightKg: 5, repsMin: 8, repsMax: 12, toFailure: false },
-      ],
-      restInSec: 15,
-      restAfterSec: 120,
-      weightMode: 'external',
-    });
-    let r = convertExerciseToDropSet(session, ex.id, target);
-    session = r.session;
-    const cur = session.exercises.find((e) => e.id === ex.id)!;
-
-    // 首轮 10/10/9/8
-    const round1 = cur.sets.filter((s) => s.roundIndex === 1).sort((a, b) => a.stageIndex - b.stageIndex);
-    const reps1 = [10, 10, 9, 8];
-    round1.forEach((st, i) => {
-      session = withSet(session, ex.id, st.id, { reps: reps1[i], status: 'done' });
-    });
-    // 第二轮只记前 2 阶段
-    const round2 = session.exercises.find((e) => e.id === ex.id)!.sets
-      .filter((s) => s.roundIndex === 2)
-      .sort((a, b) => a.stageIndex - b.stageIndex);
-    session = withSet(session, ex.id, round2[0].id, { reps: 10, status: 'done' });
-    session = withSet(session, ex.id, round2[1].id, { reps: 10, status: 'done' });
-
-    const s = summarizeSession(session, NOW);
-    // 关键验收：1 个完整大组 + 1 个部分大组 + 已记录 6 阶段
-    expect(s.completedSets).toBe(1);
-    expect(s.partialGroups).toBe(1);
-    const loggedStages = session.exercises
-      .find((e) => e.id === ex.id)!
-      .sets.filter((st) => st.status === 'done').length;
-    expect(loggedStages).toBe(6);
-  });
-
-  it('已有记录时转换不覆盖实际数据', () => {
-    let { session } = setup();
-    session = addLooseExercise(session, '绳索弯举');
-    const ex = session.exercises[session.exercises.length - 1];
-    // 先记录 1 组
-    session = withSet(session, ex.id, session.exercises[session.exercises.length - 1].sets[0].id, {
-      reps: 11,
-      weightKg: 20,
-      status: 'done',
-    });
-
-    const target = draftToDropTarget({
-      rounds: 2,
-      stages: [
-        { weightKg: 20, repsMin: 8, repsMax: 12, toFailure: false },
-        { weightKg: 10, repsMin: 8, repsMax: 12, toFailure: false },
-      ],
-      restInSec: 15,
-      restAfterSec: 120,
-      weightMode: 'external',
-    });
-    const r = convertExerciseToDropSet(session, ex.id, target);
-    expect(r.converted).toBe(true);
-    // 原记录仍在（不会被覆盖）
-    const allSets = r.session.exercises.flatMap((e) => e.sets);
-    expect(allSets.some((st) => st.reps === 11 && st.weightKg === 20)).toBe(true);
   });
 });
 

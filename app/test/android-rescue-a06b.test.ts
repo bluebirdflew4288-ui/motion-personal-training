@@ -23,6 +23,7 @@ import * as repo from '../src/db/repo';
 import * as locks from '../src/lib/lock';
 import * as dbLocks from '../src/db/locks';
 import * as rescue from '../src/lib/draftRescue';
+import * as sessionWrite from '../src/lib/sessionWrite';
 import * as domain from '../src/domain/session';
 import * as merge from '../src/domain/draftMerge';
 import { createV32Plan } from '../src/domain/presets/v32';
@@ -156,6 +157,7 @@ describe('A06b · 真实 persist 链路的救援（绕过离页守卫）', () =>
       viewBeforeRef: { current: structuredClone(base) as Session | null },
       unsavedDraft: { current: null as merge.PendingDraft | null },
       rescuedSeqRef: { current: null as number | null },
+      ownPriorCommitRef: { current: null as { revision: number; intent: Session } | null },
       saveQueue: { current: Promise.resolve() },
       lockBlockedRef: { current: false },
       editorId: { current: 'ed-old' },
@@ -180,6 +182,9 @@ describe('A06b · 真实 persist 链路的救援（绕过离页守卫）', () =>
       releaseSessionLock: locks.releaseSessionLock,
       nextDraftToken: () => ++tokenSeq,
       accumulateDraftIntent: merge.accumulateDraftIntent,
+      decideQueuedSessionWrite: sessionWrite.decideQueuedSessionWrite,
+      pendingDraftFromIntent: sessionWrite.pendingDraftFromIntent,
+      getSession: repo.getSession,
       pushToast: (m: string) => messages.push(m),
       setSaveState() {},
       setLockBlocked() {},

@@ -202,6 +202,7 @@ function Probe() {
         endsAt: api.endsAt,
         pausedRemaining: api.pausedRemaining,
         token: api.token,
+        source: api.source,
         cancelPending: api.cancelPending,
         cancelFailed: api.cancelFailed,
       })}

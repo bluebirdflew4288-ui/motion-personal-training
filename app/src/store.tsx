@@ -34,9 +34,11 @@ import {
   atomicFinishSession,
   atomicSaveHistoryEdit,
   atomicSaveSession,
+  atomicSaveSessionWithTemplate,
   type WriteResult,
 } from './db/tx';
-import type { Plan, Session } from './domain/types';
+import { readExerciseTemplates } from './db/templates';
+import type { ExerciseTemplate, Plan, Session } from './domain/types';
 
 export interface Toast {
   id: string;
@@ -84,9 +86,21 @@ interface StoreValue {
   /** 受约束写入入口 */
   createTrainingSession: (session: Session) => Promise<WriteResult>;
   saveActiveSession: (next: Session, args: SaveArgs) => Promise<WriteResult>;
+  /** G1：保存当前训练 + 可选模板记忆（同一事务，模板 revision 冲突整体回滚） */
+  saveActiveSessionWithTemplate: (
+    next: Session,
+    args: SaveArgs,
+    template: ExerciseTemplate,
+    templateExpectedRevision: number | null,
+  ) => Promise<WriteResult>;
   finishTrainingSession: (next: Session, args: SaveArgs) => Promise<WriteResult>;
   discardTrainingSession: (next: Session, args: SaveArgs) => Promise<WriteResult>;
   saveHistorySession: (next: Session, expectedRevision: number) => Promise<WriteResult>;
+  /** G1：动作配置记忆（只读缓存；G2 编辑器消费） */
+  exerciseTemplates: ExerciseTemplate[];
+  /** 模板缓存读取错误（不能当成“没有记忆”静默进入首次保存） */
+  exerciseTemplateError: string | null;
+  refreshExerciseTemplates: () => Promise<void>;
 }
 
 const Ctx = createContext<StoreValue | null>(null);
@@ -121,6 +135,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [plans, setPlans] = useState<Plan[]>([]);
   const [sessions, setSessions] = useState<Session[]>([]);
+  const [exerciseTemplates, setExerciseTemplates] = useState<ExerciseTemplate[]>([]);
+  const [exerciseTemplateError, setExerciseTemplateError] = useState<string | null>(null);
   const [activeSession, setActiveSessionState] = useState<Session | null>(null);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const toastTimers = useRef<Map<string, number>>(new Map());
@@ -156,6 +172,21 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     setActiveSessionState(active[0] ?? null);
   }, []);
 
+  const refreshExerciseTemplates = useCallback(async () => {
+    try {
+      const snap = await readExerciseTemplates();
+      setExerciseTemplates(snap.templates);
+      setExerciseTemplateError(
+        snap.invalid.length
+          ? `动作配置记忆有 ${snap.invalid.length} 条损坏项（${snap.invalid[0].key}），本次不会把它当作“无记忆”`
+          : null,
+      );
+    } catch (err) {
+      setExerciseTemplates([]);
+      setExerciseTemplateError(err instanceof Error ? err.message : '动作配置记忆读取失败');
+    }
+  }, []);
+
   /** 所有未结束的训练（用于「单活动训练」引导与恢复入口，审计 R2-04） */
   const activeSessions = useMemo(
     () => sessions.filter((s) => s.status === 'active').sort((a, b) => b.startedAt - a.startedAt),
@@ -167,17 +198,24 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     (async () => {
       try {
         await ensureSeed();
-        const [s, p, sess, active] = await Promise.all([
+        const [s, p, sess, active, templateSnap] = await Promise.all([
           loadSettings(),
           listPlans(),
           listSessions(),
           findActiveSession(),
+          readExerciseTemplates(),
         ]);
         if (cancelled) return;
         setSettings(s);
         applyTheme(s.theme);
         setPlans(p);
         setSessions(sess);
+        setExerciseTemplates(templateSnap.templates);
+        setExerciseTemplateError(
+          templateSnap.invalid.length
+            ? `动作配置记忆有 ${templateSnap.invalid.length} 条损坏项（${templateSnap.invalid[0].key}），本次不会把它当作“无记忆”`
+            : null,
+        );
         setActiveSessionState(active ?? null);
         setReady(true);
       } catch (err) {
@@ -343,6 +381,39 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     [afterWrite],
   );
 
+  const saveActiveSessionWithTemplate = useCallback(
+    async (
+      next: Session,
+      args: SaveArgs,
+      template: ExerciseTemplate,
+      templateExpectedRevision: number | null,
+    ) => {
+      const r = await atomicSaveSessionWithTemplate({
+        session: next,
+        guard: {
+          sessionId: next.id,
+          editorId: args.editorId ?? '',
+          expectedVersion: args.expectedRevision,
+        },
+        template,
+        templateExpectedRevision,
+      });
+      /**
+       * 事务提交与缓存刷新分离：刷新失败不能把已提交的保存报成整次失败
+       * （否则 UI 重试会以为没保存）。缓存错误提示可恢复，不影响 r.ok。
+       */
+      if (r.ok) {
+        try {
+          await refreshExerciseTemplates();
+        } catch (err) {
+          pushToast(err instanceof Error ? `动作配置记忆刷新失败：${err.message}` : '动作配置记忆刷新失败', 'error');
+        }
+      }
+      return afterWrite(r);
+    },
+    [afterWrite, refreshExerciseTemplates],
+  );
+
   const finishTrainingSession = useCallback(
     async (next: Session, args: SaveArgs) => {
       const r = await atomicFinishSession({
@@ -407,9 +478,13 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       clearActive,
       createTrainingSession,
       saveActiveSession,
+      saveActiveSessionWithTemplate,
       finishTrainingSession,
       discardTrainingSession,
       saveHistorySession,
+      exerciseTemplates,
+      exerciseTemplateError,
+      refreshExerciseTemplates,
     }),
     [
       ready,
@@ -434,9 +509,13 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       clearActive,
       createTrainingSession,
       saveActiveSession,
+      saveActiveSessionWithTemplate,
       finishTrainingSession,
       discardTrainingSession,
       saveHistorySession,
+      exerciseTemplates,
+      exerciseTemplateError,
+      refreshExerciseTemplates,
     ],
   );
 

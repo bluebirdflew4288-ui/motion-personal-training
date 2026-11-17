@@ -37,6 +37,7 @@ import {
   INCLINE_STEP_PCT,
 } from './limits';
 import { resolveExerciseId } from './identity';
+import { stabilizeDropTargetStageIds } from './exerciseConfig';
 import type {
   CardioParams,
   CardioPreset,
@@ -290,50 +291,52 @@ function stageText(st: DropStageTarget): string {
     : `${st.weightKg !== null ? `${trimNum(st.weightKg)} kg · ` : ''}${st.repsMin ?? 0}–${st.repsMax ?? 0} 次`;
 }
 
-function parseDropSet(c: TCtx, v: Record<string, unknown>, path: string): DropSetTarget | null {
-  rejectUnknown(
-    c,
-    v,
-    ['kind', 'rounds', 'stages', 'restInSec', 'restAfterSec', 'weightMode', 'dumbbellBasis'],
-    path,
-  );
-  const rounds = reqInt(c, v.rounds, `${path}.rounds`, MIN_ROUNDS, MAX_ROUNDS, '轮数');
-  // 新模板能力 = 编辑器能力：阶段 2–6。
-  // （备份校验层容忍 12 阶段只保护旧数据，不成为模板新建能力。）
-  if (!Array.isArray(v.stages)) {
-    c.add(`${path}.stages`, '缺少阶段数组');
-    return null;
-  }
-  if (v.stages.length < MIN_STAGES || v.stages.length > MAX_STAGES) {
-    c.add(`${path}.stages`, `递减阶段数必须在 ${MIN_STAGES}–${MAX_STAGES} 之间（编辑器能力）`);
-    return null;
-  }
-  const { weightMode, dumbbellBasis } = parseWeightFields(c, v, path);
-  if (v.suggestedWeightKg !== undefined) {
-    c.add(`${path}.suggestedWeightKg`, '递减组的重量在各阶段里填写');
-  }
-  const restIn = reqInt(c, v.restInSec, `${path}.restInSec`, 0, MAX_REST_IN_SEC, '阶段间休息');
-  const restAfter = reqInt(c, v.restAfterSec, `${path}.restAfterSec`, 0, MAX_REST, '轮间休息');
+function parseDropStages(
+  c: TCtx,
+  list: unknown[],
+  path: string,
+  min: number,
+  max: number,
+  brokenRef: { broken: boolean },
+): DropStageTarget[] {
   const stages: DropStageTarget[] = [];
-  let broken = rounds === null || restIn === null || restAfter === null || !weightMode;
-  v.stages.forEach((sv, i) => {
-    const sp = `${path}.stages[${i}]`;
+  if (list.length < min || list.length > max) {
+    c.add(path, `递减阶段数必须在 ${min}–${max} 之间（编辑器能力）`);
+    brokenRef.broken = true;
+    return stages;
+  }
+  list.forEach((sv, i) => {
+    const sp = `${path}[${i}]`;
     if (!isObj(sv)) {
       c.add(sp, '阶段必须是对象');
-      broken = true;
+      brokenRef.broken = true;
       return;
     }
-    rejectUnknown(c, sv, ['weightKg', 'repsMin', 'repsMax', 'toFailure'], sp);
+    // R02 FIX3：阶段身份允许可选显式 id（跨轮同源阶段共享同一 id），
+    // 由下面校验非空文本 + 同一阶段数组内唯一。
+    rejectUnknown(c, sv, ['id', 'weightKg', 'repsMin', 'repsMax', 'toFailure'], sp);
+    let stageId: string | undefined;
+    if (sv.id !== undefined) {
+      if (typeof sv.id !== 'string' || !sv.id.trim()) {
+        c.add(`${sp}.id`, '阶段 ID 必须是非空文本');
+        brokenRef.broken = true;
+      } else if (sv.id.trim().length > 120) {
+        c.add(`${sp}.id`, '阶段 ID 最多 120 个字符');
+        brokenRef.broken = true;
+      } else {
+        stageId = sv.id.trim();
+      }
+    }
     let weightKg: number | null = null;
     if (sv.weightKg !== undefined && sv.weightKg !== null) {
       const w = reqWeightNum(c, sv.weightKg, `${sp}.weightKg`, 0, 999, '阶段重量');
-      if (w === null) broken = true;
+      if (w === null) brokenRef.broken = true;
       else weightKg = w;
     }
     const toFailure = sv.toFailure === true;
     if (sv.toFailure !== undefined && typeof sv.toFailure !== 'boolean') {
       c.add(`${sp}.toFailure`, '应为布尔值');
-      broken = true;
+      brokenRef.broken = true;
     }
     let repsMin: number | null = null;
     let repsMax: number | null = null;
@@ -341,16 +344,17 @@ function parseDropSet(c: TCtx, v: Record<string, unknown>, path: string): DropSe
       // 非力竭阶段必须填次数范围（与编辑器 validateDropDraft 同一规则）
       repsMin = reqInt(c, sv.repsMin, `${sp}.repsMin`, 0, MAX_REPS, '次数下限');
       repsMax = reqInt(c, sv.repsMax, `${sp}.repsMax`, 0, MAX_REPS, '次数上限');
-      if (repsMin === null || repsMax === null) broken = true;
+      if (repsMin === null || repsMax === null) brokenRef.broken = true;
       else if (repsMin > repsMax) {
         c.add(`${sp}.repsMin`, '次数下限不能大于上限');
-        broken = true;
+        brokenRef.broken = true;
       }
     } else if (sv.repsMin !== undefined || sv.repsMax !== undefined) {
       c.add(sp, '技术性力竭阶段不需要次数范围');
-      broken = true;
+      brokenRef.broken = true;
     }
     const stage: DropStageTarget = {
+      ...(stageId ? { id: stageId } : {}),
       label: `第 ${i + 1} 阶段`,
       weightKg,
       repsMin,
@@ -361,21 +365,116 @@ function parseDropSet(c: TCtx, v: Record<string, unknown>, path: string): DropSe
     stage.targetText = stageText(stage);
     stages.push(stage);
   });
-  // 轮 × 阶段 满足组行数上限（编辑器能产生的合法数据必须能备份恢复）
-  if (rounds !== null && rounds * stages.length > MAX_SET_ROWS) {
-    c.add(`${path}.rounds`, `${rounds} 轮 × ${stages.length} 阶段 = ${rounds * stages.length} 行，超过上限 ${MAX_SET_ROWS}`);
-    broken = true;
+  // 显式 id 必须在同一阶段数组内唯一；跨轮同源阶段共享 id 不受影响。
+  const seenIds = new Set<string>();
+  for (const stage of stages) {
+    if (!stage.id) continue;
+    if (seenIds.has(stage.id)) {
+      c.add(path, `阶段 ID 重复：${stage.id}`);
+      brokenRef.broken = true;
+    }
+    seenIds.add(stage.id);
   }
-  if (broken) return null;
-  return {
+  return stages;
+}
+
+function parseDropSet(c: TCtx, v: Record<string, unknown>, path: string): DropSetTarget | null {
+  rejectUnknown(
+    c,
+    v,
+    ['kind', 'form', 'rounds', 'stages', 'roundConfigs', 'restInSec', 'restAfterSec', 'weightMode', 'dumbbellBasis'],
+    path,
+  );
+  const rounds = reqInt(c, v.rounds, `${path}.rounds`, MIN_ROUNDS, MAX_ROUNDS, '轮数');
+  // 新模板能力 = 编辑器能力：阶段 2–6。
+  // （备份校验层容忍 12 阶段只保护旧数据，不成为模板新建能力。）
+  if (!Array.isArray(v.stages)) {
+    c.add(`${path}.stages`, '缺少阶段数组');
+    return null;
+  }
+  const { weightMode, dumbbellBasis } = parseWeightFields(c, v, path);
+  if (v.suggestedWeightKg !== undefined) {
+    c.add(`${path}.suggestedWeightKg`, '递减组的重量在各阶段里填写');
+  }
+  const restIn = reqInt(c, v.restInSec, `${path}.restInSec`, 0, MAX_REST_IN_SEC, '阶段间休息');
+  const restAfter = reqInt(c, v.restAfterSec, `${path}.restAfterSec`, 0, MAX_REST, '轮间休息');
+  const state = { broken: rounds === null || restIn === null || restAfter === null || !weightMode };
+  const stages = parseDropStages(c, v.stages, `${path}.stages`, MIN_STAGES, MAX_STAGES, state);
+  const roundConfigs: Array<{ roundIndex: number; stages: DropStageTarget[]; restInSec?: number }> = [];
+  if (v.roundConfigs !== undefined) {
+    if (!Array.isArray(v.roundConfigs)) {
+      c.add(`${path}.roundConfigs`, '逐轮配置必须是数组');
+      state.broken = true;
+    } else if (v.roundConfigs.length > MAX_ROUNDS) {
+      c.add(`${path}.roundConfigs`, `逐轮配置不能超过 ${MAX_ROUNDS} 项`);
+      state.broken = true;
+    } else {
+      const seen = new Set<number>();
+      v.roundConfigs.forEach((rv, i) => {
+        const rp = `${path}.roundConfigs[${i}]`;
+        if (!isObj(rv)) {
+          c.add(rp, '逐轮配置必须是对象');
+          state.broken = true;
+          return;
+        }
+        rejectUnknown(c, rv, ['roundIndex', 'stages', 'restInSec'], rp);
+        const roundIndex = reqInt(c, rv.roundIndex, `${rp}.roundIndex`, 1, MAX_ROUNDS, '轮序号');
+        if (roundIndex !== null) {
+          if (seen.has(roundIndex)) {
+            c.add(`${rp}.roundIndex`, `轮序号重复：${roundIndex}`);
+            state.broken = true;
+          }
+          seen.add(roundIndex);
+          if (rounds !== null && roundIndex > rounds) {
+            c.add(`${rp}.roundIndex`, `轮序号 ${roundIndex} 超过轮数 ${rounds}`);
+            state.broken = true;
+          }
+        }
+        if (!Array.isArray(rv.stages)) {
+          c.add(`${rp}.stages`, '每轮阶段配置必须是数组');
+          state.broken = true;
+          return;
+        }
+        const roundStages = parseDropStages(c, rv.stages, `${rp}.stages`, MIN_STAGES, MAX_STAGES, state);
+        let rest: number | undefined;
+        if (rv.restInSec !== undefined) {
+          const r = reqInt(c, rv.restInSec, `${rp}.restInSec`, 0, MAX_REST_IN_SEC, '阶段间休息');
+          if (r === null) state.broken = true;
+          else rest = r;
+        }
+        roundConfigs.push({
+          roundIndex: roundIndex ?? i + 1,
+          stages: roundStages,
+          ...(rest !== undefined ? { restInSec: rest } : {}),
+        });
+      });
+    }
+  }
+  // R02：总行数按各轮真实 stageCount 求和
+  let totalRows = 0;
+  for (let r = 1; r <= Math.max(1, rounds ?? 1); r += 1) {
+    const override = roundConfigs.find((x) => x.roundIndex === r);
+    totalRows += (override?.stages ?? stages).length;
+  }
+  if (totalRows > MAX_SET_ROWS) {
+    c.add(`${path}.rounds`, `组结构会生成 ${totalRows} 行，超过上限 ${MAX_SET_ROWS}`);
+    state.broken = true;
+  }
+  if (state.broken) return null;
+  // 导入是“新写入”：把默认轮与可证明同源的 override 身份一次性稳定化，
+  // 旧无 id JSON 也能在训练中按阶段沿用；无法证明的不同阶段仍保持无 id，
+  // 运行时用确定性兜底身份且不按位置硬配。
+  return stabilizeDropTargetStageIds({
     kind: 'dropSet',
+    ...(v.form !== undefined ? { form: oneOf(c, v.form, `${path}.form`, ['dropSet', 'superset'] as const, '训练形式') ?? 'dropSet' } : {}),
     rounds: rounds!,
     stages,
+    ...(roundConfigs.length ? { roundConfigs } : {}),
     restInSec: restIn!,
     restAfterSec: restAfter!,
     weightMode: weightMode!,
     dumbbellBasis,
-  };
+  }) as DropSetTarget;
 }
 
 function parseExercise(c: TCtx, v: unknown, path: string): PlanExercise | null {
@@ -685,11 +784,22 @@ export function buildPreview(plan: Plan): TemplatePreview {
       0,
     );
     const exerciseLines = d.exercises.map((ex) => {
-      const base =
-        ex.target.kind === 'straight'
-          ? `${ex.target.sets}${ex.target.setsMax > ex.target.sets ? `–${ex.target.setsMax}` : ''} 组 × ${ex.target.repsMin}–${ex.target.repsMax} 次` +
-            (ex.target.suggestedWeightKg !== null ? ` · ${ex.target.suggestedWeightKg}kg` : '')
-          : `${ex.target.rounds} 轮 × ${ex.target.stages.length} 阶段递减`;
+      const t = ex.target;
+      let base: string;
+      if (t.kind === 'straight') {
+        base =
+          `${t.sets}${t.setsMax > t.sets ? `–${t.setsMax}` : ''} 组 × ${t.repsMin}–${t.repsMax} 次` +
+          (t.suggestedWeightKg !== null ? ` · ${t.suggestedWeightKg}kg` : '');
+      } else {
+        const counts = Array.from({ length: t.rounds }, (_, i) => {
+          const override = t.roundConfigs?.find((r) => r.roundIndex === i + 1);
+          return (override?.stages ?? t.stages).length;
+        });
+        const uniform = counts.every((n) => n === counts[0]);
+        base = uniform
+          ? `${t.rounds} 轮 × ${t.stages.length} 阶段递减`
+          : `${t.rounds} 轮 · 每轮阶段 ${counts.join('/')} 递减`;
+      }
       return `${ex.name}：${base} · 休息 ${ex.restSec} 秒`;
     });
     const cardioLines = (d.cardio ?? []).map(

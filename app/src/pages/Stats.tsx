@@ -301,7 +301,7 @@ export function setRowsText(e: ExerciseHistoryEntry): string {
   type Row = { reps: number | null; weightKg: number | null; roundIndex: number; stageIndex: number };
   const fmtSet = (s: Row, withRound: boolean): string => {
     const reps = s.reps ?? '—';
-    const weight = s.weightKg !== null && s.weightKg > 0 ? `×${fmtWeight(s.weightKg)}` : '';
+    const weight = typeof s.weightKg === 'number' && Number.isFinite(s.weightKg) ? `×${fmtWeight(s.weightKg)}` : '';
     return withRound ? `R${s.roundIndex}S${s.stageIndex} ${reps}${weight}` : `${reps}${weight}`;
   };
   const drop = e.fragments.some((f) => f.kind === 'dropSet');

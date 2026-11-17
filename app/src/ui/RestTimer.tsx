@@ -20,6 +20,7 @@ import {
   decideRestore,
   loadRestTimerSnapshot,
   saveRestTimerSnapshot,
+  type RestTimerSource,
 } from '../lib/restTimerSnapshot';
 
 export interface RestTimerApi {
@@ -31,6 +32,8 @@ export interface RestTimerApi {
   pausedRemaining: number | null;
   /** 本次休息的唯一 token（原生去重与身份核验用） */
   token: string | null;
+  /** G3A1：当前休息归属（未知旧快照为 null） */
+  source?: RestTimerSource | null;
   /**
    * 是否还有**未完成的原生取消责任**（B4-R3 F2）。
    *
@@ -48,7 +51,7 @@ export interface RestTimerApi {
    * 避免刚点暂停（请求在途）就闪错误。
    */
   cancelFailed: boolean;
-  start: (sec: number) => void;
+  start: (sec: number, source?: RestTimerSource) => void;
   pause: () => void;
   resume: () => void;
   adjust: (deltaSec: number) => void;
@@ -64,11 +67,18 @@ export function useRestTimer(
    * 页面重建（切后台被回收 / 重新进入）可恢复（BRIEF 第2项）。
    */
   sessionId?: string,
+  /**
+   * G3A2：已知 source 是否仍存在于当前训练（重建时精确清理幽灵归属）。
+   * 返回 false 表示快照 source 指向的目标已删除 → 不恢复该计时并清理快照。
+   */
+  hasSource?: (source: RestTimerSource) => boolean,
 ): RestTimerApi {
   const [endsAt, setEndsAt] = useState<number | null>(null);
   const [pausedRemaining, setPausedRemaining] = useState<number | null>(null);
   /** 本次休息的身份：原生提醒与页面状态共用同一个 token */
   const [token, setToken] = useState<string | null>(null);
+  const [source, setSource] = useState<RestTimerSource | null>(null);
+  const sourceRef = useRef<RestTimerSource | null>(null);
   const defaultRef = useRef(defaultSec);
   defaultRef.current = defaultSec;
   /** 当前 token 的同步镜像：供 async 回调读到最新值（避免闭包过期） */
@@ -87,6 +97,8 @@ export function useRestTimer(
   /** sessionId 的同步镜像（供回调读取最新值） */
   const sessionRef = useRef<string | undefined>(sessionId);
   sessionRef.current = sessionId;
+  const hasSourceRef = useRef(hasSource);
+  hasSourceRef.current = hasSource;
 
   /**
    * 排程协调器：负责异步响应的归属、迟到补偿与代次提交（REVIEW-1 #2）。
@@ -146,6 +158,7 @@ export function useRestTimer(
       saveRestTimerSnapshot({
         sessionId: sid,
         token: committedToken,
+        source: sourceRef.current,
         generation,
         intentWatermark: intentSeqRef.current,
         endsAt: live.status === 'running' ? live.endsAt : null,
@@ -249,6 +262,7 @@ export function useRestTimer(
     saveRestTimerSnapshot({
       sessionId: sid,
       token: snap.token,
+      source: sourceRef.current,
       generation: controller.snapshot.generation,
       /**
        * B4-R3 closure · 重挂连续性：**水位随快照持久化**。
@@ -264,7 +278,9 @@ export function useRestTimer(
     });
   }, [controller]);
 
-  const start = useCallback((sec?: number) => {
+  const start = useCallback((sec?: number, nextSource?: RestTimerSource) => {
+    sourceRef.current = nextSource ?? null;
+    setSource(nextSource ?? null);
     pendingOriginRef.current = 'user-start';
     const nextToken = newRestToken();
     const ms = Math.max(0, (sec ?? defaultRef.current) * 1000);
@@ -291,6 +307,8 @@ export function useRestTimer(
       tokenRef.current = null;
       setToken(null);
       genRef.current = 0;
+      sourceRef.current = null;
+      setSource(null);
       persist({ token: null, status: 'running', endsAt: null, pausedRemaining: null });
       return;
     }
@@ -432,6 +450,8 @@ export function useRestTimer(
     setPausedRemaining(null);
     tokenRef.current = null;
     setToken(null);
+    sourceRef.current = null;
+    setSource(null);
     genRef.current = 0;
     // 跳过/结束：显式全清（不带身份），旧 token 凭据随即失效
     /**
@@ -491,6 +511,8 @@ export function useRestTimer(
       setEndsAt(null);
       setPausedRemaining(null);
       genRef.current = 0;
+      sourceRef.current = null;
+      setSource(null);
       lastPersistRef.current = null;
       liveStateRef.current = { token: null, status: 'running', endsAt: null, pausedRemaining: null };
       // 旧实例的原生提醒不应由新实例的控制器持有（只清内存归属，不碰原生与旧快照）
@@ -505,9 +527,53 @@ export function useRestTimer(
       return;
     }
     if (!snap) return;
+    /**
+     * G3A2：已知 source 但目标已不存在 → 精确清理，不恢复幽灵计时。
+     * 旧快照 source 缺失（unknown）保持原兼容策略：照常恢复，由 UI 提示归属未知。
+     */
+    const src = snap.source ?? null;
+    const checkSource = hasSourceRef.current;
+    if (src && checkSource && !checkSource(src)) {
+      /**
+       * G3A2-FIX1：已知 source 但目标已被删除（T02 阻断项）。
+       *
+       * 只清快照会让原生闹钟继续存在 —— 必须通过既有 controller
+       * **按精确身份**取消；generation 未知时先接管再核对，由迟到补偿补取消，
+       * 失败责任保留可见并可 retryCancel，绝不无身份全清（会误伤其他计时）。
+       */
+      if (snap.generation !== null) {
+        controller.adopt(snap.token, snap.generation);
+        controller.disarm(false);
+      } else {
+        controller.adopt(snap.token, null);
+        controller.disarm(false);
+        void controller.adoptVerified(snap.token).then((r) => {
+          if (r.generation !== null) {
+            // 核对到真实代次：按身份精确补取消（disarm 已在 pendingCancel 登记）
+            controller.adopt(snap.token, r.generation);
+            controller.disarm(false);
+          }
+          void Promise.resolve().then(bumpCancelDuty);
+        }).catch(() => {
+          void Promise.resolve().then(bumpCancelDuty);
+        });
+      }
+      clearRestTimerSnapshot(sid);
+      tokenRef.current = null;
+      setToken(null);
+      setEndsAt(null);
+      setPausedRemaining(null);
+      sourceRef.current = null;
+      setSource(null);
+      liveStateRef.current = { token: null, status: 'running', endsAt: null, pausedRemaining: null };
+      void Promise.resolve().then(bumpCancelDuty);
+      return;
+    }
 
     tokenRef.current = snap.token;
     setToken(snap.token);
+    sourceRef.current = snap.source ?? null;
+    setSource(snap.source ?? null);
     genRef.current = snap.generation ?? 0;
     /**
      * B4-R3 closure · **重挂后的编号连续性**。
@@ -719,6 +785,7 @@ export function useRestTimer(
       endsAt,
       pausedRemaining,
       token,
+      source,
       cancelPending: cancelState.pending,
       cancelErrorReason: cancelState.reason,
       cancelFailed: cancelState.failed,
@@ -759,6 +826,8 @@ function useTick(active: boolean, intervalMs: number) {
 }
 
 export function RestTimerBar({ timer }: { timer: RestTimerApi }) {
+  /** G3A2：旧快照/手动计时没有归属时明确提示，不猜名称、不全停。 */
+  const unknownOwner = timer.active && !timer.source;
   const running = timer.endsAt !== null;
   const active = timer.active;
   const tick = useTick(active, 250);
@@ -893,6 +962,14 @@ export function RestTimerBar({ timer }: { timer: RestTimerApi }) {
       >
         {fmtCountdown(remainingMs)}
       </span>
+      {unknownOwner ? (
+        <span
+          data-testid="rest-unknown-owner"
+          style={{ fontSize: 11, opacity: 0.82, flex: 'none' }}
+        >
+          归属未知 · 可手动停止
+        </span>
+      ) : null}
       <div style={{ display: 'flex', gap: 6, marginLeft: 'auto', flex: 'none' }}>
         <button
           className="btn btn-sm btn-ghost"

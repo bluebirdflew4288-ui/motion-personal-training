@@ -99,14 +99,14 @@ describe('冻结 v1 fixture 兼容', () => {
     }
   });
 
-  it('新版导出的 v2 与 v1 输入不冲突（版本升到 2）', async () => {
+  it('新版导出的 v3 与 v1 输入不冲突（版本升到 3）', async () => {
     const v = validateBackup(loadFixture());
     expect(v.ok).toBe(true);
     if (!v.ok) return;
     await restoreBackup(v.payload);
 
     const b = await buildBackup('2.0.0');
-    expect(b.version).toBe(2);
+    expect(b.version).toBe(3);
     // 导出的会话带上新字段（缺省值），且旧内容仍在
     for (const s of b.data.sessions) {
       expect(s.kind).toBe('strength');

@@ -247,3 +247,19 @@ describe('第8项 · 陈旧与损坏数据', () => {
     expect(loadRestTimerSnapshot('sess-9')).toBeNull();
   });
 });
+
+describe('G3A1 · RestTimer source metadata', () => {
+  it('快照保留可选 source，旧 v1 无 source 读作 null', () => {
+    saveRestTimerSnapshot({
+      sessionId: 'sess-source', token: 'rest-source', generation: null,
+      source: { sessionExerciseId: 'ex-1', setId: 'set-1' },
+      endsAt: Date.now() + 30_000, pausedRemaining: null, status: 'running',
+    });
+    expect(loadRestTimerSnapshot('sess-source')?.source).toEqual({ sessionExerciseId: 'ex-1', setId: 'set-1' });
+    saveRestTimerSnapshot({
+      sessionId: 'sess-old', token: 'rest-old', generation: null,
+      endsAt: Date.now() + 30_000, pausedRemaining: null, status: 'running',
+    });
+    expect(loadRestTimerSnapshot('sess-old')?.source).toBeNull();
+  });
+});

@@ -2,15 +2,16 @@
    所有写入都走 IndexedDB 事务；失败会抛 StorageError 由 UI 显示「未保存」，
    绝不在失败后假装成功。 */
 
-import { idbDelete, idbGet, idbGetAll, idbPut, idbReplaceAll, openDb, StorageError } from './idb';
+import { idbDelete, idbGet, idbGetAll, idbPut, idbRestoreAll, idbSnapshotAll, openDb, StorageError } from './idb';
 import { MAX_LEGACY_PLAN_NAME, MAX_PLAN_NAME } from '../domain/limits';
 import { createV32Plan } from '../domain/presets/v32';
 import { validateDataDeep } from './validate';
 import { detectLegacyShape, deriveGroupsFrom, migrateLegacyData, validateLegacyShape } from './migrate';
 import { exerciseIdFromName, resolveExerciseId } from '../domain/identity';
 import { targetGroupsOf } from '../domain/session';
-import { findV1Contraband, isSupportedBackupVersion } from './backupCompat';
-import type { GroupPlan, Plan, Session, SessionExercise } from '../domain/types';
+import { findG1Contraband, findV1Contraband, isSupportedBackupVersion } from './backupCompat';
+import { EXERCISE_TEMPLATE_PREFIX, validateExerciseTemplate } from './templates';
+import type { ExerciseTemplate, GroupPlan, Plan, Session, SessionExercise } from '../domain/types';
 
 export interface AppSettings {
   key: 'app';
@@ -21,6 +22,8 @@ export interface AppSettings {
   lastBackupPromptAt: number | null;
   /** 已读的更新提示版本 */
   seenVersion: string | null;
+  /** 启用删除音效（F11） */
+  soundEnabled: boolean;
 }
 
 export interface MetaRow {
@@ -35,6 +38,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   lastExportAt: null,
   lastBackupPromptAt: null,
   seenVersion: null,
+  soundEnabled: true,
 };
 
 /* ── 计划 ─────────────────────────────── */
@@ -325,25 +329,48 @@ export async function ensureSeed(): Promise<boolean> {
 /* ── 备份 / 恢复 ─────────────────────── */
 
 export const BACKUP_FORMAT = 'motion-training-backup';
-export const BACKUP_VERSION = 2;
+export const BACKUP_VERSION = 3;
 
 export interface BackupPayload {
   format: typeof BACKUP_FORMAT;
   version: number;
   exportedAt: number;
   appVersion: string;
-  counts: { plans: number; sessions: number; activeSessions: number };
+  counts: { plans: number; sessions: number; activeSessions: number; exerciseTemplates: number };
   data: {
     plans: Plan[];
     sessions: Session[];
     settings: AppSettings[];
+    /** G1：动作配置记忆（纯配置；旧备份缺省为空数组） */
+    exerciseTemplates: ExerciseTemplate[];
   };
 }
 
 export async function buildBackup(appVersion: string): Promise<BackupPayload> {
-  const plans = await listPlans();
-  const sessions = await listSessions();
-  const settings = [await loadSettings()];
+  /**
+   * G1-PRE-REVIEW #4：一次只读事务读取所有业务数据与 meta 模板前缀，
+   * 避免「旧 Session + 新模板」的跨事务拼接快照。
+   */
+  const snap = await idbSnapshotAll();
+  const plans = (snap.plans as Plan[]).sort((a, b) => a.createdAt - b.createdAt);
+  const sessions = (snap.sessions as Session[]).map(normalizeSession).sort((a, b) => b.startedAt - a.startedAt);
+  const settingsRow = (snap.settings as AppSettings[]).find((row) => row?.key === 'app');
+  const settings: AppSettings[] = [{ ...DEFAULT_SETTINGS, ...(settingsRow ?? {}) }];
+  // 任一行模板损坏 → 明确失败，不"导出成功但少一条记忆"
+  const exerciseTemplates: ExerciseTemplate[] = [];
+  const invalidTemplates: Array<{ key: string; message: string }> = [];
+  for (const row of snap.meta) {
+    const key = typeof row.key === 'string' ? row.key : '';
+    if (!key.startsWith(EXERCISE_TEMPLATE_PREFIX)) continue;
+    const parsed = validateExerciseTemplate(row.value);
+    if (parsed.ok) exerciseTemplates.push(parsed.template);
+    else invalidTemplates.push({ key, message: parsed.issues[0]?.message ?? '结构不合法' });
+  }
+  if (invalidTemplates.length) {
+    throw new StorageError(
+      `动作配置记忆中有损坏项（${invalidTemplates[0].key}: ${invalidTemplates[0].message}），已停止导出，避免静默丢数据`,
+    );
+  }
   return {
     format: BACKUP_FORMAT,
     version: BACKUP_VERSION,
@@ -353,8 +380,9 @@ export async function buildBackup(appVersion: string): Promise<BackupPayload> {
       plans: plans.length,
       sessions: sessions.length,
       activeSessions: sessions.filter((s) => s.status === 'active').length,
+      exerciseTemplates: exerciseTemplates.length,
     },
-    data: { plans, sessions, settings },
+    data: { plans, sessions, settings, exerciseTemplates },
   };
 }
 
@@ -367,6 +395,8 @@ export interface RestorePreview {
   oldestSession: number | null;
   newestSession: number | null;
   theme: string | null;
+  /** G1：恢复将写入的动作配置记忆数量 */
+  exerciseTemplates: number;
 }
 
 export type ValidateResult =
@@ -375,11 +405,11 @@ export type ValidateResult =
 
 /*
  * 应用显示版本 + **新导出备份写入的 appVersion 元数据**（第5阶段候选）。
- * 历史值曾是 Web 期 '1.0.0'；本轮与候选包 0.1.8 对齐，避免设置页与包版本矛盾。
+ * 历史值曾是 Web 期 '1.0.0'；本轮与候选包 0.1.10 对齐，避免设置页与包版本矛盾。
  * 旧备份里的 1.0.0 元数据仍按现有规则**只提示不拒绝**（validateBackup 的
  * warnings：srcVersion !== currentAppVersion），冻结/历史文件不改。
  */
-export const CURRENT_APP_VERSION = '0.1.8';
+export const CURRENT_APP_VERSION = '0.1.14';
 
 export function validateBackup(raw: unknown, currentAppVersion = CURRENT_APP_VERSION): ValidateResult {
   if (typeof raw !== 'object' || raw === null) return { ok: false, error: '文件不是有效的 JSON 对象' };
@@ -416,6 +446,22 @@ export function validateBackup(raw: unknown, currentAppVersion = CURRENT_APP_VER
         ok: false,
         error: `v1 备份包含新版结构，已拒绝：${first.path} — ${first.message}`,
         issues: contraband,
+      };
+    }
+  }
+  /**
+   * G1：v1/v2 旧备份不得夹带新字段（superSet form / perSetConfigs /
+   * stage id / stage restAfterSec / exerciseTemplates）。
+   * 明确拒绝而不是"按已知字段重建"后静默吞掉。
+   */
+  if (obj.version === 1 || obj.version === 2) {
+    const g1Contraband = findG1Contraband(data);
+    if (g1Contraband.length) {
+      const first = g1Contraband[0];
+      return {
+        ok: false,
+        error: `v${obj.version} 备份包含 G1 新结构，已拒绝（需使用 v3）：${first.path} — ${first.message}`,
+        issues: g1Contraband,
       };
     }
   }
@@ -509,6 +555,44 @@ export function validateBackup(raw: unknown, currentAppVersion = CURRENT_APP_VER
     warnings.push(`备份来自应用 ${srcVersion}，当前为 ${currentAppVersion}；如出现异常可用恢复前快照回退`);
   }
 
+  /* ── G1：动作配置记忆校验（模板必须完整合法；缺失按空记忆）── */
+  const rawTemplatesRaw = (data as { exerciseTemplates?: unknown }).exerciseTemplates;
+  if (obj.version === 3 && rawTemplatesRaw === undefined) {
+    warnings.push('备份没有动作配置记忆字段，将按空记忆恢复');
+  }
+  if (obj.version === 3 && rawTemplatesRaw !== undefined && !Array.isArray(rawTemplatesRaw)) {
+    return { ok: false, error: '备份的 exerciseTemplates 必须是数组，已拒绝导入' };
+  }
+  const rawTemplates = Array.isArray(rawTemplatesRaw) ? (rawTemplatesRaw as unknown[]) : [];
+  const exerciseTemplates: ExerciseTemplate[] = [];
+  const templateIssues: Array<{ path: string; message: string }> = [];
+  const seenTemplateIds = new Set<string>();
+  rawTemplates.forEach((rawTemplate, i) => {
+    const parsed = validateExerciseTemplate(rawTemplate);
+    if (!parsed.ok) {
+      for (const issue of parsed.issues) {
+        templateIssues.push({ path: `data.exerciseTemplates[${i}]${issue.path ? `.${issue.path}` : ''}`, message: issue.message });
+      }
+      return;
+    }
+    if (seenTemplateIds.has(parsed.template.exerciseId)) {
+      templateIssues.push({
+        path: `data.exerciseTemplates[${i}].exerciseId`,
+        message: `动作配置记忆身份重复：${parsed.template.exerciseId}`,
+      });
+      return;
+    }
+    seenTemplateIds.add(parsed.template.exerciseId);
+    exerciseTemplates.push(parsed.template);
+  });
+  if (templateIssues.length) {
+    return {
+      ok: false,
+      error: `动作配置记忆损坏，已拒绝导入：${templateIssues[0].path} — ${templateIssues[0].message}`,
+      issues: templateIssues,
+    };
+  }
+
   const payload: BackupPayload = {
     format: BACKUP_FORMAT,
     version: obj.version,
@@ -518,8 +602,14 @@ export function validateBackup(raw: unknown, currentAppVersion = CURRENT_APP_VER
       plans: plans.length,
       sessions: sessions.length,
       activeSessions: sessions.filter((s) => s.status === 'active').length,
+      exerciseTemplates: exerciseTemplates.length,
     },
-    data: { plans, sessions, settings: settings.length ? settings : [DEFAULT_SETTINGS] },
+    data: {
+      plans,
+      sessions,
+      settings: settings.length ? settings : [DEFAULT_SETTINGS],
+      exerciseTemplates,
+    },
   };
 
   const preview: RestorePreview = {
@@ -531,6 +621,7 @@ export function validateBackup(raw: unknown, currentAppVersion = CURRENT_APP_VER
     oldestSession: ended.length ? Math.min(...ended) : null,
     newestSession: ended.length ? Math.max(...ended) : null,
     theme: settings[0]?.theme ?? null,
+    exerciseTemplates: exerciseTemplates.length,
   };
   return { ok: true, payload, preview, warnings };
 }
@@ -563,15 +654,27 @@ export async function restoreBackup(payload: BackupPayload): Promise<void> {
     lastExportAt: current.lastExportAt ?? incoming?.lastExportAt ?? null,
     lastBackupPromptAt: current.lastBackupPromptAt ?? null,
     seenVersion: current.seenVersion ?? null,
+    /**
+     * F11：删除成功音效开关属于**本机交互偏好**，与「最近导出时间」同类，
+     * 不由备份覆盖。
+     *
+     * <p>理由：这是用户在当前设备/当前环境下的即时反馈选择（安静场合会临时关掉），
+     * 换机或恢复旧备份时自动把它打开，等于替用户改了刚刚做出的选择。
+     * 备份文件里仍会带上该字段（向前兼容），旧备份没有该字段时按默认值处理，
+     * 因此不改变备份版本、也不改存储架构。
+     */
+    soundEnabled: current.soundEnabled,
   };
   const settings = [merged];
+  const exerciseTemplates = payload.data.exerciseTemplates ?? [];
 
   try {
-    await idbReplaceAll({ plans, sessions, settings });
+    // G1：原子替换 plans / sessions / settings / 模板前缀；
+    // 只定向删除 exercise-template: 前缀，锁/seed/恢复前快照等 meta 保留。
+    await idbRestoreAll({ plans, sessions, settings, exerciseTemplates });
   } catch (err) {
     throw err instanceof StorageError ? err : new StorageError('恢复失败', err);
   }
-  await setMeta('seeded', true);
 }
 
 /* ── 数据升级（不打断进行中的训练）─────── */
@@ -601,8 +704,9 @@ export function migratePlans(plans: Plan[]): Plan[] {
  * 规则与 db/migrate.ts 的 deriveGroups 完全一致 —— 直接复用同一份实现，避免两处漂移。
  */
 function rebuildGroupsFor(ex: SessionExercise): GroupPlan[] {
-  const stageCount = ex.target?.kind === 'dropSet' ? Math.max(1, ex.target.stages.length) : 1;
-  return deriveGroupsFrom(ex.sets ?? [], ex.target as unknown as Record<string, unknown>, stageCount);
+  // 传给 deriveGroupsFrom 的 target 已带 roundConfigs 时，逐轮 stageCount 由它解析；
+  // 不传单一 hint，避免把第 2 轮的 2 阶段错写成默认 3 阶段。
+  return deriveGroupsFrom(ex.sets ?? [], ex.target as unknown as Record<string, unknown>);
 }
 
 export function migrateSessions(sessions: Session[]): Session[] {
