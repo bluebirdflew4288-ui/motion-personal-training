@@ -113,12 +113,12 @@ beforeEach(async () => {
   await wipe();
 });
 
-describe('P04 v3 完整导出 → 恢复 → 再导出（模板与新字段一致快照）', () => {
+describe('P04 当前格式完整导出 → 恢复 → 再导出（模板与新字段一致快照）', () => {
   it('模板与 perSetConfigs / form / stage id / stage rest 全部往返保真', async () => {
     await seedAll();
     const b1 = await buildBackup('0.1.9');
-    expect(b1.version).toBe(3);
-    expect(BACKUP_VERSION).toBe(3);
+    expect(b1.version).toBe(4);
+    expect(BACKUP_VERSION).toBe(4);
     expect(b1.counts.exerciseTemplates).toBe(1);
     expect(b1.data.exerciseTemplates).toHaveLength(1);
     const tpl0 = b1.data.exerciseTemplates[0];
@@ -191,7 +191,7 @@ describe('P04 v3 完整导出 → 恢复 → 再导出（模板与新字段一�
   it('恢复前快照包含模板（P06 前置）', async () => {
     await seedAll();
     const snap = await snapshotBeforeRestore('0.1.9');
-    expect(snap.version).toBe(3);
+    expect(snap.version).toBe(4);
     expect(snap.data.exerciseTemplates).toHaveLength(1);
     expect((await getPreRestoreSnapshot())?.data.exerciseTemplates).toHaveLength(1);
   });
@@ -326,10 +326,10 @@ describe('P05 v1/v2 兼容、坏 v3、高版本', () => {
     expect(await listExerciseTemplates()).toHaveLength(1);
   });
 
-  it('高版本 v4 明确拒绝', async () => {
+  it('高版本 v5 明确拒绝', async () => {
     const b = await buildBackup('0.1.9');
-    const v4 = { ...JSON.parse(JSON.stringify(b)), version: 4 };
-    const v = validateBackup(v4);
+    const future = { ...JSON.parse(JSON.stringify(b)), version: 5 };
+    const v = validateBackup(future);
     expect(v.ok).toBe(false);
     if (!v.ok) expect(v.error).toContain('高于当前应用支持');
   });
@@ -400,13 +400,13 @@ describe('P07 当前 0.1.8 解析 v3 明确拒绝（冻结旧验证器）', () =
 });
 
 describe('P08 共享计划模板 v1 原有边界', () => {
-  it('旧计划模板 v1 仍可解析；v2 与混入新字段明确拒绝', () => {
+  it('旧计划模板 v1 仍可解析；未来版本与 v1 夹带字段明确拒绝', () => {
     const ok = parsePlanTemplate(EXAMPLE_PLAN_TEMPLATE);
     expect(ok.ok).toBe(true);
 
-    const v2 = JSON.stringify({ format: PLAN_TEMPLATE_FORMAT, version: 2, plan: { name: 'X', days: [] } });
-    const badV2 = parsePlanTemplate(v2);
-    expect(badV2.ok).toBe(false);
+    const future = JSON.stringify({ format: PLAN_TEMPLATE_FORMAT, version: 3, plan: { name: 'X', days: [] } });
+    const badFuture = parsePlanTemplate(future);
+    expect(badFuture.ok).toBe(false);
 
     const parsed = JSON.parse(EXAMPLE_PLAN_TEMPLATE) as {
       plan: { days: Array<{ exercises?: Array<{ target: Record<string, unknown> }> }> };

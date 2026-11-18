@@ -4,6 +4,7 @@
    · `areExerciseCardPropsEqual` 在 IndexedDB 事务返回全新反序列化 Session 克隆后，
      对未变动的兄弟动作做 O(sets) 值比对，确保录入第 1 个动作时其余 7 张动作卡 0 次重渲染。 */
 
+import { SetupNoteTag } from '../../ui/SetupNoteSheet';
 import { memo, useCallback, useState } from 'react';
 import type { RefObject } from 'react';
 import { resolveGroupConfig } from '../../domain/exerciseConfig';
@@ -271,6 +272,8 @@ export interface SessionExerciseCardProps {
   onToggle: (exId: string) => void;
   lastPerformance: LastPerformanceSummary | null;
   progressionHint?: string | null;
+  setupNote?: string;
+  onEditSetupNote?: (exId: string) => void;
   onOpenPlateCalc?: (exId: string, weightKg: number | null, setId?: string) => void;
   apply: (fn: (prev: Session) => Session) => unknown;
   latestRef: RefObject<Session | undefined>;
@@ -314,6 +317,8 @@ function areExerciseCardPropsEqual(
     (prev.historyHydrated ?? true) !== (next.historyHydrated ?? true) ||
     (prev.progressionHint ?? null) !== (next.progressionHint ?? null) ||
     prev.onOpenPlateCalc !== next.onOpenPlateCalc ||
+    prev.setupNote !== next.setupNote ||
+    prev.onEditSetupNote !== next.onEditSetupNote ||
     prev.recordingPaused !== next.recordingPaused ||
     (prev.rawResetToken ?? 0) !== (next.rawResetToken ?? 0) ||
     Boolean(prev.hasRawRisk) !== Boolean(next.hasRawRisk) ||
@@ -349,6 +354,8 @@ export const SessionExerciseCard = memo(function SessionExerciseCard({
   onToggle,
   lastPerformance,
   progressionHint,
+  setupNote,
+  onEditSetupNote,
   onOpenPlateCalc,
   apply,
   latestRef,
@@ -458,6 +465,9 @@ export const SessionExerciseCard = memo(function SessionExerciseCard({
               >
                 {ex.name}
               </h3>
+              {setupNote && onEditSetupNote && (
+                <SetupNoteTag note={setupNote} onClick={() => onEditSetupNote(ex.id)} />
+              )}
               <div style={{ fontSize: 13, color: 'var(--ink-3)', marginTop: 3, lineHeight: 1.5 }}>
                 {describeTarget({ id: ex.id, name: ex.name, restSec: ex.restSec, target: ex.target })}
                 <span style={{ color: 'var(--ink-4)' }}> · 休息 {fmtRest(ex.restSec)}</span>

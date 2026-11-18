@@ -6,9 +6,12 @@
    · 完整保留行内快捷控件与多字段草稿离页门禁（100% 兼容 B4R2 与 W02 回归契约）。 */
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { CARDIO_FIELDS, CARDIO_PRESET_CHOICES, normalizeCardioParams } from '../../domain/cardio';
 import { useStore } from '../../store';
 import { navigate, registerLeaveGuard } from '../../lib/router';
 import { Sheet } from '../../ui/Sheet';
+import { SetupNoteSheet, SetupNoteTag } from '../../ui/SetupNoteSheet';
+import { setupNoteFor, withSetupNote } from '../../domain/setupNote';
 import { Confirm } from '../../ui/Confirm';
 import { DraftTextField } from '../../ui/DraftTextField';
 import { DraftNumberField } from '../../ui/DraftNumberField';
@@ -66,9 +69,6 @@ import { resolveExerciseId, WEIGHT_MODE_LABEL } from '../../domain/identity';
 import {
   MAX_CARDIO_ENTRIES,
   MAX_EXERCISES,
-  MAX_INCLINE_PCT,
-  MAX_SPEED_KMH,
-  MAX_STAIR_LEVEL,
 } from '../../domain/limits';
 import { newId, targetGroupsOf } from '../../domain/session';
 import {
@@ -86,6 +86,7 @@ import {
   validateDropDraft,
   type DropSetDraft,
 } from '../../domain/dropSet';
+import { TRAINING_FOCUSES, TRAINING_FOCUS_LABEL } from '../../domain/types';
 import type {
   ExerciseTarget,
   Plan,
@@ -94,7 +95,7 @@ import type {
   StraightTarget,
 } from '../../domain/types';
 
-const FOCUS_LABEL = { chest: '胸', back: '背', legs: '腿' } as const;
+
 const UNDO_TTL_MS = 8_000;
 
 function defaultStraightTarget(): StraightTarget {
@@ -415,6 +416,8 @@ export function PlanDayEditor({ planId, dayId }: { planId: string; dayId: string
     settings,
   } = useStore();
 
+  const [setupNoteForId, setSetupNoteForId] = useState<string | null>(null);
+  const templatesById = useMemo(() => new Map(exerciseTemplates.map((item) => [item.exerciseId, item])), [exerciseTemplates]);
   const plansRef = useRef<Plan[]>(plans);
   plansRef.current = plans;
 
@@ -777,9 +780,13 @@ export function PlanDayEditor({ planId, dayId }: { planId: string; dayId: string
         return { ok: false, message: '这个计划已经不存在了' };
       }
 
+      const oldExercise = latestPlan.days.find((day) => day.id === dayId)?.exercises.find((ex) => ex.id === editorState.exId);
+      const previous = oldExercise && resolveExerciseId(oldExercise) === payload.exerciseId ? oldExercise : {};
+      const remembered = templatesById.get(payload.exerciseId);
+      const nextNote = setupNoteFor(previous, remembered);
       const templateWrite =
         payload.remember && payload.template
-          ? { template: payload.template, expectedRevision: payload.templateExpectedRevision }
+          ? { template: withSetupNote(payload.template, nextNote), expectedRevision: payload.templateExpectedRevision }
           : undefined;
 
       if (editorState.mode === 'add') {
@@ -789,6 +796,7 @@ export function PlanDayEditor({ planId, dayId }: { planId: string; dayId: string
           ...(payload.en !== undefined ? { en: payload.en } : {}),
           target: payload.target,
           restSec: payload.restSec,
+          setupNote: nextNote,
         });
         const built = planExerciseFromTemplate(tpl);
         const existing = addCommitRef.current;
@@ -847,7 +855,7 @@ export function PlanDayEditor({ planId, dayId }: { planId: string; dayId: string
       }
       return { ok: true };
     },
-    [currentPlan, dayId, editorState, planId, pushToast, upsertPlanWithTemplate],
+    [currentPlan, dayId, editorState, planId, pushToast, templatesById, upsertPlanWithTemplate],
   );
 
   const handleReorderExercises = useCallback(
@@ -1045,6 +1053,10 @@ export function PlanDayEditor({ planId, dayId }: { planId: string; dayId: string
     );
   }
 
+  const setupExercise = day.exercises.find((exercise) => exercise.id === setupNoteForId);
+  const setupIdentity = setupExercise ? resolveExerciseId(setupExercise) : undefined;
+  const setupTemplate = setupIdentity ? templatesById.get(setupIdentity) : undefined;
+
   function updateCardioTarget(cardioId: string, patch: Partial<PlanCardio['target']>) {
     const latest = currentPlan(planId);
     const next: Plan = {
@@ -1056,13 +1068,7 @@ export function PlanDayEditor({ planId, dayId }: { planId: string; dayId: string
           cardio: (d.cardio ?? []).map((pc) => {
             if (pc.id !== cardioId) return pc;
             const merged = { ...pc.target, ...patch };
-            const target: PlanCardio['target'] =
-              pc.preset === 'treadmill-incline'
-                ? {
-                    ...(typeof merged.speedKmh === 'number' ? { speedKmh: merged.speedKmh } : {}),
-                    ...(typeof merged.inclinePct === 'number' ? { inclinePct: merged.inclinePct } : {}),
-                  }
-                : { ...(typeof merged.level === 'number' ? { level: merged.level } : {}) };
+            const target = normalizeCardioParams(pc.preset, merged);
             return { ...pc, target };
           }),
         };
@@ -1090,18 +1096,23 @@ export function PlanDayEditor({ planId, dayId }: { planId: string; dayId: string
       </div>
 
       <div style={{ display: 'flex', gap: 8, marginTop: 12, flexWrap: 'wrap' }}>
-        {(['chest', 'back', 'legs'] as const).map((f) => (
+        {day.kind === 'train' && TRAINING_FOCUSES.map((f) => (
           <button
             key={f}
             className={`btn btn-sm ${day.focus === f ? 'btn-primary' : 'btn-ghost'}`}
+            aria-pressed={day.focus === f}
             onClick={() =>
               void save({
                 ...plan,
-                days: plan.days.map((d) => (d.id === day.id ? { ...d, focus: f } : d)),
+                days: plan.days.map((d) => {
+                  if (d.id !== day.id) return d;
+                  const { focus, ...rest } = d;
+                  return focus === f ? rest : { ...rest, focus: f };
+                }),
               })
             }
           >
-            {FOCUS_LABEL[f]}
+            {TRAINING_FOCUS_LABEL[f]}
           </button>
         ))}
         {(
@@ -1177,72 +1188,44 @@ export function PlanDayEditor({ planId, dayId }: { planId: string; dayId: string
                   >
                     ×
                   </button>
-                  <div
-                    style={{
-                      flex: '1 1 100%',
-                      display: 'grid',
-                      gridTemplateColumns:
-                        pc.preset === 'treadmill-incline'
-                          ? 'repeat(2, minmax(0,1fr))'
-                          : 'repeat(1, minmax(0,1fr))',
-                      gap: 8,
-                      marginTop: 8,
-                      paddingLeft: 2,
-                    }}
-                  >
-                    {pc.preset === 'treadmill-incline' ? (
-                      <>
-                        <DraftNumberField
-                          onDirtyChange={editorDirtyHandler(`num:cardio:${day.id}:${pc.id}:speed`)}
-                          label="速度"
-                          value={pc.target.speedKmh ?? 0}
-                          min={0}
-                          max={MAX_SPEED_KMH}
-                          integer={false}
-                          unit="km/h"
-                          fieldId={`cardio.${pc.id}.speed`}
-                          onCommit={(v) => void updateCardioTarget(pc.id, { speedKmh: v })}
-                        />
-                        <DraftNumberField
-                          onDirtyChange={editorDirtyHandler(`num:cardio:${day.id}:${pc.id}:incline`)}
-                          label="坡度"
-                          value={pc.target.inclinePct ?? 0}
-                          min={0}
-                          max={MAX_INCLINE_PCT}
-                          integer={false}
-                          unit="%"
-                          fieldId={`cardio.${pc.id}.incline`}
-                          onCommit={(v) => void updateCardioTarget(pc.id, { inclinePct: v })}
-                        />
-                      </>
-                    ) : (
-                      <DraftNumberField
-                        onDirtyChange={editorDirtyHandler(`num:cardio:${day.id}:${pc.id}:level`)}
-                        label="档位"
-                        value={pc.target.level ?? 1}
-                        min={1}
-                        max={MAX_STAIR_LEVEL}
-                        unit="档"
-                        fieldId={`cardio.${pc.id}.level`}
-                        onCommit={(v) => void updateCardioTarget(pc.id, { level: v })}
-                      />
-                    )}
-                  </div>
+                  {CARDIO_FIELDS[pc.preset].length > 0 && (
+                    <div style={{ flex: '1 1 100%', display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 8, marginTop: 8 }}>
+                      {CARDIO_FIELDS[pc.preset].map(({ key, label, min, max, unit, integer, optional }) => {
+                        const field = {
+                          label: optional ? `${label}（可选）` : label,
+                          min, max, unit, integer: Boolean(integer),
+                          fieldId: `cardio.${pc.id}.${key}`,
+                          onDirtyChange: editorDirtyHandler(`num:cardio:${day.id}:${pc.id}:${key}`),
+                        };
+                        return optional ? (
+                          <DraftNumberField
+                            key={key}
+                            {...field}
+                            nullable
+                            value={pc.target[key] ?? null}
+                            onCommit={(value) => void updateCardioTarget(pc.id, { [key]: value ?? undefined })}
+                          />
+                        ) : (
+                          <DraftNumberField
+                            key={key}
+                            {...field}
+                            value={pc.target[key] ?? min}
+                            onCommit={(value) => void updateCardioTarget(pc.id, { [key]: value })}
+                          />
+                        );
+                      })}
+                    </div>
+                  )}
                 </div>
               ))}
             </div>
           ) : (
             <p style={{ fontSize: 13, color: 'var(--ink-3)', lineHeight: 1.65, marginTop: 6 }}>
-              这一日还没有有氧项目。可以添加「有氧爬坡」或「爬楼机」作为今天的默认目标。
+              这一日还没有有氧项目。选择一个预设来添加。
             </p>
           )}
           <div style={{ display: 'flex', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
-            {(
-              [
-                ['treadmill-incline', '有氧爬坡', { speedKmh: 4, inclinePct: 4 }],
-                ['stair-climber', '爬楼机', { level: 5 }],
-              ] as const
-            ).map(([preset, label, target]) => (
+            {CARDIO_PRESET_CHOICES.map(({ preset, label, params: target }) => (
               <button
                 key={preset}
                 className="btn btn-ghost btn-sm"
@@ -1370,6 +1353,7 @@ export function PlanDayEditor({ planId, dayId }: { planId: string; dayId: string
                 const hasRemembered = exerciseTemplates.some(
                   (t) => t.exerciseId === resolveExerciseId(ex),
                 );
+                const setupNote = setupNoteFor(ex, templatesById.get(resolveExerciseId(ex)));
 
                 return (
                   <div key={ex.id} style={{ marginTop: 10 }}>
@@ -1407,6 +1391,12 @@ export function PlanDayEditor({ planId, dayId }: { planId: string; dayId: string
                             }
                           />
                         </div>
+
+                        {setupNote && (
+                          <div style={{ paddingLeft: 28 }}>
+                            <SetupNoteTag note={setupNote} onClick={() => setSetupNoteForId(ex.id)} />
+                          </div>
+                        )}
 
                         {ex.target.weightMode !== 'external' ||
                         hasPerSet ||
@@ -1476,6 +1466,15 @@ export function PlanDayEditor({ planId, dayId }: { planId: string; dayId: string
                           >
                             独立身份
                           </button>
+                          {!setupNote && (
+                            <button
+                              type="button"
+                              className="btn btn-ghost btn-sm"
+                              onClick={() => setSetupNoteForId(ex.id)}
+                            >
+                              记器械档位
+                            </button>
+                          )}
                           <div style={{ display: 'flex', gap: 6, flex: 'none', marginLeft: 'auto' }}>
                             <button
                               type="button"
@@ -1844,6 +1843,37 @@ export function PlanDayEditor({ planId, dayId }: { planId: string; dayId: string
           }
         }}
       />
+      {setupExercise && setupIdentity && (
+        <SetupNoteSheet
+          key={setupExercise.id}
+          exerciseName={setupExercise.name}
+          initial={setupNoteFor(setupExercise, setupTemplate)}
+          revision={setupTemplate?.revision}
+          onClose={() => setSetupNoteForId(null)}
+          onSave={async (note) => {
+            if (exerciseTemplateError) return { ok: false, message: exerciseTemplateError };
+            const current = currentPlan(planId);
+            const currentDay = current.days.find((entry) => entry.id === day.id);
+            const target = currentDay?.exercises.find((exercise) => exercise.id === setupExercise.id);
+            if (!target || resolveExerciseId(target) !== setupIdentity) {
+              return { ok: false, message: '动作已变化，请重新打开' };
+            }
+            const template = setupTemplate ?? exerciseTemplateFromConfig({ ...target, exerciseId: setupIdentity });
+            const updated: Plan = {
+              ...current,
+              days: current.days.map((entry) => entry !== currentDay ? entry : {
+                ...entry,
+                exercises: entry.exercises.map((exercise) => exercise === target ? withSetupNote(exercise, note) : exercise),
+              }),
+            };
+            const result = await upsertPlanWithTemplate(updated, {
+              template: withSetupNote(template, note),
+              expectedRevision: setupTemplate?.revision ?? null,
+            });
+            return result.ok ? { ok: true } : { ok: false, message: result.message };
+          }}
+        />
+      )}
     </main>
   );
 }

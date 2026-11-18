@@ -1,3 +1,5 @@
+import { CARDIO_PRESETS, LEGACY_CARDIO_PRESETS, LEGACY_TRAINING_FOCUSES, TRAINING_FOCUSES } from '../domain/types';
+
 /* 备份版本兼容判定（G1：v3）。
    ── 边界 ────────────────────────────────────────────────────
    · v3：当前格式，含动作配置记忆（exerciseTemplates）与 G1 新字段
@@ -156,7 +158,62 @@ export function findG1Contraband(data: unknown): CompatIssue[] {
   return issues;
 }
 
-/** 版本号必须是 1、2 或 3 的整数 */
-export function isSupportedBackupVersion(v: unknown): v is 1 | 2 | 3 {
-  return v === 1 || v === 2 || v === 3;
+const newFocuses = new Set<string>(TRAINING_FOCUSES.filter((focus) =>
+  !(LEGACY_TRAINING_FOCUSES as readonly string[]).includes(focus),
+));
+const newPresets = new Set<string>(CARDIO_PRESETS.filter((preset) =>
+  !(LEGACY_CARDIO_PRESETS as readonly string[]).includes(preset),
+));
+const newParamKeys = ['resistanceLevel', 'cadenceRpm', 'damperLevel', 'splitSecPer500m'] as const;
+
+export function findV4Contraband(data: unknown): CompatIssue[] {
+  const issues: CompatIssue[] = [];
+  if (!isObj(data)) return issues;
+  const report = (path: string) => {
+    issues.push({ path, message: '该字段或枚举需要 v4 备份' });
+  };
+  const each = (items: unknown, path: string, inspect: (item: Record<string, unknown>, path: string) => void) => {
+    if (Array.isArray(items)) items.forEach((item, i) => {
+      if (isObj(item)) inspect(item, `${path}[${i}]`);
+    });
+  };
+  const setup = (exercise: Record<string, unknown>, path: string) => {
+    if ('setupNote' in exercise) report(`${path}.setupNote`);
+  };
+  const focus = (day: unknown, path: string) => {
+    if (isObj(day) && typeof day.focus === 'string' && newFocuses.has(day.focus)) report(`${path}.focus`);
+  };
+  const params = (value: unknown, path: string) => {
+    if (!isObj(value)) return;
+    for (const key of newParamKeys) {
+      if (key in value) report(`${path}.${key}`);
+    }
+  };
+  const cardio = (item: Record<string, unknown>, path: string) => {
+    if (typeof item.preset === 'string' && newPresets.has(item.preset)) report(`${path}.preset`);
+    params(item.target, `${path}.target`);
+    params(item.currentParams, `${path}.currentParams`);
+    each(item.segments, `${path}.segments`, (segment, segmentPath) => {
+      params(segment.params, `${segmentPath}.params`);
+      if ('note' in segment) report(`${segmentPath}.note`);
+    });
+  };
+  each(data.plans, 'plans', (plan, path) => {
+    each(plan.days, `${path}.days`, (day, dayPath) => {
+      focus(day, dayPath);
+      each(day.exercises, `${dayPath}.exercises`, setup);
+      each(day.cardio, `${dayPath}.cardio`, cardio);
+    });
+  });
+  each(data.sessions, 'sessions', (session, path) => {
+    focus(session.day, `${path}.day`);
+    each(session.exercises, `${path}.exercises`, setup);
+    each(session.cardio, `${path}.cardio`, cardio);
+  });
+  each(data.exerciseTemplates, 'exerciseTemplates', setup);
+  return issues;
+}
+
+export function isSupportedBackupVersion(v: unknown): v is 1 | 2 | 3 | 4 {
+  return v === 1 || v === 2 || v === 3 || v === 4;
 }

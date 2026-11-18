@@ -19,7 +19,7 @@ import { validateDataDeep } from './validate';
 import { detectLegacyShape, deriveGroupsFrom, migrateLegacyData, validateLegacyShape } from './migrate';
 import { exerciseIdFromName, resolveExerciseId } from '../domain/identity';
 import { targetGroupsOf } from '../domain/session';
-import { findG1Contraband, findV1Contraband, isSupportedBackupVersion } from './backupCompat';
+import { findG1Contraband, findV1Contraband, findV4Contraband, isSupportedBackupVersion } from './backupCompat';
 import {
   EXERCISE_TEMPLATE_PREFIX,
   exerciseTemplateKey,
@@ -688,7 +688,7 @@ export async function ensureSeed(): Promise<boolean> {
 /* ── 备份 / 恢复 ─────────────────────── */
 
 export const BACKUP_FORMAT = 'motion-training-backup';
-export const BACKUP_VERSION = 3;
+export const BACKUP_VERSION = 4;
 
 export interface BackupPayload {
   format: typeof BACKUP_FORMAT;
@@ -768,7 +768,7 @@ export type ValidateResult =
  * 旧备份里的 1.0.0 元数据仍按现有规则**只提示不拒绝**（validateBackup 的
  * warnings：srcVersion !== currentAppVersion），冻结/历史文件不改。
  */
-export const CURRENT_APP_VERSION = '0.1.19';
+export const CURRENT_APP_VERSION = '0.2.0';
 
 export function validateBackup(raw: unknown, currentAppVersion = CURRENT_APP_VERSION): ValidateResult {
   if (typeof raw !== 'object' || raw === null) return { ok: false, error: '文件不是有效的 JSON 对象' };
@@ -790,6 +790,17 @@ export function validateBackup(raw: unknown, currentAppVersion = CURRENT_APP_VER
   const data = obj.data;
   if (!data || typeof data !== 'object') {
     return { ok: false, error: '备份缺少 data 内容' };
+  }
+
+  if (obj.version < 4) {
+    const issues = findV4Contraband(data);
+    if (issues.length) {
+      return {
+        ok: false,
+        error: `v${obj.version} 备份包含 v4 结构，已拒绝：${issues[0].path} — ${issues[0].message}`,
+        issues,
+      };
+    }
   }
 
   /**
@@ -916,10 +927,10 @@ export function validateBackup(raw: unknown, currentAppVersion = CURRENT_APP_VER
 
   /* ── G1：动作配置记忆校验（模板必须完整合法；缺失按空记忆）── */
   const rawTemplatesRaw = (data as { exerciseTemplates?: unknown }).exerciseTemplates;
-  if (obj.version === 3 && rawTemplatesRaw === undefined) {
+  if (obj.version >= 3 && rawTemplatesRaw === undefined) {
     warnings.push('备份没有动作配置记忆字段，将按空记忆恢复');
   }
-  if (obj.version === 3 && rawTemplatesRaw !== undefined && !Array.isArray(rawTemplatesRaw)) {
+  if (obj.version >= 3 && rawTemplatesRaw !== undefined && !Array.isArray(rawTemplatesRaw)) {
     return { ok: false, error: '备份的 exerciseTemplates 必须是数组，已拒绝导入' };
   }
   const rawTemplates = Array.isArray(rawTemplatesRaw) ? (rawTemplatesRaw as unknown[]) : [];

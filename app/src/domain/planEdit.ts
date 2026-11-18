@@ -207,7 +207,8 @@ export function renameExercise(
           if (ex.id !== exId) return ex;
           if (opts.keepIdentity) return { ...ex, name: trimmed };
           // 真正换动作：清掉旧 exerciseId，让读取侧按新名重新解析
-          return { ...ex, name: trimmed, exerciseId: undefined };
+          const { setupNote: _setupNote, ...rest } = ex;
+          return { ...rest, name: trimmed, exerciseId: undefined };
         }),
       };
     }),
@@ -314,6 +315,7 @@ export function planExerciseFromTemplate(tpl: ExerciseTemplate): PlanExercise {
     name: tpl.name,
     ...(tpl.en !== undefined ? { en: tpl.en } : {}),
     restSec: tpl.restSec,
+    ...(tpl.setupNote ? { setupNote: tpl.setupNote } : {}),
     target,
   };
 }
@@ -387,6 +389,7 @@ export function applyEditorToPlanExercise(
     restSec: payload.restSec,
     target: nextTarget,
   };
+  if (identityChanged) delete nextExercise.setupNote;
   if (payload.en !== undefined) {
     nextExercise.en = payload.en;
   } else {

@@ -190,6 +190,7 @@ export function extractCleanPlanExercises(
       ...(typeof ex.en === 'string' && ex.en.trim().length > 0 ? { en: ex.en } : {}),
       restSec: ex.restSec,
       target,
+      ...(ex.setupNote ? { setupNote: ex.setupNote } : {}),
       ...(sameIdentityAsOrig && orig?.note !== undefined ? { note: orig.note } : {}),
       ...(sameIdentityAsOrig && orig?.substitutes !== undefined
         ? { substitutes: [...orig.substitutes] }

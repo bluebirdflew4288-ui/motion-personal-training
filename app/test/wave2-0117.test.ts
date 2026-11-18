@@ -342,10 +342,10 @@ describe('Wave 2A · Plans 拆分解耦、单事务计划+记忆保存、统一�
     expect(addedRes.added).toBe(true);
     await savePlan(addedRes.plan);
 
-    // 3) 导出 BackupPayload v3 并执行深度校验，确保零 v3 contraband / 零丢字段
+    // 3) 导出当前 BackupPayload 并执行深度校验，确保配置字段往返保真
     const backup = await buildBackup(CURRENT_APP_VERSION);
     expect(backup.version).toBe(BACKUP_VERSION);
-    expect(backup.version).toBe(3);
+    expect(backup.version).toBe(4);
     const validated = validateBackup(backup);
     expect(validated.ok).toBe(true);
     if (!validated.ok) return;

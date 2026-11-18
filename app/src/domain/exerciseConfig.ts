@@ -1110,6 +1110,7 @@ export function extractExerciseTemplate(
     ...(ex.en !== undefined ? { en: ex.en } : {}),
     target,
     restSec: ex.restSec,
+    ...(ex.setupNote ? { setupNote: ex.setupNote } : {}),
     revision,
     updatedAt: now,
   };
@@ -1125,6 +1126,7 @@ export function exerciseTemplateFromConfig(cfg: {
   en?: string;
   target: ExerciseTarget;
   restSec: number;
+  setupNote?: string;
   revision?: number;
   now?: number;
   makeStageId?: (stageIndex: number) => string;
@@ -1136,6 +1138,7 @@ export function exerciseTemplateFromConfig(cfg: {
     name: cfg.name,
     ...(cfg.en !== undefined ? { en: cfg.en } : {}),
     restSec: cfg.restSec,
+    ...(cfg.setupNote ? { setupNote: cfg.setupNote } : {}),
     target: cfg.target,
     status: 'pending',
     groups: [],
@@ -1179,6 +1182,7 @@ export function sessionExerciseFromTemplate(
     name: tpl.name,
     ...(tpl.en !== undefined ? { en: tpl.en } : {}),
     restSec: tpl.restSec,
+    ...(tpl.setupNote ? { setupNote: tpl.setupNote } : {}),
     target,
     status: 'pending',
     groups,

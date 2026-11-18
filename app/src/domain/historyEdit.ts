@@ -190,6 +190,7 @@ export function correctHistoryCardioEntry(
         startElapsedMs: 0,
         endElapsedMs: nextElapsedMs,
         params: { ...nextParams },
+        ...(entry.segments[0]?.note ? { note: entry.segments[0].note } : {}),
       },
     ];
   } else {
@@ -205,7 +206,7 @@ export function correctHistoryCardioEntry(
         ? nextElapsedMs
         : Math.min(nextElapsedMs, Math.max(cursor, Math.round((origEnd / denom) * nextElapsedMs)));
       const built = {
-        id: seg.id,
+        ...seg,
         startElapsedMs: cursor,
         endElapsedMs: scaledEnd,
         params: normalizeCardioParams(entry.preset, seg.params),

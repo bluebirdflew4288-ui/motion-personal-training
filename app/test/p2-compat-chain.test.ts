@@ -196,22 +196,22 @@ describe('场景2 · v1 备份恢复保真 + 夹带新结构必须拒绝', () =>
     expect(validateBackup(v1).ok).toBe(false);
   });
 
-  it('version 4 → 拒绝（不猜测读取；v3 已是当前格式）', () => {
-    const v3 = {
+  it('version 5 → 拒绝（不猜测读取；v4 已是当前格式）', () => {
+    const future = {
       format: BACKUP_FORMAT,
-      version: 4,
+      version: 5,
       exportedAt: NOW,
       appVersion: '9.9.9',
       counts: { plans: 0, sessions: 0, activeSessions: 0 },
       data: { plans: [], sessions: [], settings: [] },
     };
-    const v = validateBackup(v3);
+    const v = validateBackup(future);
     expect(v.ok).toBe(false);
     if (!v.ok) expect(v.error).toContain('高于当前应用支持');
   });
 });
 
-describe('场景5 · v2 导出 → 校验 → 恢复 → 重读 → 重导出 逐字段保真', () => {
+describe('场景5 · 有氧记录导出 → 校验 → 恢复 → 重读 → 重导出 逐字段保真', () => {
   it('力量+两段有氧的混合记录往返保真', async () => {
     const plan = createV32Plan(NOW);
     await savePlan(plan);
@@ -250,9 +250,9 @@ describe('场景5 · v2 导出 → 校验 → 恢复 → 重读 → 重导出 �
     });
     expect(r.ok).toBe(true);
 
-    // 导出 v2
+    // 导出当前格式，并显式用旧版 envelope 验证旧格式
     const b1 = await buildBackup('2.0.0');
-    expect(b1.version).toBe(3);
+    expect(b1.version).toBe(4);
     const json1 = JSON.parse(JSON.stringify(b1));
 
     // 校验

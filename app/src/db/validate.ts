@@ -46,16 +46,12 @@ import {
   MAX_SET_ROWS,
   MAX_STAGES_ACCEPTED,
   MAX_STRAIGHT_SETS,
-  MAX_INCLINE_PCT,
-  MAX_SPEED_KMH,
-  MAX_STAIR_LEVEL,
   MAX_TEXT,
   MAX_WEIGHT,
-  MIN_INCLINE_PCT,
-  MIN_SPEED_KMH,
-  MIN_STAIR_LEVEL,
 } from '../domain/limits';
-import { validateCardioEntry as validateCardioEntryInvariants } from '../domain/cardio';
+import { normalizeCardioParams, validateCardioParams as checkCardioParams, validateCardioEntry as validateCardioEntryInvariants } from '../domain/cardio';
+import { CARDIO_PRESETS, TRAINING_FOCUSES } from '../domain/types';
+import { parseSetupNote } from '../domain/setupNote';
 import { isLocalDateKey } from '../domain/localDate';
 
 export interface ValidationIssue {
@@ -426,6 +422,15 @@ function validateWarmup(c: Ctx, v: unknown, path: string): WarmupTarget | null {
   };
 }
 
+function validatedSetupNote(c: Ctx, value: unknown, path: string): { setupNote?: string } {
+  const result = parseSetupNote(value);
+  if (!result.ok) {
+    c.add(path, result.message);
+    return {};
+  }
+  return result.note === undefined ? {} : { setupNote: result.note };
+}
+
 /* ── 计划 ───────────────────────────────── */
 
 function validatePlanExercise(c: Ctx, v: unknown, path: string): PlanExercise | null {
@@ -442,6 +447,7 @@ function validatePlanExercise(c: Ctx, v: unknown, path: string): PlanExercise | 
     en: v.en === undefined ? undefined : str(c, v.en, `${path}.en`, { max: 200, optional: true }),
     restSec: num(c, v.restSec, `${path}.restSec`, { min: 0, max: MAX_REST, integer: true }) ?? 120,
     target,
+    ...validatedSetupNote(c, v.setupNote, `${path}.setupNote`),
     note: v.note === undefined ? undefined : str(c, v.note, `${path}.note`, { max: MAX_TEXT, optional: true }),
     substitutes: Array.isArray(v.substitutes)
       ? (v.substitutes.length > MAX_EXERCISES
@@ -515,7 +521,7 @@ function validatePlanDay(c: Ctx, v: unknown, path: string): PlanDay | null {
           ...(v.focus !== undefined
             ? {
                 focus:
-                  oneOf(c, v.focus, `${path}.focus`, ['chest', 'back', 'legs'] as const) ?? undefined,
+                  oneOf(c, v.focus, `${path}.focus`, TRAINING_FOCUSES) ?? undefined,
               }
             : {}),
           ...(v.round !== undefined
@@ -526,7 +532,7 @@ function validatePlanDay(c: Ctx, v: unknown, path: string): PlanDay | null {
           ...(v.focus !== undefined
             ? {
                 focus:
-                  oneOf(c, v.focus, `${path}.focus`, ['chest', 'back', 'legs'] as const) ?? undefined,
+                  oneOf(c, v.focus, `${path}.focus`, TRAINING_FOCUSES) ?? undefined,
               }
             : {}),
           ...(v.round !== undefined
@@ -676,6 +682,7 @@ function validateSessionExercise(c: Ctx, v: unknown, path: string): SessionExerc
     en: v.en === undefined ? undefined : str(c, v.en, `${path}.en`, { max: 200, optional: true }),
     restSec: num(c, v.restSec, `${path}.restSec`, { min: 0, max: MAX_REST, integer: true }) ?? 120,
     target,
+    ...validatedSetupNote(c, v.setupNote, `${path}.setupNote`),
     status: oneOf(c, v.status, `${path}.status`, ['pending', 'done', 'skipped'] as const) ?? 'pending',
     groups,
     sets,
@@ -822,7 +829,7 @@ function validateSession(c: Ctx, v: unknown, path: string): Session | null {
       ...(day.focus !== undefined
         ? {
             focus:
-              oneOf(c, day.focus, `${path}.day.focus`, ['chest', 'back', 'legs'] as const) ?? undefined,
+              oneOf(c, day.focus, `${path}.day.focus`, TRAINING_FOCUSES) ?? undefined,
           }
         : {}),
       ...(day.round !== undefined
@@ -999,38 +1006,9 @@ function validateCardioParams(c: Ctx, v: unknown, path: string, preset: CardioPr
     c.add(path, '有氧参数必须是对象');
     return null;
   }
-  const out: CardioParams = {};
-  const allowed = new Set<keyof CardioParams>(
-    preset === 'treadmill-incline' ? ['speedKmh', 'inclinePct'] : ['level'],
-  );
-
-  // 不适用字段必须缺省
-  for (const key of ['speedKmh', 'inclinePct', 'level'] as const) {
-    if (v[key] !== undefined && !allowed.has(key)) {
-      c.add(`${path}.${key}`, '该预设不使用此参数');
-    }
-  }
-
-  if (preset === 'treadmill-incline') {
-    const speed = num(c, v.speedKmh, `${path}.speedKmh`, {
-      min: MIN_SPEED_KMH,
-      max: MAX_SPEED_KMH,
-    });
-    if (speed !== null) out.speedKmh = speed;
-    const inc = num(c, v.inclinePct, `${path}.inclinePct`, {
-      min: MIN_INCLINE_PCT,
-      max: MAX_INCLINE_PCT,
-    });
-    if (inc !== null) out.inclinePct = inc;
-  } else {
-    const level = num(c, v.level, `${path}.level`, {
-      min: MIN_STAIR_LEVEL,
-      max: MAX_STAIR_LEVEL,
-      integer: true,
-    });
-    if (level !== null) out.level = level;
-  }
-  return out;
+  const issues = checkCardioParams(preset, v);
+  for (const issue of issues) c.add(`${path}.${issue.field}`, issue.message);
+  return issues.length ? null : normalizeCardioParams(preset, v);
 }
 
 function validateCardioSegment(c: Ctx, v: unknown, path: string, preset: CardioPreset): CardioSegment | null {
@@ -1051,11 +1029,13 @@ function validateCardioSegment(c: Ctx, v: unknown, path: string, preset: CardioP
   if (endElapsedMs !== null && startElapsedMs !== null && endElapsedMs < startElapsedMs) {
     c.add(`${path}.endElapsedMs`, '分段终点早于起点（负时长）');
   }
+  const note = v.note === undefined ? undefined : str(c, v.note, `${path}.note`, { max: MAX_TEXT }).trim();
   return {
     id: str(c, v.id, `${path}.id`, { max: 120 }),
     startElapsedMs: startElapsedMs ?? 0,
     endElapsedMs,
     params: params ?? {},
+    ...(note ? { note } : {}),
   };
 }
 
@@ -1064,7 +1044,7 @@ function validateCardioEntry(c: Ctx, v: unknown, path: string): CardioEntry | nu
     c.add(path, '有氧项目必须是对象');
     return null;
   }
-  const preset = oneOf(c, v.preset, `${path}.preset`, ['treadmill-incline', 'stair-climber'] as const);
+  const preset = oneOf(c, v.preset, `${path}.preset`, CARDIO_PRESETS);
   if (!preset) {
     c.add(`${path}.preset`, '有氧预设不合法');
     return null;
@@ -1133,7 +1113,7 @@ function validatePlanCardio(c: Ctx, v: unknown, path: string): PlanCardio | null
     c.add(path, '计划有氧目标必须是对象');
     return null;
   }
-  const preset = oneOf(c, v.preset, `${path}.preset`, ['treadmill-incline', 'stair-climber'] as const);
+  const preset = oneOf(c, v.preset, `${path}.preset`, CARDIO_PRESETS);
   if (!preset) {
     c.add(`${path}.preset`, '有氧预设不合法');
     return null;

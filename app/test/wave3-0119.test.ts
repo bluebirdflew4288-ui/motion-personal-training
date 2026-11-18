@@ -279,8 +279,9 @@ describe('Wave 3A：完成训练时可选「将今日动作编排同步回原计
     expect(planAfter2.days[0].exercises[0].target.kind === 'straight' && planAfter2.days[0].exercises[0].target.sets).toBe(4);
 
     const backup = await buildBackup(CURRENT_APP_VERSION);
-    expect(backup.version).toBe(3);
+    expect(backup.version).toBe(4);
     expect(validateBackup(backup).ok).toBe(true);
+    expect(validateBackup({ ...backup, version: 3 }).ok).toBe(true);
 
     // 3) 若目标训练日在另一标签页被改成休息日：勾选同步时整个事务 abort，训练保持 active 不丢锁
     await savePlan({

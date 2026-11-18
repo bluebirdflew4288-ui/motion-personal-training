@@ -99,8 +99,8 @@ describe('F11 音效开关与备份兼容', () => {
     expect(r.ok).toBe(true);
   });
 
-  it('备份版本号没有因为 F11 改变', () => {
-    expect(BACKUP_VERSION).toBe(3);
+  it('当前备份版本同时保留 F11 本地音效偏好契约', () => {
+    expect(BACKUP_VERSION).toBe(4);
   });
 
   it('恢复备份不覆盖本机音效开关（本机交互偏好），但主题仍然按备份恢复', async () => {

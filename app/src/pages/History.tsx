@@ -14,17 +14,11 @@ import { Sheet } from '../ui/Sheet';
 import { fmtDateWithWeek, fmtDuration, fmtTime, fmtWeight } from '../lib/format';
 import type { CardioEntry, Session, SessionSet } from '../domain/types';
 import {
-  MAX_INCLINE_PCT,
-  MAX_SPEED_KMH,
-  MAX_STAIR_LEVEL,
   MAX_TEXT,
-  MIN_INCLINE_PCT,
-  MIN_SPEED_KMH,
-  MIN_STAIR_LEVEL,
 } from '../domain/limits';
 import { isSetLogged, summarizeSession, withSet } from '../domain/session';
 import { sessionKindOf } from '../domain/sessionKind';
-import { describeCardioParams, liveElapsedMs, validateCardioList } from '../domain/cardio';
+import { CARDIO_FIELDS, describeCardioParams, liveElapsedMs, validateCardioList } from '../domain/cardio';
 import {
   appendBlankGroupToHistoryExercise,
   canRemoveBlankGroupFromHistoryExercise,
@@ -956,7 +950,7 @@ export function HistoryDetailPage({ id }: { id: string }) {
                           {fmtDuration(seg.startElapsedMs)} –{' '}
                           {seg.endElapsedMs === null ? '进行中' : fmtDuration(seg.endElapsedMs)}
                         </span>
-                        <span>{describeCardioParams(c.preset, seg.params)}</span>
+                        <span>{seg.note || describeCardioParams(c.preset, seg.params)}</span>
                       </div>
                     ))}
                   </>
@@ -1013,70 +1007,35 @@ export function HistoryDetailPage({ id }: { id: string }) {
                       </label>
                     </div>
 
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-                      <span style={{ fontSize: 12.5, color: 'var(--ink-3)', width: 56, flex: 'none' }}>
-                        强度参数
-                      </span>
-                      {c.preset === 'treadmill-incline' ? (
-                        <>
-                          <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 12, color: 'var(--ink-3)' }}>
-                            速度
+                    {CARDIO_FIELDS[c.preset].length > 0 && (
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                        <span style={{ fontSize: 12.5, color: 'var(--ink-3)', width: 56, flex: 'none' }}>
+                          强度参数
+                        </span>
+                        {CARDIO_FIELDS[c.preset].map(({ key, label, min, max, integer, unit, optional }) => (
+                          <label key={key} style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 12, color: 'var(--ink-3)' }}>
+                            {label}
                             <DraftCell
-                              value={c.currentParams.speedKmh ?? null}
-                              required
-                              min={MIN_SPEED_KMH}
-                              max={MAX_SPEED_KMH}
+                              value={c.currentParams[key] ?? null}
+                              required={!optional}
+                              min={min}
+                              max={max}
+                              integer={integer}
                               width={78}
-                              unit="km/h"
-                              ariaLabel={`${c.name} 速度`}
-                              onValidityChange={(ok) => setCellValid(`cardio:${c.id}:speed`, ok)}
-                              onDraftState={(dirty, valid) => setCellRaw(`cardio:${c.id}:speed`, dirty, valid)}
+                              unit={unit}
+                              ariaLabel={`${c.name} ${label}`}
+                              onValidityChange={(ok) => setCellValid(`cardio:${c.id}:${key}`, ok)}
+                              onDraftState={(dirty, valid) => setCellRaw(`cardio:${c.id}:${key}`, dirty, valid)}
                               onCommit={(v) => {
-                                if (v === null) return;
-                                updateDraftCardio(c, { params: { speedKmh: v } });
+                                if (!optional && v === null) return;
+                                updateDraftCardio(c, { params: { [key]: v ?? undefined } });
                               }}
                             />
                           </label>
-                          <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 12, color: 'var(--ink-3)' }}>
-                            坡度
-                            <DraftCell
-                              value={c.currentParams.inclinePct ?? null}
-                              required
-                              min={MIN_INCLINE_PCT}
-                              max={MAX_INCLINE_PCT}
-                              width={74}
-                              unit="%"
-                              ariaLabel={`${c.name} 坡度`}
-                              onValidityChange={(ok) => setCellValid(`cardio:${c.id}:incline`, ok)}
-                              onDraftState={(dirty, valid) => setCellRaw(`cardio:${c.id}:incline`, dirty, valid)}
-                              onCommit={(v) => {
-                                if (v === null) return;
-                                updateDraftCardio(c, { params: { inclinePct: v } });
-                              }}
-                            />
-                          </label>
-                        </>
-                      ) : (
-                        <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 12, color: 'var(--ink-3)' }}>
-                          档位
-                          <DraftCell
-                            value={c.currentParams.level ?? null}
-                            integer
-                            required
-                            min={MIN_STAIR_LEVEL}
-                            max={MAX_STAIR_LEVEL}
-                            width={76}
-                            ariaLabel={`${c.name} 档位`}
-                            onValidityChange={(ok) => setCellValid(`cardio:${c.id}:level`, ok)}
-                            onDraftState={(dirty, valid) => setCellRaw(`cardio:${c.id}:level`, dirty, valid)}
-                            onCommit={(v) => {
-                              if (v === null) return;
-                              updateDraftCardio(c, { params: { level: v } });
-                            }}
-                          />
-                        </label>
-                      )}
-                    </div>
+                        ))}
+                      </div>
+                    )}
+
                   </div>
                 )}
               </div>

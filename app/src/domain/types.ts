@@ -142,6 +142,7 @@ export interface ExerciseTemplate {
   /** 完整纯配置；阶段必须带稳定 id */
   target: ExerciseTarget;
   restSec: number;
+  setupNote?: string;
   /** 模板 revision：每次显式更新 +1，用于 expected revision 冲突保护 */
   revision: number;
   updatedAt: number;
@@ -157,19 +158,38 @@ export interface PlanExercise {
   restSec: number;
   target: ExerciseTarget;
   note?: string;
+  setupNote?: string;
   /** V3.2 中被标记为可替代的动作 */
   substitutes?: string[];
 }
+
+export const LEGACY_TRAINING_FOCUSES = ['chest', 'back', 'legs'] as const;
+export const TRAINING_FOCUSES = [
+  ...LEGACY_TRAINING_FOCUSES, 'shoulders', 'arms', 'core', 'upper', 'lower', 'full',
+] as const;
+export type TrainingFocus = (typeof TRAINING_FOCUSES)[number];
+
+export const TRAINING_FOCUS_LABEL: Record<TrainingFocus, string> = {
+  chest: '胸',
+  back: '背',
+  legs: '腿',
+  shoulders: '肩',
+  arms: '手臂',
+  core: '核心',
+  upper: '上肢',
+  lower: '下肢',
+  full: '全身',
+};
 
 export interface PlanDay {
   id: string;
   /** 训练日名称，例如 胸 A */
   name: string;
   /**
-   * 分部：胸 / 背 / 腿。
+   * 力量训练日的分部标签。
    * 仅 `kind === 'train'`（力量日）适用；有氧/休息日不伪造该字段。
    */
-  focus?: 'chest' | 'back' | 'legs';
+  focus?: TrainingFocus;
   /** A/B 轮。同样仅力量日适用。 */
   round?: 'A' | 'B';
   /**
@@ -201,15 +221,17 @@ export interface Plan {
 
 /* ── 有氧（第2阶段）───────────────────────── */
 
-/** 首版仅两个预设，不做自定义参数设计器 */
-export type CardioPreset = 'treadmill-incline' | 'stair-climber';
+export const LEGACY_CARDIO_PRESETS = ['treadmill-incline', 'stair-climber'] as const;
+export const CARDIO_PRESETS = [
+  ...LEGACY_CARDIO_PRESETS, 'stationary-bike', 'elliptical', 'rowing-machine', 'free-cardio',
+] as const;
+export type CardioPreset = (typeof CARDIO_PRESETS)[number];
 
 /**
  * 有氧参数。
  *
  * **按 preset 严格区分使用字段**（PHASE-2-APPROVAL §2）：
- * · treadmill-incline：只用 speedKmh + inclinePct
- * · stair-climber    ：只用 level
+ * 每个预设的字段、范围和必填性由 cardio.ts 中的 CARDIO_FIELDS 定义。
  * 不适用的字段**缺省**（不写 undefined，也不写 null —— 新记录统一"缺省"这一种输出）。
  */
 export interface CardioParams {
@@ -219,6 +241,10 @@ export interface CardioParams {
   inclinePct?: number;
   /** 爬楼机：器械档位（必填，整数） */
   level?: number;
+  resistanceLevel?: number;
+  cadenceRpm?: number;
+  damperLevel?: number;
+  splitSecPer500m?: number;
 }
 
 /**
@@ -233,6 +259,7 @@ export interface CardioSegment {
   /** null = 该段仍 open（仅 status==='running' 时允许） */
   endElapsedMs: number | null;
   params: CardioParams;
+  note?: string;
 }
 
 export type CardioStatus = 'pending' | 'running' | 'paused' | 'done';
@@ -321,6 +348,7 @@ export interface GroupPlan {
 }
 
 export interface SessionExercise {
+  setupNote?: string;
   /** 本次训练中的动作实例 ID（sessionExerciseId） */
   id: string;
   /**
@@ -361,7 +389,7 @@ export interface SessionSnapshotDay {
   dayId: string;
   dayName: string;
   /** 仅力量训练快照适用；有氧/休息不伪造。旧数据已有值原样保留。 */
-  focus?: 'chest' | 'back' | 'legs';
+  focus?: TrainingFocus;
   round?: 'A' | 'B';
   partText: string;
 }

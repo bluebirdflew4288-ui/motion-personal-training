@@ -101,7 +101,7 @@ describe('严格拒绝', () => {
   it('未来版本 → 明确拒绝', () => {
     const r = parse(wrap({ name: 'X', days: [trainDay()], version: 99, __v: 99 }));
     expect(r.ok).toBe(false);
-    const r2 = parse({ format: PLAN_TEMPLATE_FORMAT, version: 2, plan: { name: 'X', days: [trainDay()] } });
+    const r2 = parse({ format: PLAN_TEMPLATE_FORMAT, version: 3, plan: { name: 'X', days: [trainDay()] } });
     expect(r2.ok).toBe(false);
     if (r2.ok) return;
     expect(r2.issues.some((i) => i.path === 'version' && i.message.includes('高于'))).toBe(true);
@@ -405,7 +405,7 @@ describe('导入后的完整生命周期', () => {
   it('导入的新计划进入全量 v2 备份 → 校验 → 恢复 → 重读保真', async () => {
     const plan = await importedPlan();
     const bak = await buildBackup('2.0.0');
-    expect(bak.version).toBe(3);
+    expect(bak.version).toBe(4);
     const v = validateBackup(JSON.parse(JSON.stringify(bak)));
     expect(v.ok, v.ok ? '' : (v as { error: string }).error).toBe(true);
     if (!v.ok) return;

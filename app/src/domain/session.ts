@@ -145,6 +145,7 @@ export function sessionExerciseFromPlan(ex: PlanExercise): SessionExercise {
     planExerciseId: ex.id,
     name: ex.name,
     en: ex.en,
+    ...(ex.setupNote ? { setupNote: ex.setupNote } : {}),
     restSec: ex.restSec,
     target,
     status: 'pending',

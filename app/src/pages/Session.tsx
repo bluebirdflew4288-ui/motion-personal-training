@@ -6,7 +6,7 @@
    · 结束训练确认面板 → `./session/SessionFinishSheet` */
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { createCardioEntry, validateCardioParams } from '../domain/cardio';
+import { CARDIO_PRESET_CHOICES, createCardioEntry, validateCardioParams } from '../domain/cardio';
 import {
   collectMovementFragments,
   comparabilityOf,
@@ -37,6 +37,7 @@ import {
   withExercise,
   withSetAndPrefillFollowingWeight,
 } from '../domain/session';
+import { setupNoteFor, withSetupNote } from '../domain/setupNote';
 import { diffSessionVsPlanDay } from '../domain/sessionToPlanSync';
 import {
   applyDeleteItem,
@@ -91,6 +92,7 @@ import { PlateCalculatorSheet } from '../ui/PlateCalculatorSheet';
 import { markPendingFinishReceipt } from '../ui/ReceiptSlipSheet';
 import { RestTimerBar, useRestTimer } from '../ui/RestTimer';
 import { Sheet } from '../ui/Sheet';
+import { SessionSetupNote, useSetupNoteTarget } from './session/SessionSetupNote';
 import { SwipeActionCard } from '../ui/SwipeActionCard';
 import { UndoStack, type UndoStackItem } from '../ui/UndoStack';
 import {
@@ -101,12 +103,6 @@ import { SessionFinishSheet } from './session/SessionFinishSheet';
 import { SessionHeader } from './session/SessionHeader';
 import { SessionWarmupSection } from './session/SessionWarmupSection';
 import { useSessionPersistence } from './session/useSessionPersistence';
-
-/** 首版仅两个有氧预设（默认初始参数，用户可当场调整） */
-const CARDIO_PRESETS = [
-  { preset: 'treadmill-incline' as const, label: '有氧爬坡', params: { speedKmh: 4, inclinePct: 4 } },
-  { preset: 'stair-climber' as const, label: '爬楼机', params: { level: 5 } },
-];
 
 interface DeleteUndoEntry {
   undo: DeleteUndoRecord;
@@ -164,6 +160,7 @@ export function SessionPage({
   const [summaryOpen, setSummaryOpen] = useState(false);
   const [discardOpen, setDiscardOpen] = useState(false);
   const [toolsFor, setToolsFor] = useState<string | null>(null);
+  const { setupNoteForId, openSetupNote, closeSetupNote, templatesById } = useSetupNoteTarget(exerciseTemplates);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const defaultExpandedApplied = useRef(false);
   const [confirmRemoveRoundOpen, setConfirmRemoveRoundOpen] = useState(false);
@@ -851,9 +848,10 @@ export function SessionPage({
       const intentId = entry.exercise.id;
       if (addInFlightRef.current) return { ok: false, message: '这次添加正在保存，请稍候' };
       addInFlightRef.current = intentId;
+      const priorTemplate = payload ? templatesById.get(payload.exerciseId) : undefined;
       const templateWrite =
         payload?.remember && payload.template
-          ? { template: payload.template, expectedRevision: payload.templateExpectedRevision }
+          ? { template: withSetupNote(payload.template, priorTemplate?.setupNote), expectedRevision: payload.templateExpectedRevision }
           : undefined;
       try {
         const r = await commitPaired(
@@ -885,7 +883,7 @@ export function SessionPage({
         if (addInFlightRef.current === intentId) addInFlightRef.current = null;
       }
     },
-    [commitPaired, latestRef, pushToast],
+    [commitPaired, latestRef, pushToast, templatesById],
   );
 
   const handleAddName = useCallback(
@@ -937,9 +935,14 @@ export function SessionPage({
       const latest = latestRef.current;
       const source = latest?.exercises.find((e) => e.id === exId);
       if (!latest || !source) return { ok: false, message: '这个动作已经不在本次训练里了' };
+      const priorTemplate = templatesById.get(payload.exerciseId);
+      const nextNote = setupNoteFor(
+        source.exerciseId === payload.exerciseId ? source : {},
+        priorTemplate,
+      );
       const templateWrite =
         payload.remember && payload.template
-          ? { template: payload.template, expectedRevision: payload.templateExpectedRevision }
+          ? { template: withSetupNote(payload.template, nextNote), expectedRevision: payload.templateExpectedRevision }
           : undefined;
       const r = await commitPaired((fresh) => {
         const freshSource = fresh.exercises.find((e) => e.id === exId);
@@ -963,7 +966,7 @@ export function SessionPage({
         }
         return {
           ...applied.session,
-          exercises: applied.session.exercises.map((e) => (e.id === exId ? nextExercise : e)),
+          exercises: applied.session.exercises.map((e) => (e.id === exId ? withSetupNote(nextExercise, nextNote) : e)),
         };
       }, templateWrite);
       if (r.status === 'saved') {
@@ -980,7 +983,7 @@ export function SessionPage({
       pushToast(`保存没有成功：${errMsg}。草稿已保留。`, 'error');
       return { ok: false, message: `${errMsg}，草稿已保留` };
     },
-    [commitPaired, latestRef, pushToast],
+    [commitPaired, latestRef, pushToast, templatesById],
   );
 
   const handleEditorSubmit = useCallback(
@@ -994,6 +997,7 @@ export function SessionPage({
           ...(payload.en !== undefined ? { en: payload.en } : {}),
           target: payload.target,
           restSec: payload.restSec,
+          setupNote: templatesById.get(payload.exerciseId)?.setupNote,
         });
         const built = sessionExerciseFromTemplate(tpl);
         const entry = {
@@ -1025,7 +1029,7 @@ export function SessionPage({
       }
       return commitEditPayload(payload, exId);
     },
-    [commitAddExercise, commitEditPayload, editorState, latestRef, sessionId],
+    [commitAddExercise, commitEditPayload, editorState, latestRef, sessionId, templatesById],
   );
 
   /**
@@ -1209,6 +1213,7 @@ export function SessionPage({
   const summary = summarizeSession(session);
   const sessionCardio = session.cardio ?? [];
   const toolsEx = session.exercises.find((e) => e.id === toolsFor);
+  const setupExercise = session.exercises.find((exercise) => exercise.id === setupNoteForId);
 
   async function finish() {
     if (!session) return;
@@ -1367,6 +1372,8 @@ export function SessionPage({
                 ex,
                 lastPerfIndex.latestExByKey.get(comparabilityOf(ex)),
               )}
+              setupNote={setupNoteFor(ex, templatesById.get(ex.exerciseId))}
+              onEditSetupNote={openSetupNote}
               onOpenPlateCalc={handleOpenPlateCalc}
               apply={applyChange}
               latestRef={latestRef}
@@ -1452,7 +1459,7 @@ export function SessionPage({
         ) : null}
 
         <div style={{ display: 'flex', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
-          {CARDIO_PRESETS.map((p) => (
+          {CARDIO_PRESET_CHOICES.map((p) => (
             <button
               key={p.preset}
               className="btn btn-ghost btn-sm"
@@ -1585,6 +1592,9 @@ export function SessionPage({
       <Sheet open={!!toolsEx} title={toolsEx ? toolsEx.name : ''} onClose={() => setToolsFor(null)}>
         {toolsEx ? (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            <button type="button" className="btn btn-ghost" onClick={() => { openSetupNote(toolsEx.id); setToolsFor(null); }}>
+              器械档位
+            </button>
             {toolsEx.target.weightMode === 'external' ? (
               <button
                 type="button"
@@ -1652,6 +1662,9 @@ export function SessionPage({
         applyChange={applyChange}
       />
 
+      {setupExercise && <SessionSetupNote key={setupExercise.id} exercise={setupExercise} memory={templatesById.get(setupExercise.exerciseId)}
+        blocked={inputPaused} templateError={exerciseTemplateError} commit={commitPaired}
+        onClose={closeSetupNote} />}
       <PlateCalculatorSheet
         open={plateCalcState !== null}
         initialWeightKg={plateCalcState?.weightKg ?? null}

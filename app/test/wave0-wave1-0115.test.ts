@@ -345,13 +345,13 @@ describe('Wave 0A & 0B · 版本号、非热路径懒加载路由、空闲预热
     vi.unstubAllGlobals();
   });
 
-  it('CURRENT_APP_VERSION、package.json 与 Android build.gradle 严格对齐 0.1.19 / versionCode 20', () => {
-    expect(CURRENT_APP_VERSION).toBe('0.1.19');
+  it('CURRENT_APP_VERSION、package.json 与 Android build.gradle 严格对齐 0.2.0 / versionCode 21', () => {
+    expect(CURRENT_APP_VERSION).toBe('0.2.0');
     const pkg = JSON.parse(readApp('package.json')) as { version: string };
-    expect(pkg.version).toBe('0.1.19');
+    expect(pkg.version).toBe('0.2.0');
     const gradle = readApp('android/app/build.gradle');
-    expect(gradle).toContain('versionCode 20');
-    expect(gradle).toContain('versionName "0.1.19"');
+    expect(gradle).toContain('versionCode 21');
+    expect(gradle).toContain('versionName "0.2.0"');
   });
 
   it('App.tsx 保持 Home 与 SessionPage 同步直出，其余 6 个非热路径页面走 React.lazy + Suspense 并带后台预热与 Tab 按下预加载', async () => {

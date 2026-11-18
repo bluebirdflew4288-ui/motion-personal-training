@@ -16,11 +16,13 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  CARDIO_FIELDS,
   CARDIO_PRESET_LABEL,
   commitCardioParams,
   completeCardio,
   describeCardioParams,
   liveElapsedMs,
+  markFreeCardioSegment,
   paramsEqual,
   pauseCardio,
   resumeCardio,
@@ -32,6 +34,7 @@ import {
   MAX_INCLINE_PCT,
   MAX_SPEED_KMH,
   MAX_STAIR_LEVEL,
+  MAX_TEXT,
   MIN_INCLINE_PCT,
   MIN_SPEED_KMH,
   MIN_STAIR_LEVEL,
@@ -92,6 +95,7 @@ export function CardioPanel({ entry, apply, disabled, pushToast, registerFlush, 
   const form = useDraftForm();
   const [paramError, setParamError] = useState<string | null>(null);
   const [showSegments, setShowSegments] = useState(false);
+  const [segmentNote, setSegmentNote] = useState('');
   /** 有未纠正的草稿时置 true：done 后也保留参数区以便纠正/放弃 */
   const [draftPending, setDraftPending] = useState(false);
 
@@ -186,7 +190,9 @@ export function CardioPanel({ entry, apply, disabled, pushToast, registerFlush, 
   }, [entry, tick]);
 
   const isTreadmill = entry.preset === 'treadmill-incline';
-  const showParams = !done || draftPending;
+  const usesLegacyControls = isTreadmill || entry.preset === 'stair-climber';
+  const fields = CARDIO_FIELDS[entry.preset];
+  const showParams = fields.length > 0 && (!done || draftPending);
 
   /**
    * G3A2：把**实时 getter** 交给父页（删除预览/队列执行时调用）。
@@ -217,16 +223,16 @@ export function CardioPanel({ entry, apply, disabled, pushToast, registerFlush, 
   }, [form, registerRawSignature]);
 
   /** 用 flushAll 的解析值 + 滑杆值合成候选参数（滑杆未提交也纳入） */
-  const mergeDraftTo = (latest: CardioEntry, values: Record<string, number>): CardioParams => {
-    const sp = values['cardio.speed'];
-    const inc = values['cardio.incline'];
-    const lv = values['cardio.level'];
-    return {
-      ...latest.currentParams,
-      ...(typeof sp === 'number' ? { speedKmh: sp } : {}),
-      ...(typeof inc === 'number' ? { inclinePct: inc } : {}),
-      ...(typeof lv === 'number' ? { level: lv } : {}),
-    };
+  const mergeDraftTo = (latest: CardioEntry, { values, nullIds }: ReturnType<typeof form.flushAll>): CardioParams => {
+    const next = { ...latest.currentParams };
+    for (const { key, optional } of fields) {
+      const id = key === 'speedKmh' ? 'cardio.speed' : key === 'inclinePct' && isTreadmill
+        ? 'cardio.incline' : `cardio.${key}`;
+      const value = values[id];
+      if (typeof value === 'number') next[key] = value;
+      if (optional && nullIds?.has(id)) delete next[key];
+    }
+    return next;
   };
 
   /**
@@ -256,7 +262,7 @@ export function CardioPanel({ entry, apply, disabled, pushToast, registerFlush, 
         return null;
       }
 
-      const candidate = mergeDraftTo(latest, flushed.values);
+      const candidate = mergeDraftTo(latest, flushed);
       /**
        * 滑杆未提交值纳入候选 —— 但**必须逐字段只取"与库值不同"的键**。
        *
@@ -472,7 +478,7 @@ export function CardioPanel({ entry, apply, disabled, pushToast, registerFlush, 
               参数
             </div>
 
-            {isTreadmill ? (
+            {!usesLegacyControls ? null : isTreadmill ? (
               <div style={{ display: 'grid', gap: 10, marginTop: 8 }}>
                 <label style={{ fontSize: 12, color: 'var(--ink-3)', display: 'block' }}>
                   <span style={{ display: 'block' }}>速度（km/h）</span>
@@ -545,7 +551,20 @@ export function CardioPanel({ entry, apply, disabled, pushToast, registerFlush, 
             )}
 
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0,1fr))', gap: 8, marginTop: 8 }}>
-              {isTreadmill ? (
+              {!usesLegacyControls ? fields.map(({ key, label, min, max, integer, unit, optional }) => {
+                const props = {
+                  label: optional ? `${label}（可选）` : label,
+                  min, max, integer: Boolean(integer), unit, form,
+                  fieldId: `cardio.${key}`,
+                  disabled: disabled || done,
+                  onCommit: () => { withDraft((latest, session) => withCardioEntry(session, latest)); },
+                };
+                return optional ? (
+                  <DraftNumberField key={key} {...props} nullable value={entry.currentParams[key] ?? null} />
+                ) : (
+                  <DraftNumberField key={key} {...props} value={entry.currentParams[key] ?? min} />
+                );
+              }) : isTreadmill ? (
                 <>
                   <DraftNumberField
                     label="速度精确值"
@@ -617,6 +636,38 @@ export function CardioPanel({ entry, apply, disabled, pushToast, registerFlush, 
           </div>
         ) : null}
 
+        {entry.preset === 'free-cardio' && running && (
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 10 }}>
+            <input
+              className="input"
+              aria-label="自由有氧分段备注"
+              placeholder="分段备注（可选）"
+              maxLength={MAX_TEXT}
+              disabled={disabled}
+              value={segmentNote}
+              onChange={(event) => setSegmentNote(event.target.value)}
+              style={{ flex: '1 1 150px', minWidth: 0 }}
+            />
+            <button
+              type="button"
+              className="btn btn-ghost btn-sm"
+              disabled={disabled}
+              onClick={() => apply((latest, session) => {
+                const result = markFreeCardioSegment(latest, segmentNote);
+                if (!result.ok) {
+                  pushToast(result.reason, 'error');
+                  return null;
+                }
+                setSegmentNote('');
+                setShowSegments(true);
+                return withCardioEntry(session, result.entry);
+              })}
+            >
+              记录分段
+            </button>
+          </div>
+        )}
+
         {showSegments && entry.segments.length ? (
           <div style={{ marginTop: 10 }}>
             <div className="mono-label" style={{ fontSize: 11, marginBottom: 4 }}>
@@ -640,7 +691,7 @@ export function CardioPanel({ entry, apply, disabled, pushToast, registerFlush, 
                   {seg.endElapsedMs === null ? '进行中' : fmtElapsed(seg.endElapsedMs)}
                 </span>
                 <span style={{ textAlign: 'right' }}>
-                  {describeCardioParams(entry.preset, seg.params)}
+                  {seg.note || describeCardioParams(entry.preset, seg.params)}
                   <span style={{ color: 'var(--ink-4)' }}> · {fmtCountdown(segmentDurationMs(seg, live))}</span>
                 </span>
               </div>

@@ -10,6 +10,7 @@
 
 import { openDb, StorageError, idbGetAll } from './idb';
 import type { ExerciseTemplate } from '../domain/types';
+import { parseSetupNote } from '../domain/setupNote';
 import {
   findTemplateContraband,
   parseExerciseTargetUnknown,
@@ -82,6 +83,8 @@ export function validateExerciseTemplate(raw: unknown): TemplateValidation {
     issues.push({ path: 'updatedAt', message: '模板 updatedAt 必须是有限数字' });
   }
 
+  const setup = parseSetupNote(raw.setupNote);
+  if (!setup.ok) issues.push({ path: 'setupNote', message: setup.message });
   const parsedTarget = parseExerciseTargetUnknown(raw.target);
   let target: ExerciseTemplate['target'] | null = null;
   if (!parsedTarget.ok) {
@@ -118,6 +121,7 @@ export function validateExerciseTemplate(raw: unknown): TemplateValidation {
       ...(raw.en !== undefined ? { en: raw.en as string } : {}),
       target,
       restSec: raw.restSec as number,
+      ...(setup.ok && setup.note !== undefined ? { setupNote: setup.note } : {}),
       revision: raw.revision as number,
       updatedAt: raw.updatedAt as number,
     },

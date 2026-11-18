@@ -25,17 +25,18 @@ import {
   MAX_SET_ROWS,
   MAX_SPEED_KMH,
   MAX_STAGES,
-  MAX_STAIR_LEVEL,
   MAX_STRAIGHT_SETS,
   MAX_TEXT,
   MIN_INCLINE_PCT,
   MIN_ROUNDS,
   MIN_SPEED_KMH,
-  MIN_STAIR_LEVEL,
   MIN_STAGES,
   SPEED_STEP_KMH,
   INCLINE_STEP_PCT,
 } from './limits';
+import { CARDIO_PRESETS, LEGACY_CARDIO_PRESETS, LEGACY_TRAINING_FOCUSES, TRAINING_FOCUSES, TRAINING_FOCUS_LABEL } from './types';
+import { describeCardioParams, normalizeCardioParams, validateCardioParams } from './cardio';
+import { parseSetupNote } from './setupNote';
 import { resolveExerciseId } from './identity';
 import { stabilizeDropTargetStageIds } from './exerciseConfig';
 import type {
@@ -52,7 +53,7 @@ import type {
 import type { DropSetTarget, DropStageTarget, ExerciseTarget, StraightTarget } from './types';
 
 export const PLAN_TEMPLATE_FORMAT = 'motion-plan-template';
-export const PLAN_TEMPLATE_VERSION = 1;
+export const PLAN_TEMPLATE_VERSION = 2;
 /** 全量备份的 format 值 —— 出现在模板入口必须拒绝 */
 export const FULL_BACKUP_FORMAT = 'motion-training-backup';
 
@@ -68,6 +69,7 @@ export type TemplateResult =
 /* ── 校验基础设施 ───────────────────────── */
 
 class TCtx {
+  constructor(readonly version: 1 | 2) {}
   issues: TemplateIssue[] = [];
   add(path: string, message: string): void {
     this.issues.push({ path, message });
@@ -482,7 +484,11 @@ function parseExercise(c: TCtx, v: unknown, path: string): PlanExercise | null {
     c.add(path, '动作必须是对象');
     return null;
   }
-  rejectUnknown(c, v, ['name', 'en', 'restSec', 'note', 'target'], path);
+  const allowedKeys = ['name', 'en', 'restSec', 'note', 'target'];
+  if (c.version === 2) allowedKeys.push('setupNote');
+  rejectUnknown(c, v, allowedKeys, path);
+  const setup = parseSetupNote(v.setupNote);
+  if (!setup.ok) c.add(`${path}.setupNote`, setup.message);
   const name = reqStr(c, v.name, `${path}.name`, 200);
   const en = optStr(c, v.en, `${path}.en`, 200);
   const note = optStr(c, v.note, `${path}.note`, MAX_TEXT);
@@ -505,6 +511,7 @@ function parseExercise(c: TCtx, v: unknown, path: string): PlanExercise | null {
   };
   if (en !== undefined) ex.en = en;
   if (note !== undefined) ex.note = note;
+  if (setup.ok && setup.note !== undefined) ex.setupNote = setup.note;
   return ex;
 }
 
@@ -515,17 +522,16 @@ function parseCardioTarget(c: TCtx, preset: CardioPreset, v: unknown, path: stri
     c.add(path, '有氧目标必须是对象');
     return null;
   }
-  if (preset === 'treadmill-incline') {
+  if (c.version === 1 && preset === 'treadmill-incline') {
     rejectUnknown(c, v, ['speedKmh', 'inclinePct'], path);
     const sp = reqStepNum(c, v.speedKmh, `${path}.speedKmh`, MIN_SPEED_KMH, MAX_SPEED_KMH, '速度（km/h）', SPEED_STEP_KMH);
     const inc = reqStepNum(c, v.inclinePct, `${path}.inclinePct`, MIN_INCLINE_PCT, MAX_INCLINE_PCT, '坡度（%）', INCLINE_STEP_PCT);
     if (sp === null || inc === null) return null;
     return { speedKmh: sp, inclinePct: inc };
   }
-  rejectUnknown(c, v, ['level'], path);
-  const lv = reqInt(c, v.level, `${path}.level`, MIN_STAIR_LEVEL, MAX_STAIR_LEVEL, '档位');
-  if (lv === null) return null;
-  return { level: lv };
+  const issues = validateCardioParams(preset, v);
+  for (const issue of issues) c.add(`${path}.${issue.field}`, issue.message);
+  return issues.length ? null : normalizeCardioParams(preset, v);
 }
 
 function parsePlanCardio(c: TCtx, v: unknown, path: string): PlanCardio | null {
@@ -538,7 +544,7 @@ function parsePlanCardio(c: TCtx, v: unknown, path: string): PlanCardio | null {
     c,
     v.preset,
     `${path}.preset`,
-    ['treadmill-incline', 'stair-climber'] as const,
+    c.version === 2 ? CARDIO_PRESETS : LEGACY_CARDIO_PRESETS,
     '有氧预设',
   );
   const name = reqStr(c, v.name, `${path}.name`, 100);
@@ -593,7 +599,7 @@ function parseDay(c: TCtx, v: unknown, path: string): PlanDay | null {
      */
     const focus = v.focus === undefined
       ? undefined
-      : oneOf(c, v.focus, `${path}.focus`, ['chest', 'back', 'legs'] as const, '部位');
+      : oneOf(c, v.focus, `${path}.focus`, c.version === 2 ? TRAINING_FOCUSES : LEGACY_TRAINING_FOCUSES, '部位');
     const round = v.round === undefined
       ? undefined
       : oneOf(c, v.round, `${path}.round`, ['A', 'B'] as const, '轮次');
@@ -706,16 +712,16 @@ export function parsePlanTemplate(text: string, now = Date.now()): TemplateResul
       issues: [{ path: 'format', message: '这是「全量备份」文件，不能在模板导入里使用；请到 设置 → 备份与恢复 → 从文件恢复' }],
     };
   }
-  const c = new TCtx();
+  const c = new TCtx(raw.version === 2 ? 2 : 1);
   rejectUnknown(c, raw, ['format', 'version', 'plan'], '(根)');
   if (raw.format !== PLAN_TEMPLATE_FORMAT) {
     c.add('format', `应为 "${PLAN_TEMPLATE_FORMAT}"，实际是 ${JSON.stringify(raw.format)}`);
   }
-  if (raw.version !== PLAN_TEMPLATE_VERSION) {
+  if (raw.version !== 1 && raw.version !== PLAN_TEMPLATE_VERSION) {
     if (typeof raw.version === 'number' && raw.version > PLAN_TEMPLATE_VERSION) {
       c.add('version', `模板版本 ${raw.version} 高于当前支持的 ${PLAN_TEMPLATE_VERSION}，请先升级应用`);
     } else {
-      c.add('version', `模板版本只能是 ${PLAN_TEMPLATE_VERSION}`);
+      c.add('version', `模板版本只能是 1 或 ${PLAN_TEMPLATE_VERSION}`);
     }
   }
   const plan = parsePlanRoot(c, raw);
@@ -775,8 +781,6 @@ export interface TemplatePreview {
   days: PreviewDay[];
 }
 
-const FOCUS_LABEL: Record<string, string> = { chest: '胸', back: '背', legs: '腿' };
-
 export function buildPreview(plan: Plan): TemplatePreview {
   const days: PreviewDay[] = plan.days.map((d, i) => {
     const targetSets = d.exercises.reduce(
@@ -803,17 +807,13 @@ export function buildPreview(plan: Plan): TemplatePreview {
       return `${ex.name}：${base} · 休息 ${ex.restSec} 秒`;
     });
     const cardioLines = (d.cardio ?? []).map(
-      (pc) =>
-        `${pc.name}：` +
-        (pc.preset === 'treadmill-incline'
-          ? `速度 ${pc.target.speedKmh} km/h · 坡度 ${pc.target.inclinePct}%`
-          : `档位 ${pc.target.level}`),
+      (pc) => `${pc.name}：${describeCardioParams(pc.preset, pc.target)}`,
     );
     return {
       order: i + 1,
       name: d.name,
       kind: d.kind,
-      ...(d.focus ? { focusLabel: FOCUS_LABEL[d.focus] } : {}),
+      ...(d.focus ? { focusLabel: TRAINING_FOCUS_LABEL[d.focus] } : {}),
       ...(d.round ? { roundLabel: d.round } : {}),
       targetSets,
       exerciseLines,

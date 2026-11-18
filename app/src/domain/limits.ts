@@ -44,6 +44,7 @@ export const MAX_REST_IN_SEC = 600;
 
 /** 文本长度（备注 / 名称 / 说明） */
 export const MAX_TEXT = 2000;
+export const MAX_SETUP_NOTE = 200;
 
 /**
  * 动作稳定身份 exerciseId 的最大长度（单一真源）。
@@ -98,6 +99,14 @@ export const INCLINE_STEP_PCT = 0.1;
 /** 爬楼机档位（整数） */
 export const MIN_STAIR_LEVEL = 1;
 export const MAX_STAIR_LEVEL = 100;
+export const MIN_RESISTANCE_LEVEL = 1;
+export const MAX_RESISTANCE_LEVEL = 100;
+export const MIN_CADENCE_RPM = 1;
+export const MAX_CADENCE_RPM = 250;
+export const MIN_DAMPER_LEVEL = 1;
+export const MAX_DAMPER_LEVEL = 10;
+export const MIN_SPLIT_SEC_PER_500M = 60;
+export const MAX_SPLIT_SEC_PER_500M = 600;
 
 /** 单个有氧项目的有效时长上限（24 小时） */
 export const MAX_CARDIO_MS = 24 * 60 * 60 * 1000;

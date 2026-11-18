@@ -182,7 +182,7 @@ describe('R1-03 损坏备份允许覆盖', () => {
       (b) => { b.data.plans[0].days[0].exercises[0].target.repsMin = Infinity; },
       (b) => { b.data.plans[0].days[0].exercises[0].target.repsMax = -5; },
       (b) => { b.data.plans[0].days[0].exercises[0].restSec = 'abc'; },
-      (b) => { b.data.plans[0].days[0].focus = 'arms'; },
+      (b) => { b.data.plans[0].days[0].focus = 'invalid-focus'; },
       (b) => { b.data.plans[0].cursor = 999; },
       (b) => { b.data.plans[0].days[0].exercises[0].target.kind = 'nope'; },
       (b) => { b.data.plans = []; b.data.sessions = []; }, // 空数据合法，另测

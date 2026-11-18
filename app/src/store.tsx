@@ -40,6 +40,7 @@ import {
   type WriteResult,
 } from './db/tx';
 import { readExerciseTemplates } from './db/templates';
+import { withSetupNote } from './domain/setupNote';
 import type { ExerciseTemplate, Plan, Session } from './domain/types';
 
 export interface Toast {
@@ -498,10 +499,15 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
   const createTrainingSession = useCallback(
     async (session: Session) => {
-      const r = await atomicCreateSession({ session });
+      const templates = new Map(exerciseTemplates.map((template) => [template.exerciseId, template]));
+      const exercises = session.exercises.map((exercise) => {
+        const template = templates.get(exercise.exerciseId);
+        return template ? withSetupNote(exercise, template.setupNote) : exercise;
+      });
+      const r = await atomicCreateSession({ session: { ...session, exercises } });
       return afterWrite(r);
     },
-    [afterWrite],
+    [afterWrite, exerciseTemplates],
   );
 
   const saveActiveSession = useCallback(

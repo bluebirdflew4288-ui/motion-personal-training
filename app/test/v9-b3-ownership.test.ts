@@ -125,7 +125,7 @@ describe('B3/G5 · 删除与 current 清理原子化', () => {
 
 describe('B3/G5 · 字段 ID 用实体稳定 ID（不用源码行号）', () => {
   it('数字字段 ID 含实体 ID', () => {
-    expect(PLANS).toContain('num:cardio:${day.id}:${pc.id}:speed');
+    expect(PLANS).toContain('num:cardio:${day.id}:${pc.id}:${key}');
     expect(PLANS).toContain('num:ex:${day.id}:${ex.id}:sets');
   });
 

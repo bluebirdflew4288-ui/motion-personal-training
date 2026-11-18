@@ -16,12 +16,21 @@
    4. 至多一个 open 段，且仅当 status==='running'
 
    ── 参数规范（PHASE-2-APPROVAL §2）──────────────────────────
-   坡走只用 speedKmh + inclinePct；爬楼只用 level。
-   不适用的字段**缺省**（不写 null/undefined 两套）。 */
+   每个预设只保存 CARDIO_FIELDS 中声明的字段。
+   未使用的字段缺省，不写 null 或 undefined。 */
 
 import {
+  MAX_CADENCE_RPM,
   MAX_CARDIO_MS,
+  MAX_DAMPER_LEVEL,
+  MAX_RESISTANCE_LEVEL,
+  MAX_SPLIT_SEC_PER_500M,
+  MIN_CADENCE_RPM,
+  MIN_DAMPER_LEVEL,
+  MIN_RESISTANCE_LEVEL,
+  MIN_SPLIT_SEC_PER_500M,
   MAX_CARDIO_SEGMENTS,
+  MAX_TEXT,
   MAX_INCLINE_PCT,
   MAX_SPEED_KMH,
   MAX_STAIR_LEVEL,
@@ -29,6 +38,7 @@ import {
   MIN_SPEED_KMH,
   MIN_STAIR_LEVEL,
 } from './limits';
+import { CARDIO_PRESETS } from './types';
 import type {
   CardioEntry,
   CardioParams,
@@ -45,101 +55,125 @@ export const newCardioId = (prefix: string): string =>
 export const CARDIO_PRESET_LABEL: Record<CardioPreset, string> = {
   'treadmill-incline': '有氧爬坡',
   'stair-climber': '爬楼机',
+  'stationary-bike': '动感单车',
+  elliptical: '椭圆机',
+  'rowing-machine': '划船机',
+  'free-cardio': '自由有氧',
 };
 
-/** 某预设实际使用的参数键（唯一真源，校验与 UI 共用） */
-export function paramKeysOf(preset: CardioPreset): Array<keyof CardioParams> {
-  return preset === 'treadmill-incline' ? ['speedKmh', 'inclinePct'] : ['level'];
+type CardioParamKey = keyof CardioParams;
+
+interface CardioField {
+  key: CardioParamKey;
+  label: string;
+  unit?: string;
+  min: number;
+  max: number;
+  integer?: boolean;
+  optional?: boolean;
+}
+
+const resistance: CardioField = {
+  key: 'resistanceLevel', label: '阻力', min: MIN_RESISTANCE_LEVEL, max: MAX_RESISTANCE_LEVEL, integer: true,
+};
+const incline: CardioField = {
+  key: 'inclinePct', label: '坡度', unit: '%', min: MIN_INCLINE_PCT, max: MAX_INCLINE_PCT,
+};
+
+export const CARDIO_FIELDS: Record<CardioPreset, readonly CardioField[]> = {
+  'treadmill-incline': [
+    { key: 'speedKmh', label: '速度', unit: 'km/h', min: MIN_SPEED_KMH, max: MAX_SPEED_KMH },
+    incline,
+  ],
+  'stair-climber': [
+    { key: 'level', label: '档位', min: MIN_STAIR_LEVEL, max: MAX_STAIR_LEVEL, integer: true },
+  ],
+  'stationary-bike': [
+    resistance,
+    { key: 'cadenceRpm', label: '踏频', unit: 'rpm', min: MIN_CADENCE_RPM, max: MAX_CADENCE_RPM, integer: true, optional: true },
+  ],
+  elliptical: [resistance, { ...incline, optional: true }],
+  'rowing-machine': [
+    { key: 'damperLevel', label: '风阻档位', min: MIN_DAMPER_LEVEL, max: MAX_DAMPER_LEVEL, integer: true },
+    { key: 'splitSecPer500m', label: '配速', unit: '秒/500m', min: MIN_SPLIT_SEC_PER_500M, max: MAX_SPLIT_SEC_PER_500M, optional: true },
+  ],
+  'free-cardio': [],
+};
+
+const DEFAULT_CARDIO_PARAMS: Record<CardioPreset, CardioParams> = {
+  'treadmill-incline': { speedKmh: 4, inclinePct: 4 },
+  'stair-climber': { level: 5 },
+  'stationary-bike': { resistanceLevel: 5 },
+  elliptical: { resistanceLevel: 5 },
+  'rowing-machine': { damperLevel: 5 },
+  'free-cardio': {},
+};
+
+export const CARDIO_PRESET_CHOICES = CARDIO_PRESETS.map((preset) => ({
+  preset,
+  label: CARDIO_PRESET_LABEL[preset],
+  params: DEFAULT_CARDIO_PARAMS[preset],
+}));
+
+export function paramKeysOf(preset: CardioPreset): CardioParamKey[] {
+  return CARDIO_FIELDS[preset].map((field) => field.key);
 }
 
 export interface ParamIssue {
-  field: keyof CardioParams;
+  field: string;
   message: string;
 }
 
-/**
- * 校验参数（按 preset 拒绝错误字段/单位/超限）。
- * 不做静默 clamp —— 非法值一律明确拒绝。
- */
 export function validateCardioParams(
   preset: CardioPreset,
-  p: CardioParams,
+  params: Record<string, unknown> | CardioParams,
 ): ParamIssue[] {
   const issues: ParamIssue[] = [];
-  const allowed = new Set(paramKeysOf(preset));
-
-  // 不适用字段必须缺省（拒绝混用）
-  for (const key of ['speedKmh', 'inclinePct', 'level'] as const) {
-    const v = p[key];
-    if (v === undefined) continue;
-    if (!allowed.has(key)) {
-      issues.push({ field: key, message: `${CARDIO_PRESET_LABEL[preset]} 不使用该参数` });
-    }
+  const fields = CARDIO_FIELDS[preset];
+  const allowed = new Set<string>(fields.map((field) => field.key));
+  for (const key of Object.keys(params)) {
+    if (!allowed.has(key)) issues.push({ field: key, message: '该预设不使用此参数' });
   }
-
-  const checkNum = (
-    key: keyof CardioParams,
-    min: number,
-    max: number,
-    integer: boolean,
-    label: string,
-  ) => {
-    if (!allowed.has(key)) return;
-    const v = p[key];
-    if (v === undefined || v === null) {
-      issues.push({ field: key, message: `${label}必须填写` });
-      return;
-    }
-    if (typeof v !== 'number' || !Number.isFinite(v)) {
+  for (const { key, label, min, max, integer, optional } of fields) {
+    const value = params[key];
+    if (value === undefined && optional && !Object.prototype.hasOwnProperty.call(params, key)) continue;
+    if (value === undefined || value === null) {
+      issues.push({ field: key, message: optional ? `${label}未填写时应省略` : `${label}必须填写` });
+    } else if (typeof value !== 'number' || !Number.isFinite(value)) {
       issues.push({ field: key, message: `${label}必须是有限数字` });
-      return;
-    }
-    if (integer && !Number.isInteger(v)) {
+    } else if (integer && !Number.isInteger(value)) {
       issues.push({ field: key, message: `${label}必须是整数` });
-      return;
-    }
-    if (v < min || v > max) {
+    } else if (value < min || value > max) {
       issues.push({ field: key, message: `${label}必须在 ${min}–${max} 之间` });
     }
-  };
-
-  if (preset === 'treadmill-incline') {
-    checkNum('speedKmh', MIN_SPEED_KMH, MAX_SPEED_KMH, false, '速度');
-    checkNum('inclinePct', MIN_INCLINE_PCT, MAX_INCLINE_PCT, false, '坡度');
-  } else {
-    checkNum('level', MIN_STAIR_LEVEL, MAX_STAIR_LEVEL, true, '档位');
   }
   return issues;
 }
 
-/** 归一化为「只含该预设实际字段」的参数对象（缺省语义，不写 null） */
-export function normalizeCardioParams(preset: CardioPreset, p: CardioParams): CardioParams {
-  if (preset === 'treadmill-incline') {
-    const out: CardioParams = {};
-    if (typeof p.speedKmh === 'number') out.speedKmh = p.speedKmh;
-    if (typeof p.inclinePct === 'number') out.inclinePct = p.inclinePct;
-    return out;
+export function normalizeCardioParams(preset: CardioPreset, params: CardioParams): CardioParams {
+  const normalized: CardioParams = {};
+  for (const key of paramKeysOf(preset)) {
+    const value = params[key];
+    if (typeof value === 'number') normalized[key] = value;
   }
-  const out: CardioParams = {};
-  if (typeof p.level === 'number') out.level = p.level;
-  return out;
+  return normalized;
 }
 
-/** 参数深比较（同值不增段） */
 export function paramsEqual(a: CardioParams, b: CardioParams): boolean {
-  return (
-    a.speedKmh === b.speedKmh && a.inclinePct === b.inclinePct && a.level === b.level
-  );
+  const keys = Object.keys(a) as CardioParamKey[];
+  return keys.length === Object.keys(b).length && keys.every((key) => a[key] === b[key]);
 }
 
-/** 参数的一句话展示（单位清楚） */
-export function describeCardioParams(preset: CardioPreset, p: CardioParams): string {
+export function describeCardioParams(preset: CardioPreset, params: CardioParams): string {
   if (preset === 'treadmill-incline') {
-    const sp = typeof p.speedKmh === 'number' ? `${p.speedKmh} km/h` : '—';
-    const inc = typeof p.inclinePct === 'number' ? `坡度 ${p.inclinePct}%` : '坡度 —';
-    return `${sp} · ${inc}`;
+    const speed = typeof params.speedKmh === 'number' ? `${params.speedKmh} km/h` : '—';
+    return `${speed} · 坡度 ${params.inclinePct ?? '—'}${params.inclinePct === undefined ? '' : '%'}`;
   }
-  return typeof p.level === 'number' ? `档位 ${p.level}` : '档位 —';
+  if (preset === 'free-cardio') return '纯计时';
+  return CARDIO_FIELDS[preset]
+    .filter(({ key, optional }) => !optional || params[key] !== undefined)
+    .map(({ key, label, unit }) => `${label} ${params[key] ?? '—'}${unit ? ` ${unit}` : ''}`)
+    .join(' · ');
 }
 
 /* ── 计时 ───────────────────────────────── */
@@ -270,6 +304,36 @@ export function commitCardioParams(
 }
 
 /** 暂停：封口 + 清锚点（暂停不计时） */
+export function markFreeCardioSegment(
+  entry: CardioEntry,
+  note: string,
+  now = Date.now(),
+): { ok: true; entry: CardioEntry } | { ok: false; reason: string } {
+  const segment = openSegment(entry);
+  const elapsed = liveElapsedMs(entry, now);
+  if (entry.preset !== 'free-cardio' || entry.status !== 'running' || !segment || elapsed <= segment.startElapsedMs) {
+    return { ok: false, reason: '请在计时开始后再记录分段' };
+  }
+  if (entry.segments.length >= MAX_CARDIO_SEGMENTS) {
+    return { ok: false, reason: `分段已达上限 ${MAX_CARDIO_SEGMENTS}` };
+  }
+  const text = note.trim();
+  if (text.length > MAX_TEXT) return { ok: false, reason: `分段备注最多 ${MAX_TEXT} 字` };
+  const segments = closeOpen(entry, elapsed);
+  return {
+    ok: true,
+    entry: {
+      ...entry,
+      elapsedMs: elapsed,
+      runningSinceAt: now,
+      segments: [
+        ...segments.map((row) => row.id === segment.id && text ? { ...row, note: text } : row),
+        { id: newCardioId('cseg'), startElapsedMs: elapsed, endElapsedMs: null, params: {} },
+      ],
+    },
+  };
+}
+
 export function pauseCardio(e: CardioEntry, now = Date.now()): CardioEntry {
   if (e.status !== 'running') return e;
   const elapsed = liveElapsedMs(e, now);

@@ -25,7 +25,8 @@ import { localDateKey } from '../domain/localDate';
 import { sessionKindOf } from '../domain/sessionKind';
 import { atomicCreateRest } from '../db/tx';
 import { ExerciseOverviewRow } from '../ui/TargetLine';
-import type { Plan, PlanDay, Session } from '../domain/types';
+import { CARDIO_PRESET_CHOICES, describeCardioParams } from '../domain/cardio';
+import type { CardioPreset, Plan, PlanDay, Session } from '../domain/types';
 import { Sheet } from '../ui/Sheet';
 import { pushCycle, skipCycle } from '../domain/cycle';
 import { currentLockState } from '../lib/lock';
@@ -192,15 +193,16 @@ export function Home() {
    * · 不借当前力量 dayId（用 adhoc:<sessionId>），因此默认**不推进**循环
    * · 已有未结束训练时先引导处理
    */
-  async function startAdhocCardio(preset: 'treadmill-incline' | 'stair-climber') {
+  async function startAdhocCardio(preset: CardioPreset) {
     if (!plan) return;
     const existing = activeSessions[0];
     if (existing) {
       pushToast('还有一次训练没有结束，请先结束或放弃它。', 'error');
       return;
     }
-    const params = preset === 'treadmill-incline' ? { speedKmh: 4, inclinePct: 4 } : { level: 5 };
-    const session = createAdhocCardioSession({ plan, preset, params });
+    const choice = CARDIO_PRESET_CHOICES.find((item) => item.preset === preset);
+    if (!choice) return;
+    const session = createAdhocCardioSession({ plan, preset, params: choice.params });
     try {
       const r = await createTrainingSession(session);
       if (!r.ok) {
@@ -533,20 +535,16 @@ export function Home() {
 
         {/* ── 有氧 / 完全休息入口（第2阶段）── */}
         <div style={{ display: 'flex', gap: 8, marginTop: 14, flexWrap: 'wrap' }}>
-          <button
-            className="btn btn-ghost btn-sm"
-            onClick={() => void startAdhocCardio('treadmill-incline')}
-            disabled={!!activeSessions[0]}
-          >
-            有氧爬坡
-          </button>
-          <button
-            className="btn btn-ghost btn-sm"
-            onClick={() => void startAdhocCardio('stair-climber')}
-            disabled={!!activeSessions[0]}
-          >
-            爬楼机
-          </button>
+          {CARDIO_PRESET_CHOICES.map(({ preset, label }) => (
+            <button
+              key={preset}
+              className="btn btn-ghost btn-sm"
+              onClick={() => void startAdhocCardio(preset)}
+              disabled={!!activeSessions[0]}
+            >
+              {label}
+            </button>
+          ))}
           <button
             className="btn btn-ghost btn-sm"
             style={{ marginLeft: 'auto' }}
@@ -684,9 +682,7 @@ export function Home() {
                       >
                         {pc.name}
                         <span style={{ color: 'var(--ink-4)', marginLeft: 6, fontSize: 12 }}>
-                          {pc.preset === 'treadmill-incline'
-                            ? `${pc.target.speedKmh ?? '—'} km/h · ${pc.target.inclinePct ?? '—'}%`
-                            : `档位 ${pc.target.level ?? '—'}`}
+                          {describeCardioParams(pc.preset, pc.target)}
                         </span>
                       </li>
                     ))
@@ -1027,9 +1023,7 @@ export function Home() {
                     ? (pendingStart.cardio ?? []).map((pc) => (
                         <span key={pc.id}>
                           {pc.name}：
-                          {pc.preset === 'treadmill-incline'
-                            ? `速度 ${pc.target.speedKmh ?? '—'} km/h · 坡度 ${pc.target.inclinePct ?? '—'}%`
-                            : `档位 ${pc.target.level ?? '—'}`}
+                          {describeCardioParams(pc.preset, pc.target)}
                           <br />
                         </span>
                       ))
