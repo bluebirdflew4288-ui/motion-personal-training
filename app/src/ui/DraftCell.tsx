@@ -13,6 +13,7 @@ interface Props {
   value: number | null;
   onCommit: (v: number | null) => void;
   integer?: boolean;
+  required?: boolean;
   min?: number;
   max?: number;
   ariaLabel: string;
@@ -35,6 +36,7 @@ export function DraftCell({
   value,
   onCommit,
   integer = false,
+  required = false,
   min = 0,
   max = 9999,
   ariaLabel,
@@ -71,7 +73,7 @@ export function DraftCell({
 
   const validateText = (raw: string): { ok: true; v: number | null } | { ok: false; msg: string } => {
     const t = raw.trim();
-    if (t === '') return { ok: true, v: null };
+    if (t === '') return required ? { ok: false, msg: '必填' } : { ok: true, v: null };
     // 只允许可选的负号 + 数字 + 可选小数点（是否允许负由 min 决定）
     if (!/^-?\d*\.?\d*$/.test(t)) return { ok: false, msg: '只能输入数字' };
     if (t === '-' || t === '.' || t === '-.') return { ok: false, msg: '数字未输完' };

@@ -58,13 +58,16 @@ public final class RestReminderState {
          * 真正**不同的 token** 才重新起算编号空间。
          */
         public final String lastIntentToken;
+        /** 最近一次由用户在系统持续通知栏主动点击「取消」的身份（Wave 1B.2 前后台对账用） */
+        public final String lastUserCancelledToken;
+        public final long lastUserCancelledGeneration;
 
         public Snapshot(String token, long generation, boolean fired, int notifId) {
-            this(token, generation, fired, notifId, 0L, null);
+            this(token, generation, fired, notifId, 0L, null, null, -1L);
         }
 
         public Snapshot(String token, long generation, boolean fired, int notifId, long lastIntentId) {
-            this(token, generation, fired, notifId, lastIntentId, null);
+            this(token, generation, fired, notifId, lastIntentId, null, null, -1L);
         }
 
         public Snapshot(
@@ -75,16 +78,34 @@ public final class RestReminderState {
             long lastIntentId,
             String lastIntentToken
         ) {
+            this(token, generation, fired, notifId, lastIntentId, lastIntentToken, null, -1L);
+        }
+
+        public Snapshot(
+            String token,
+            long generation,
+            boolean fired,
+            int notifId,
+            long lastIntentId,
+            String lastIntentToken,
+            String lastUserCancelledToken,
+            long lastUserCancelledGeneration
+        ) {
             this.token = token;
             this.generation = generation;
             this.fired = fired;
             this.notifId = notifId;
             this.lastIntentId = lastIntentId;
             this.lastIntentToken = (lastIntentToken != null) ? lastIntentToken : token;
+            this.lastUserCancelledToken = lastUserCancelledToken;
+            this.lastUserCancelledGeneration =
+                (lastUserCancelledToken != null && lastUserCancelledGeneration >= 0L)
+                    ? lastUserCancelledGeneration
+                    : -1L;
         }
 
         public static Snapshot empty() {
-            return new Snapshot(null, 0L, false, 0, 0L, null);
+            return new Snapshot(null, 0L, false, 0, 0L, null, null, -1L);
         }
     }
 
@@ -168,7 +189,8 @@ public final class RestReminderState {
             // 已到点/非法：取消旧提醒，不建立新身份
             return Outcome.cancel(
                 new Snapshot(null, base.generation + 1, false, base.notifId,
-                    base.lastIntentId, base.lastIntentToken),
+                    base.lastIntentId, base.lastIntentToken,
+                    base.lastUserCancelledToken, base.lastUserCancelledGeneration),
                 "non-positive-delay"
             );
         }
@@ -182,7 +204,7 @@ public final class RestReminderState {
             if (intentId <= base.lastIntentId) return Outcome.noop(base, "stale-intent");
             return Outcome.schedule(
                 new Snapshot(token, base.generation + 1, false, base.notifId + 1,
-                    intentId, token)
+                    intentId, token, null, -1L)
             );
         }
         /**
@@ -246,16 +268,23 @@ public final class RestReminderState {
          * 只是新 token 的编号空间从 1 重新开始。
          */
         long nextIntent;
+        String keptUserCancelToken = base.lastUserCancelledToken;
+        long keptUserCancelGen = base.lastUserCancelledGeneration;
         if (!sameToken && !sameLineage) {
             // 真正**不同的 token**：编号作用域跟着新 token 走
             nextIntent = intentId > 0L ? intentId : 0L;
         } else {
-            // 同一编号空间（含取消后回流的同 token）：水位单调，不清零
+            // 同一编号空间（含取消后回流的同 token）：水位单调，不清零；
+            // 一旦该 token 建立了新排程，清空旧的通知栏取消标记，避免后续应用内暂停误读旧取消。
             nextIntent = intentId > base.lastIntentId ? intentId : base.lastIntentId;
+            if (token.equals(keptUserCancelToken)) {
+                keptUserCancelToken = null;
+                keptUserCancelGen = -1L;
+            }
         }
         return Outcome.schedule(
             new Snapshot(token, base.generation + 1, false, base.notifId + 1,
-                nextIntent, token)
+                nextIntent, token, keptUserCancelToken, keptUserCancelGen)
         );
     }
 
@@ -272,7 +301,8 @@ public final class RestReminderState {
          */
         return Outcome.cancel(
             new Snapshot(null, base.generation + 1, false, base.notifId,
-                base.lastIntentId, base.lastIntentToken),
+                base.lastIntentId, base.lastIntentToken,
+                base.lastUserCancelledToken, base.lastUserCancelledGeneration),
             "cancelled"
         );
     }
@@ -299,7 +329,8 @@ public final class RestReminderState {
         return new Outcome(
             Outcome.Action.NOOP, // 接收器无需再排/取消，只需持久化 fired
             new Snapshot(base.token, base.generation, true, base.notifId,
-                base.lastIntentId, base.lastIntentToken),
+                base.lastIntentId, base.lastIntentToken,
+                base.lastUserCancelledToken, base.lastUserCancelledGeneration),
             "fire"
         );
     }
@@ -335,6 +366,81 @@ public final class RestReminderState {
         if (!base.token.equals(token)) return Outcome.noop(base, "stale-token");
         if (generation != base.generation) return Outcome.noop(base, "stale-generation");
         return cancel(base);
+    }
+
+    /**
+     * 用户在持续通知栏主动点击「取消」（Wave 1B.2）。
+     *
+     * <p>在严格复用 {@link #cancelIfCurrent} 身份核验的前提下，额外把被取消的
+     * {@code (token, generation)} 记录为 {@code cancelled-by-user}，使 WebView 回到前台时
+     * 能精准区分「通知栏主动取消」与「应用内暂停取消」，静默收束页面倒计时而不闪失败条。
+     */
+    public static Outcome cancelFromNotification(
+        Snapshot cur,
+        String token,
+        long generation
+    ) {
+        Snapshot base = cur == null ? Snapshot.empty() : cur;
+        if (token == null || token.isEmpty()) return Outcome.noop(base, "empty-token");
+        if (base.token == null) return Outcome.noop(base, "no-active-token");
+        if (!base.token.equals(token)) return Outcome.noop(base, "stale-token");
+        if (generation != base.generation) return Outcome.noop(base, "stale-generation");
+        if (base.fired) return Outcome.noop(base, "already-fired");
+        return Outcome.cancel(
+            new Snapshot(
+                null,
+                base.generation + 1,
+                false,
+                base.notifId,
+                base.lastIntentId,
+                base.lastIntentToken,
+                token,
+                generation
+            ),
+            "cancelled-by-user"
+        );
+    }
+
+    /**
+     * 按身份查询当前持久化状态（Wave 1B.2 前后台对账）。
+     *
+     * @return {@code "active" | "fired" | "cancelled_by_user" | "cancelled" | "unknown"}
+     */
+    public static String inspectIdentity(
+        Snapshot cur,
+        String token,
+        long generation,
+        boolean hasGeneration
+    ) {
+        Snapshot base = cur == null ? Snapshot.empty() : cur;
+        if (token == null || token.isEmpty()) return "unknown";
+        if (hasGeneration && generation < 0L) return "unknown";
+
+        if (base.token != null && token.equals(base.token)) {
+            if (!hasGeneration || generation == base.generation) {
+                return base.fired ? "fired" : "active";
+            }
+            if (generation < base.generation) {
+                if (token.equals(base.lastUserCancelledToken)
+                    && generation == base.lastUserCancelledGeneration) {
+                    return "cancelled_by_user";
+                }
+                return "cancelled";
+            }
+            return "unknown";
+        }
+
+        if (token.equals(base.lastUserCancelledToken)
+            && (!hasGeneration || generation == base.lastUserCancelledGeneration)) {
+            return "cancelled_by_user";
+        }
+
+        if (token.equals(base.lastIntentToken)
+            && (!hasGeneration || generation < base.generation)) {
+            return "cancelled";
+        }
+
+        return "unknown";
     }
 
     /** 该结果是否表示"应当真的发通知" */

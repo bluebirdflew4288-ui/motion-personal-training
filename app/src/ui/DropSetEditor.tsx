@@ -3,7 +3,7 @@
    移动端默认简洁：只在选择「递减组」时展开细项，保存前有可读预览。 */
 
 import { useEffect, useState } from 'react';
-import type { DropSetDraft } from '../domain/dropSet';
+import type { DropSetDraft, StageDraft } from '../domain/dropSet';
 import {
   MAX_ROUNDS,
   MAX_STAGES,
@@ -15,6 +15,7 @@ import {
   draftStagesForRound,
   moveStageInRound,
   removeStageFromRound,
+  updateRoundStages,
   updateStageInRound,
   validateDropDraft,
 } from '../domain/dropSet';
@@ -167,6 +168,122 @@ export function DropSetEditor({
   const [stageToDelete, setStageToDelete] = useState<{ round: number; index: number } | null>(null);
   const [activeRound, setActiveRound] = useState(1);
 
+  const computeInitialCustomized = (d: DropSetDraft): number[] => {
+    const r1 = draftStagesForRound(d, 1);
+    const r1Rest = d.roundOverrides?.find((x) => x.roundIndex === 1)?.restInSec;
+    const out: number[] = [];
+    for (let r = 2; r <= Math.max(1, d.rounds); r += 1) {
+      const rr = draftStagesForRound(d, r);
+      const rrRest = d.roundOverrides?.find((x) => x.roundIndex === r)?.restInSec;
+      const same =
+        rr.length === r1.length &&
+        rrRest === r1Rest &&
+        rr.every(
+          (st, idx) =>
+            (st.label ?? '') === (r1[idx].label ?? '') &&
+            st.weightKg === r1[idx].weightKg &&
+            st.repsMin === r1[idx].repsMin &&
+            st.repsMax === r1[idx].repsMax &&
+            st.toFailure === r1[idx].toFailure &&
+            (st.restAfterSec ?? null) === (r1[idx].restAfterSec ?? null),
+        );
+      if (!same) out.push(r);
+    }
+    return out;
+  };
+
+  const [customizedRounds, setCustomizedRounds] = useState<number[]>(() => computeInitialCustomized(draft));
+  useEffect(() => {
+    setCustomizedRounds(computeInitialCustomized(draft));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fieldPrefix]);
+
+  const markRoundCustomized = (round: number) => {
+    if (round < 2) return;
+    setCustomizedRounds((prev) => (prev.includes(round) ? prev : [...prev, round].sort((a, b) => a - b)));
+  };
+
+  const handleUpdateStage = (round: number, index: number, patch: Partial<StageDraft>) => {
+    if (round >= 2) {
+      markRoundCustomized(round);
+      onChange(updateStageInRound(draft, round, index, patch));
+      return;
+    }
+    let next = updateStageInRound(draft, 1, index, patch);
+    for (let r = 2; r <= Math.max(1, draft.rounds); r += 1) {
+      if (customizedRounds.includes(r)) continue;
+      if (index < draftStagesForRound(next, r).length) {
+        next = updateStageInRound(next, r, index, patch);
+      }
+    }
+    onChange(next);
+  };
+
+  const handleAddStage = (round: number) => {
+    if (round >= 2) {
+      markRoundCustomized(round);
+      onChange(addStageToRound(draft, round));
+      return;
+    }
+    let next = addStageToRound(draft, 1);
+    const added = draftStagesForRound(next, 1).at(-1);
+    if (added) {
+      for (let r = 2; r <= Math.max(1, draft.rounds); r += 1) {
+        if (customizedRounds.includes(r)) continue;
+        const rRows = draftStagesForRound(next, r);
+        if (rRows.length < MAX_STAGES) {
+          next = updateRoundStages(next, r, [...rRows, { ...added }]);
+        }
+      }
+    }
+    onChange(next);
+  };
+
+  const handleMoveStage = (round: number, index: number, dir: -1 | 1) => {
+    if (round >= 2) {
+      markRoundCustomized(round);
+      onChange(moveStageInRound(draft, round, index, dir));
+      return;
+    }
+    let next = moveStageInRound(draft, 1, index, dir);
+    for (let r = 2; r <= Math.max(1, draft.rounds); r += 1) {
+      if (customizedRounds.includes(r)) continue;
+      const rRows = draftStagesForRound(next, r);
+      const target = index + dir;
+      if (index >= 0 && target >= 0 && index < rRows.length && target < rRows.length) {
+        next = moveStageInRound(next, r, index, dir);
+      }
+    }
+    onChange(next);
+  };
+
+  const handleRemoveStage = (round: number, index: number) => {
+    if (round >= 2) {
+      markRoundCustomized(round);
+      onChange(removeStageFromRound(draft, round, index));
+      return;
+    }
+    let next = removeStageFromRound(draft, 1, index);
+    for (let r = 2; r <= Math.max(1, draft.rounds); r += 1) {
+      if (customizedRounds.includes(r)) continue;
+      const rRows = draftStagesForRound(next, r);
+      if (rRows.length > MIN_STAGES && index >= 0 && index < rRows.length) {
+        next = removeStageFromRound(next, r, index);
+      }
+    }
+    onChange(next);
+  };
+
+  const syncRound1ToAll = () => {
+    const r1 = draftStagesForRound(draft, 1).map((st) => ({ ...st }));
+    let next = updateRoundStages(draft, 1, r1);
+    for (let r = 2; r <= Math.max(1, draft.rounds); r += 1) {
+      next = updateRoundStages(next, r, r1.map((st) => ({ ...st })));
+    }
+    setCustomizedRounds([]);
+    onChange(next);
+  };
+
   const issues = validateDropDraft(draft);
   const issueFor = (path: string) => issues.find((i) => i.path === path)?.message ?? null;
   const effectiveRound = Math.min(Math.max(1, activeRound), Math.max(1, draft.rounds));
@@ -208,7 +325,19 @@ export function DropSetEditor({
           max={MAX_ROUNDS}
           form={form}
           fieldId={`${fieldPrefix}.rounds`}
-          onCommit={(v) => { onChange(setDropDraftRounds(draft, v)); setActiveRound((r) => Math.min(r, Math.max(1, v))); }}
+          onCommit={(v) => {
+            if (v < draft.rounds) {
+              setCustomizedRounds((prev) => prev.filter((r) => r <= v));
+            } else if (v > draft.rounds && customizedRounds.includes(draft.rounds)) {
+              setCustomizedRounds((prev) => {
+                const s = new Set(prev);
+                for (let r = draft.rounds + 1; r <= v; r += 1) s.add(r);
+                return [...s].sort((a, b) => a - b);
+              });
+            }
+            onChange(setDropDraftRounds(draft, v));
+            setActiveRound((r) => Math.min(r, Math.max(1, v)));
+          }}
         />
         <DraftNumberField
           label="阶段间休息"
@@ -237,21 +366,50 @@ export function DropSetEditor({
         </div>
       ) : null}
 
-      {/* R02：逐轮阶段（默认 stages 为第 1 轮；其它轮可独立配置） */}
+      {/* R02 + 0.1.18：逐轮阶段（改第 1 轮默认自动同步未单改后续轮；切到第 2/3 轮单改即独立） */}
       {draft.rounds > 1 ? (
-        <div className="segmented" role="group" aria-label="逐轮阶段配置" style={{ flexWrap: 'wrap' }}>
-          {roundStageCounts.map((count, i) => (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+          <div className="segmented" role="group" aria-label="逐轮阶段配置" style={{ flexWrap: 'wrap' }}>
+            {roundStageCounts.map((count, i) => (
+              <button
+                key={i}
+                type="button"
+                data-testid={`drop-round-tab-${i + 1}`}
+                aria-pressed={effectiveRound === i + 1}
+                onClick={() => setActiveRound(i + 1)}
+                style={{ fontSize: 12, minWidth: 72 }}
+              >
+                第 {i + 1} 轮 · {count} 阶段
+                {i + 1 >= 2 && customizedRounds.includes(i + 1) ? ' *' : ''}
+              </button>
+            ))}
+          </div>
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: 8,
+              flexWrap: 'wrap',
+              fontSize: 12,
+              color: 'var(--ink-3)',
+            }}
+          >
+            <span data-testid="drop-round-sync-status">
+              {customizedRounds.length === 0
+                ? `改第 1 轮自动同步第 2–${draft.rounds} 轮；切到第 2/3 轮单改即独立`
+                : `第 ${customizedRounds.join('、')} 轮已独立微调`}
+            </span>
             <button
-              key={i}
               type="button"
-              data-testid={`drop-round-tab-${i + 1}`}
-              aria-pressed={effectiveRound === i + 1}
-              onClick={() => setActiveRound(i + 1)}
-              style={{ fontSize: 12, minWidth: 72 }}
+              className="btn btn-ghost btn-sm"
+              data-testid="drop-sync-round1-all"
+              onClick={syncRound1ToAll}
+              style={{ minHeight: 28, padding: '0 8px', fontSize: 11.5 }}
             >
-              第 {i + 1} 轮 · {count} 阶段
+              同步第 1 轮到全部轮
             </button>
-          ))}
+          </div>
         </div>
       ) : null}
 
@@ -263,7 +421,7 @@ export function DropSetEditor({
             <button
               className="btn btn-sm btn-ghost"
               disabled={currentStages.length >= MAX_STAGES}
-              onClick={() => onChange(addStageToRound(draft, effectiveRound))}
+              onClick={() => handleAddStage(effectiveRound)}
             >
               + 加阶段
             </button>
@@ -294,7 +452,7 @@ export function DropSetEditor({
                   style={{ minWidth: 44, padding: 0 }}
                   disabled={i === 0}
                   aria-label={`阶段 ${i + 1} 上移`}
-                  onClick={() => onChange(moveStageInRound(draft, effectiveRound, i, -1))}
+                  onClick={() => handleMoveStage(effectiveRound, i, -1)}
                 >
                   ↑
                 </button>
@@ -303,7 +461,7 @@ export function DropSetEditor({
                   style={{ minWidth: 44, padding: 0 }}
                   disabled={i === currentStages.length - 1}
                   aria-label={`阶段 ${i + 1} 下移`}
-                  onClick={() => onChange(moveStageInRound(draft, effectiveRound, i, 1))}
+                  onClick={() => handleMoveStage(effectiveRound, i, 1)}
                 >
                   ↓
                 </button>
@@ -338,7 +496,7 @@ export function DropSetEditor({
                 unit="kg"
                 form={form}
                 fieldId={ids.weight}
-                onCommit={(v) => onChange(updateStageInRound(draft, effectiveRound, i, { weightKg: v }))}
+                onCommit={(v) => handleUpdateStage(effectiveRound, i, { weightKg: v })}
               />
               <DraftNumberField
                 label="次数下限"
@@ -348,7 +506,7 @@ export function DropSetEditor({
                 disabled={st.toFailure}
                 form={ids.repsMin ? form : undefined}
                 fieldId={ids.repsMin}
-                onCommit={(v) => onChange(updateStageInRound(draft, effectiveRound, i, { repsMin: v, ...(st.toFailure ? { toFailure: false } : {}) }))}
+                onCommit={(v) => handleUpdateStage(effectiveRound, i, { repsMin: v, ...(st.toFailure ? { toFailure: false } : {}) })}
               />
               <DraftNumberField
                 label="次数上限"
@@ -358,7 +516,7 @@ export function DropSetEditor({
                 disabled={st.toFailure}
                 form={ids.repsMax ? form : undefined}
                 fieldId={ids.repsMax}
-                onCommit={(v) => onChange(updateStageInRound(draft, effectiveRound, i, { repsMax: v, ...(st.toFailure ? { toFailure: false } : {}) }))}
+                onCommit={(v) => handleUpdateStage(effectiveRound, i, { repsMax: v, ...(st.toFailure ? { toFailure: false } : {}) })}
               />
             </div>
 
@@ -376,22 +534,16 @@ export function DropSetEditor({
               <input
                 type="checkbox"
                 checked={st.toFailure}
-                onChange={(e) => {
-                  /**
-                   * V3-04 关键修复：
-                   * 取消力竭时必须同时给出一组合法次数范围，否则「非力竭阶段必须有次数范围」
-                   * 的校验会把这次变更退回去，用户永远改不成普通次数（审查 I01）。
-                   * 这里先填「上次范围」或合理默认 8–12，再允许用户编辑。
-                   */
-                  const next = e.target.checked
-                    ? { toFailure: true }
-                    : {
-                        toFailure: false,
-                        repsMin: st.repsMin ?? 8,
-                        repsMax: st.repsMax ?? 12,
-                      };
-                  onChange(updateStageInRound(draft, effectiveRound, i, next));
-                }}
+                  onChange={(e) => {
+                    const next = e.target.checked
+                      ? { toFailure: true }
+                      : {
+                          toFailure: false,
+                          repsMin: st.repsMin ?? 8,
+                          repsMax: st.repsMax ?? 12,
+                        };
+                    handleUpdateStage(effectiveRound, i, next);
+                  }}
                 style={{ width: 20, height: 20, accentColor: 'var(--brick)' }}
               />
               本阶段目标为技术性力竭（实际仍记录真实次数）
@@ -418,7 +570,7 @@ export function DropSetEditor({
                   unit="秒"
                   form={form}
                   fieldId={ids.rest}
-                  onCommit={(v) => onChange(updateStageInRound(draft, effectiveRound, i, { restAfterSec: v }))}
+                  onCommit={(v) => handleUpdateStage(effectiveRound, i, { restAfterSec: v })}
                 />
                 {issueFor(`${stageIssuePath(i)}.restAfterSec`) ? (
                   <div role="alert" data-drop-error="rest" style={{ color: 'var(--brick)', fontSize: 12 }}>
@@ -482,7 +634,7 @@ export function DropSetEditor({
           setStageToDelete(null);
           // 只有这里是唯一改动点；取消路径不会走到
           if (index >= 0 && index < draftStagesForRound(draft, round).length) {
-            onChange(removeStageFromRound(draft, round, index));
+            handleRemoveStage(round, index);
           }
         }}
       />

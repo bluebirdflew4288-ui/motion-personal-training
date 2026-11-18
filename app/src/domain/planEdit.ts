@@ -1,9 +1,11 @@
 /* 计划编辑的纯函数集合。
    约束：这些改动只影响计划本身，永远不回写历史训练实例。 */
 
-import type { Plan, PlanDay, PlanExercise, ExerciseTarget } from './types';
+import type { ExerciseTemplate, Plan, PlanDay, PlanExercise, ExerciseTarget } from './types';
 import { newId } from './session';
-import { MAX_DAYS, MAX_EXERCISES, MAX_PLAN_NAME } from './limits';
+import { MAX_DAYS, MAX_EXERCISES, MAX_PLAN_NAME, MAX_STAGES_ACCEPTED } from './limits';
+import { ensureStageIds, validateExerciseTarget } from './exerciseConfig';
+import { resolveExerciseId } from './identity';
 
 /** 计划名称是否在备份/恢复可接受的范围内（与 validate.ts 的 200 上限一致） */
 export function isPlanNameWithinLimit(name: string): boolean {
@@ -296,5 +298,197 @@ export function applySessionChangesToDay(
   return {
     ...plan,
     days: plan.days.map((d) => (d.id === dayId ? { ...d, exercises } : d)),
+  };
+}
+
+/* ── Wave 2A：统一动作编辑器、记忆模板、长按排序与左滑撤销支持 ── */
+
+/**
+ * 由动作配置记忆模板生成全新计划动作（深复制纯配置，不含任何运行态字段）。
+ */
+export function planExerciseFromTemplate(tpl: ExerciseTemplate): PlanExercise {
+  const target = ensureStageIds(structuredClone(tpl.target) as ExerciseTarget);
+  return {
+    id: newId('ex'),
+    exerciseId: tpl.exerciseId,
+    name: tpl.name,
+    ...(tpl.en !== undefined ? { en: tpl.en } : {}),
+    restSec: tpl.restSec,
+    target,
+  };
+}
+
+/**
+ * 向训练日追加已构造好的计划动作（带幂等防重与容量上限校验）。
+ */
+export function addPlanExerciseEntry(
+  plan: Plan,
+  dayId: string,
+  exercise: PlanExercise,
+): { plan: Plan; added: boolean; reason?: 'capacity' | 'not-found'; exercise?: PlanExercise } {
+  const day = plan.days.find((d) => d.id === dayId);
+  if (!day) return { plan, added: false, reason: 'not-found' };
+  if (day.exercises.some((e) => e.id === exercise.id)) {
+    return { plan, added: true, exercise };
+  }
+  if (day.exercises.length >= MAX_EXERCISES) {
+    return { plan, added: false, reason: 'capacity' };
+  }
+  const cloned = structuredClone(exercise) as PlanExercise;
+  cloned.target = ensureStageIds(cloned.target);
+  return {
+    plan: {
+      ...plan,
+      days: plan.days.map((d) =>
+        d.id === dayId ? { ...d, exercises: [...d.exercises, cloned] } : d,
+      ),
+    },
+    added: true,
+    exercise: cloned,
+  };
+}
+
+/**
+ * 将统一编辑器（ExerciseEditor）提交结果应用到计划中的指定动作。
+ * 保留既有 PlanExercise.id、note、substitutes；若替换了动作身份则同步更新 exerciseId。
+ */
+export function applyEditorToPlanExercise(
+  plan: Plan,
+  dayId: string,
+  exId: string,
+  payload: {
+    name: string;
+    en?: string;
+    exerciseId: string;
+    target: ExerciseTarget;
+    restSec: number;
+  },
+): { ok: true; plan: Plan; identityChanged: boolean } | { ok: false; message: string } {
+  const day = plan.days.find((d) => d.id === dayId);
+  if (!day) return { ok: false, message: '找不到这个训练日' };
+  const source = day.exercises.find((e) => e.id === exId);
+  if (!source) return { ok: false, message: '这个动作已经不在该训练日里了' };
+  const trimmedName = payload.name.trim();
+  if (!trimmedName) return { ok: false, message: '动作名称不能为空' };
+  const issues = validateExerciseTarget(payload.target, {
+    minStages: 1,
+    maxStages: MAX_STAGES_ACCEPTED,
+  });
+  if (issues.length) {
+    return { ok: false, message: issues[0].message };
+  }
+  const prevIdentity = resolveExerciseId(source);
+  const identityChanged = prevIdentity !== payload.exerciseId;
+  const nextTarget = ensureStageIds(structuredClone(payload.target) as ExerciseTarget);
+  const nextExercise: PlanExercise = {
+    ...source,
+    name: trimmedName,
+    exerciseId: payload.exerciseId,
+    restSec: payload.restSec,
+    target: nextTarget,
+  };
+  if (payload.en !== undefined) {
+    nextExercise.en = payload.en;
+  } else {
+    delete nextExercise.en;
+  }
+  return {
+    ok: true,
+    identityChanged,
+    plan: {
+      ...plan,
+      days: plan.days.map((d) =>
+        d.id !== dayId
+          ? d
+          : { ...d, exercises: d.exercises.map((e) => (e.id === exId ? nextExercise : e)) },
+      ),
+    },
+  };
+}
+
+/**
+ * 计划日正式动作列表长按拖拽重排（严格全排列校验，绝不借此增删动作）。
+ */
+export function reorderPlanExercises(
+  plan: Plan,
+  dayId: string,
+  orderedIds: readonly string[],
+): { ok: true; plan: Plan; changed: boolean } | { ok: false; message: string } {
+  const day = plan.days.find((d) => d.id === dayId);
+  if (!day) return { ok: false, message: '找不到这个训练日' };
+  const before = day.exercises.map((e) => e.id);
+  if (orderedIds.length !== before.length) {
+    return { ok: false, message: '顺序数量与当前训练日不一致，请刷新后重试' };
+  }
+  const beforeSet = new Set(before);
+  const seen = new Set<string>();
+  for (const id of orderedIds) {
+    if (!beforeSet.has(id)) return { ok: false, message: '要排序的动作已不在当前训练日里' };
+    if (seen.has(id)) return { ok: false, message: '排序结果里有重复动作' };
+    seen.add(id);
+  }
+  if (orderedIds.every((id, i) => id === before[i])) {
+    return { ok: true, plan, changed: false };
+  }
+  const byId = new Map(day.exercises.map((e) => [e.id, e]));
+  const exercises = orderedIds.map((id) => byId.get(id)!);
+  return {
+    ok: true,
+    changed: true,
+    plan: {
+      ...plan,
+      days: plan.days.map((d) => (d.id === dayId ? { ...d, exercises } : d)),
+    },
+  };
+}
+
+function resolveRestoreIndex(
+  currentIds: string[],
+  orderRef: readonly string[],
+  itemId: string,
+  fallbackIndex: number,
+): number {
+  const clamped = Math.max(0, Math.min(fallbackIndex, currentIds.length));
+  const pos = orderRef.indexOf(itemId);
+  if (pos < 0) return clamped;
+  for (let i = pos + 1; i < orderRef.length; i += 1) {
+    const at = currentIds.indexOf(orderRef[i]);
+    if (at >= 0) return at;
+  }
+  for (let i = pos - 1; i >= 0; i -= 1) {
+    const at = currentIds.indexOf(orderRef[i]);
+    if (at >= 0) return at + 1;
+  }
+  return clamped;
+}
+
+/**
+ * 撤销删除计划动作：按原相对顺序插回最新训练日列表，不覆盖期间其它合法修改。
+ */
+export function restoreDeletedPlanExercise(
+  plan: Plan,
+  dayId: string,
+  deleted: PlanExercise,
+  orderBefore: readonly string[],
+  fallbackIndex = 0,
+): { ok: true; plan: Plan } | { ok: false; message: string } {
+  const day = plan.days.find((d) => d.id === dayId);
+  if (!day) return { ok: false, message: '找不到这个训练日' };
+  if (day.exercises.some((e) => e.id === deleted.id)) {
+    return { ok: true, plan };
+  }
+  if (day.exercises.length >= MAX_EXERCISES) {
+    return { ok: false, message: `动作数已达上限 ${MAX_EXERCISES}，无法撤销恢复` };
+  }
+  const currentIds = day.exercises.map((e) => e.id);
+  const insertAt = resolveRestoreIndex(currentIds, orderBefore, deleted.id, fallbackIndex);
+  const exercises = [...day.exercises];
+  exercises.splice(insertAt, 0, structuredClone(deleted) as PlanExercise);
+  return {
+    ok: true,
+    plan: {
+      ...plan,
+      days: plan.days.map((d) => (d.id === dayId ? { ...d, exercises } : d)),
+    },
   };
 }

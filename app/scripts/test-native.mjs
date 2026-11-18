@@ -71,7 +71,9 @@ const TESTS = ['BackupIoTest', 'app.motion.personal.plugins.ExportSpoolTest', 'a
   // N01：持续通知正文「点击打开/带回应用」的源码契约 + requestCode 纯策略
   'app.motion.personal.plugins.RestNotificationNavTest',
   // G04：WebView 非输入区选词/长按/拖拽门禁纯策略矩阵
-  'app.motion.personal.plugins.WebViewSelectionPolicyTest'];
+  'app.motion.personal.plugins.WebViewSelectionPolicyTest',
+  // Wave 1B.2：持续通知栏取消与页面前后台对账纯状态机矩阵
+  'app.motion.personal.plugins.RestUserCancelReconcileTest'];
 
 for (const s of SOURCES) {
   if (!existsSync(s)) {

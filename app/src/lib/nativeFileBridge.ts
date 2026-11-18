@@ -27,6 +27,14 @@ interface NativeFileBridgePluginShape {
     /** 原生写入后回读校验得到的 SHA-256（v0.1.2 起返回） */
     sha256?: string;
   }>;
+  exportPng(options: { filename: string; base64: string }): Promise<{
+    saved: boolean;
+    cancelled: boolean;
+    filename?: string;
+    uri?: string;
+    bytes?: number;
+    sha256?: string;
+  }>;
   importJson(options?: { suggestedName?: string }): Promise<{
     cancelled: boolean;
     content?: string;
@@ -88,6 +96,27 @@ export function installNativeFileBridge(): void {
         content: r.content,
         filename: r.filename ?? 'backup.json',
         bytes: r.bytes ?? r.content.length,
+      };
+    },
+    async savePng(filename, base64) {
+      const r = await plugin.exportPng({ filename, base64 });
+      if (r.cancelled) return { saved: false, cancelled: true };
+      if (!r.saved) return { saved: false, cancelled: false, error: '系统没有确认图片写入完成' };
+      const verdict = verifyNativeExportResult({
+        bytes: r.bytes,
+        sha256: r.sha256,
+        filename: r.filename,
+        uri: r.uri,
+      });
+      if (!verdict.ok) {
+        return { saved: false, cancelled: false, error: verdict.error };
+      }
+      return {
+        saved: true,
+        filename: verdict.value.filename ?? filename,
+        uri: verdict.value.uri,
+        bytes: verdict.value.bytes,
+        sha256: verdict.value.sha256,
       };
     },
   };

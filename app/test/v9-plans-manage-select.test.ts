@@ -8,20 +8,32 @@ import { resolve } from 'node:path';
 import * as ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 
-const FILE = resolve(process.cwd(), 'src/pages/Plans.tsx');
-const SRC = readFileSync(FILE, 'utf8');
-const AST = ts.createSourceFile(FILE, SRC, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+const FILE_ENTRY = resolve(process.cwd(), 'src/pages/Plans.tsx');
+const FILE_PAGE = resolve(process.cwd(), 'src/pages/plans/PlansPage.tsx');
+const FILE_EDITOR = resolve(process.cwd(), 'src/pages/plans/PlanDayEditor.tsx');
+const SRC = [
+  readFileSync(FILE_ENTRY, 'utf8'),
+  readFileSync(FILE_PAGE, 'utf8'),
+  readFileSync(FILE_EDITOR, 'utf8'),
+].join('\n');
+const ASTS = [
+  ts.createSourceFile(FILE_PAGE, readFileSync(FILE_PAGE, 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX),
+  ts.createSourceFile(FILE_EDITOR, readFileSync(FILE_EDITOR, 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX),
+];
 
 /** 取某函数声明体文本 */
 function fnBody(name: string): string {
   let body: string | null = null;
-  const visit = (n: ts.Node) => {
-    if (ts.isFunctionDeclaration(n) && n.name?.text === name && n.body) {
-      body = n.body.getText(AST);
-    }
-    ts.forEachChild(n, visit);
-  };
-  visit(AST);
+  for (const ast of ASTS) {
+    const visit = (n: ts.Node) => {
+      if (ts.isFunctionDeclaration(n) && n.name?.text === name && n.body) {
+        body = n.body.getText(ast);
+      }
+      ts.forEachChild(n, visit);
+    };
+    visit(ast);
+    if (body) break;
+  }
   if (!body) throw new Error(`找不到函数 ${name}`);
   return body;
 }

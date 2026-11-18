@@ -9,17 +9,24 @@ import * as ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 import { shouldSyncExternal } from '../src/ui/draftForm';
 
-const PLANS = resolve(process.cwd(), 'src/pages/Plans.tsx');
-const SRC = readFileSync(PLANS, 'utf8');
-const AST = ts.createSourceFile(PLANS, SRC, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+const PLANS_PAGE = resolve(process.cwd(), 'src/pages/plans/PlansPage.tsx');
+const PLAN_DAY_EDITOR = resolve(process.cwd(), 'src/pages/plans/PlanDayEditor.tsx');
+const SRC = `${readFileSync(PLANS_PAGE, 'utf8')}\n${readFileSync(PLAN_DAY_EDITOR, 'utf8')}`;
+const ASTS = [
+  ts.createSourceFile(PLANS_PAGE, readFileSync(PLANS_PAGE, 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX),
+  ts.createSourceFile(PLAN_DAY_EDITOR, readFileSync(PLAN_DAY_EDITOR, 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX),
+];
 
 function fnBody(name: string): string {
   let body: string | null = null;
-  const visit = (n: ts.Node) => {
-    if (ts.isFunctionDeclaration(n) && n.name?.text === name && n.body) body = n.body.getText(AST);
-    ts.forEachChild(n, visit);
-  };
-  visit(AST);
+  for (const ast of ASTS) {
+    const visit = (n: ts.Node) => {
+      if (ts.isFunctionDeclaration(n) && n.name?.text === name && n.body) body = n.body.getText(ast);
+      ts.forEachChild(n, visit);
+    };
+    visit(ast);
+    if (body) break;
+  }
   if (!body) throw new Error(`找不到函数 ${name}`);
   return body;
 }

@@ -505,6 +505,8 @@ export interface MergeFlushedDropDraftOptions {
   round1AsOverride?: boolean;
   /** W02：flushAll 明确清空为 null 的字段集合（用于保留空白重量而不沿用旧值） */
   nullIds?: Set<string>;
+  /** 0.1.18：当用户在第 1 轮输入未 blur 直接点保存时，需要一并同步第 1 轮 flush 值的跟随轮序号列表 */
+  syncRound1ToRounds?: readonly number[];
 }
 
 /**
@@ -564,6 +566,32 @@ export function mergeFlushedDropDraft<T extends DropDraftLike>(
         roundIndex: 1,
         stages: base.stages.map((st, i) => mergeDropStageValues(st, values, `${prefix}.s${i}`, nullIds)),
       });
+    }
+    if (opts.syncRound1ToRounds?.length) {
+      const r1Merged = overrides.find((o) => o.roundIndex === 1)?.stages ?? stages;
+      for (const followR of opts.syncRound1ToRounds) {
+        if (followR <= 1 || followR > Math.max(1, base.rounds)) continue;
+        const roundPrefix = `${prefix}.r${followR}s`;
+        const hasOwnFlushed =
+          Object.keys(values).some((k) => k.startsWith(roundPrefix)) ||
+          Array.from(nullIds ?? []).some((k) => k.startsWith(roundPrefix));
+        if (hasOwnFlushed) continue;
+        const existingFollow = overrides.find((o) => o.roundIndex === followR);
+        if (existingFollow && existingFollow.stages.length === r1Merged.length) {
+          existingFollow.stages = existingFollow.stages.map((st, i) => ({
+            ...st,
+            weightKg: r1Merged[i].weightKg,
+            repsMin: r1Merged[i].repsMin,
+            repsMax: r1Merged[i].repsMax,
+            ...(r1Merged[i].restAfterSec !== undefined ? { restAfterSec: r1Merged[i].restAfterSec } : {}),
+          }));
+        } else if (!existingFollow) {
+          overrides.push({
+            roundIndex: followR,
+            stages: r1Merged.map((st) => ({ ...st })),
+          });
+        }
+      }
     }
   } else {
     stages = base.stages.map((st, i) => mergeDropStageValues(st, values, `${prefix}.s${i}`, nullIds));

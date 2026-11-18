@@ -228,6 +228,13 @@ export function getActiveRest() {
   return new Promise((resolve) => window.nativeResolvers.push(resolve));
 }
 
+export function inspectRestIdentity(identity) {
+  if (typeof window.__auditInspectIdentity === 'function') {
+    return Promise.resolve(window.__auditInspectIdentity(identity));
+  }
+  return Promise.resolve({ available: false, status: 'unknown' });
+}
+
 export function cancelRestReminder(identity) {
   window.nativeTrace.cancels.push(identity);
   return Promise.resolve(true);

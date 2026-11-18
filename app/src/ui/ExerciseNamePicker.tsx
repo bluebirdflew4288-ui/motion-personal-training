@@ -67,7 +67,7 @@ export function ExerciseNamePicker({ open, currentName = '', templates, onSelect
             data-testid="name-search"
             className="input"
             value={query}
-            placeholder="搜索名称 / 英文名 / 分组"
+            placeholder="搜索名称 / 拼音或首字母（如 wt、wo、yin）/ 俗称"
             onChange={(e) => setQuery(e.target.value)}
           />
         </div>

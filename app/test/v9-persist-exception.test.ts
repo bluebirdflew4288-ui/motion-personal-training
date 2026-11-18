@@ -30,7 +30,7 @@ import * as sessionWrite from '../src/lib/sessionWrite';
 import type { Session } from '../src/domain/types';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const SESSION_FILE = resolve(HERE, '../src/pages/Session.tsx');
+const SESSION_FILE = resolve(HERE, '../src/pages/session/useSessionPersistence.ts');
 const SOURCE = readFileSync(SESSION_FILE, 'utf8');
 const AST = ts.createSourceFile('Session.tsx', SOURCE, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
 

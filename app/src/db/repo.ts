@@ -2,7 +2,17 @@
    所有写入都走 IndexedDB 事务；失败会抛 StorageError 由 UI 显示「未保存」，
    绝不在失败后假装成功。 */
 
-import { idbDelete, idbGet, idbGetAll, idbPut, idbRestoreAll, idbSnapshotAll, openDb, StorageError } from './idb';
+import {
+  idbDelete,
+  idbGet,
+  idbGetAll,
+  idbGetAllByIndex,
+  idbPut,
+  idbRestoreAll,
+  idbSnapshotAll,
+  openDb,
+  StorageError,
+} from './idb';
 import { MAX_LEGACY_PLAN_NAME, MAX_PLAN_NAME } from '../domain/limits';
 import { createV32Plan } from '../domain/presets/v32';
 import { validateDataDeep } from './validate';
@@ -10,7 +20,12 @@ import { detectLegacyShape, deriveGroupsFrom, migrateLegacyData, validateLegacyS
 import { exerciseIdFromName, resolveExerciseId } from '../domain/identity';
 import { targetGroupsOf } from '../domain/session';
 import { findG1Contraband, findV1Contraband, isSupportedBackupVersion } from './backupCompat';
-import { EXERCISE_TEMPLATE_PREFIX, validateExerciseTemplate } from './templates';
+import {
+  EXERCISE_TEMPLATE_PREFIX,
+  exerciseTemplateKey,
+  validateExerciseTemplate,
+  type TemplateRepositorySnapshot,
+} from './templates';
 import type { ExerciseTemplate, GroupPlan, Plan, Session, SessionExercise } from '../domain/types';
 
 export interface AppSettings {
@@ -72,6 +87,220 @@ export async function savePlan(plan: Plan): Promise<Plan> {
 
 export async function deletePlan(id: string): Promise<void> {
   await idbDelete('plans', id);
+}
+
+export type PlanTemplateWriteResult =
+  | { ok: true; plan: Plan; template?: ExerciseTemplate }
+  | {
+      ok: false;
+      reason: 'version-conflict' | 'storage' | 'invalid';
+      message: string;
+      currentTemplate?: ExerciseTemplate;
+    };
+
+/**
+ * Wave 2A：保存计划 + 可选动作配置记忆，在同一笔 IndexedDB 事务（plans + meta）中原子提交。
+ *
+ * · 计划名称长度校验与 savePlan / validateBackup 共用 MAX_PLAN_NAME；
+ * · 若包含 templateWrite，则在同事务内校验 expectedRevision 与模板结构合法性；
+ * · 任一步冲突、损坏或写库异常都会 abort 整笔事务（plans 与 meta 一起回滚）；
+ * · 成功只在 transaction.oncomplete 结算。
+ */
+export function atomicSavePlanWithTemplate(
+  plan: Plan,
+  templateWrite?: { template: ExerciseTemplate; expectedRevision: number | null },
+): Promise<PlanTemplateWriteResult> {
+  if (typeof plan.name === 'string' && plan.name.length > MAX_PLAN_NAME) {
+    return Promise.resolve({
+      ok: false,
+      reason: 'invalid',
+      message: `计划名称最多 ${MAX_PLAN_NAME} 个字符，当前 ${plan.name.length} 个字，已拒绝保存`,
+    });
+  }
+
+  let candidateTemplate: ExerciseTemplate | null = null;
+  if (templateWrite) {
+    const nextRevision =
+      templateWrite.expectedRevision === null ? 1 : templateWrite.expectedRevision + 1;
+    if (!Number.isSafeInteger(nextRevision) || nextRevision < 1) {
+      return Promise.resolve({
+        ok: false,
+        reason: 'version-conflict',
+        message: '动作配置记忆的 revision 已达安全整数上限，无法安全递增；本页没有写入任何改动',
+      });
+    }
+    const built: ExerciseTemplate = {
+      ...templateWrite.template,
+      key: exerciseTemplateKey(templateWrite.template.exerciseId),
+      schemaVersion: 1,
+      revision: nextRevision,
+    };
+    const pre = validateExerciseTemplate(built);
+    if (!pre.ok) {
+      return Promise.resolve({
+        ok: false,
+        reason: 'invalid',
+        message: `动作模板不合法：${pre.issues[0]?.path ?? ''} — ${pre.issues[0]?.message ?? ''}`,
+      });
+    }
+    candidateTemplate = built;
+  }
+
+  return openDb().then(
+    (db) =>
+      new Promise<PlanTemplateWriteResult>((resolve) => {
+        let settled = false;
+        let abortFailure: Extract<PlanTemplateWriteResult, { ok: false }> | null = null;
+        const done = (r: PlanTemplateWriteResult) => {
+          if (!settled) {
+            settled = true;
+            resolve(r);
+          }
+        };
+        let t: IDBTransaction;
+        try {
+          t = db.transaction(candidateTemplate ? ['plans', 'meta'] : ['plans'], 'readwrite');
+        } catch (err) {
+          done({
+            ok: false,
+            reason: 'storage',
+            message: err instanceof Error ? err.message : '事务开启失败',
+          });
+          return;
+        }
+
+        const abortWith = (failure: Extract<PlanTemplateWriteResult, { ok: false }>) => {
+          abortFailure = failure;
+          try {
+            t.abort();
+          } catch {
+            /* transaction may already be aborting */
+          }
+          done(failure);
+        };
+
+        let pending: { plan: Plan; template?: ExerciseTemplate } | null = null;
+        t.oncomplete = () => {
+          if (pending) {
+            done({
+              ok: true,
+              plan: pending.plan,
+              ...(pending.template ? { template: pending.template } : {}),
+            });
+          } else {
+            done({ ok: false, reason: 'storage', message: '事务完成但未产生保存结果' });
+          }
+        };
+        t.onabort = () =>
+          done(
+            abortFailure ?? {
+              ok: false,
+              reason: 'storage',
+              message: t.error?.message ?? '事务被中止，计划与动作记忆均未保存',
+            },
+          );
+        t.onerror = () =>
+          done(
+            abortFailure ?? {
+              ok: false,
+              reason: 'storage',
+              message: t.error?.message ?? '写入失败',
+            },
+          );
+
+        const planStore = t.objectStore('plans');
+        const nextPlan: Plan = { ...plan, updatedAt: Date.now() };
+
+        if (!candidateTemplate || !templateWrite) {
+          try {
+            const putReq = planStore.put(nextPlan);
+            putReq.onerror = () =>
+              abortWith({
+                ok: false,
+                reason: 'storage',
+                message: putReq.error?.message ?? '计划写入失败',
+              });
+            pending = { plan: nextPlan };
+          } catch (err) {
+            abortWith({
+              ok: false,
+              reason: 'storage',
+              message: err instanceof Error ? err.message : '计划写入失败',
+            });
+          }
+          return;
+        }
+
+        const metaStore = t.objectStore('meta');
+        const getReq = metaStore.get(candidateTemplate.key);
+        getReq.onerror = () =>
+          abortWith({
+            ok: false,
+            reason: 'storage',
+            message: getReq.error?.message ?? '读取动作模板失败',
+          });
+        getReq.onsuccess = () => {
+          const row = getReq.result as MetaRow | undefined;
+          const currentParsed = row ? validateExerciseTemplate(row.value) : null;
+          const current = currentParsed && currentParsed.ok ? currentParsed.template : undefined;
+          if (row && !current) {
+            abortWith({
+              ok: false,
+              reason: 'invalid',
+              message: '现有动作模板已损坏，请先修复或删除后再保存',
+            });
+            return;
+          }
+          const actualRev = current?.revision ?? null;
+          if (templateWrite.expectedRevision === null) {
+            if (actualRev !== null) {
+              abortWith({
+                ok: false,
+                reason: 'version-conflict',
+                message: '这条动作配置已经有记忆了（可能另一个页面刚保存过），本页没有覆盖它；请刷新后重试',
+                ...(current ? { currentTemplate: current } : {}),
+              });
+              return;
+            }
+          } else if (actualRev !== templateWrite.expectedRevision) {
+            abortWith({
+              ok: false,
+              reason: 'version-conflict',
+              message: '动作配置记忆已被更新（可能在另一个页面改过），本页没有覆盖新数据；请刷新后重试',
+              ...(current ? { currentTemplate: current } : {}),
+            });
+            return;
+          }
+
+          try {
+            const putPlanReq = planStore.put(nextPlan);
+            putPlanReq.onerror = () =>
+              abortWith({
+                ok: false,
+                reason: 'storage',
+                message: putPlanReq.error?.message ?? '计划写入失败',
+              });
+            const putMetaReq = metaStore.put({
+              key: candidateTemplate.key,
+              value: candidateTemplate,
+            });
+            putMetaReq.onerror = () =>
+              abortWith({
+                ok: false,
+                reason: 'storage',
+                message: putMetaReq.error?.message ?? '动作模板写入失败',
+              });
+            pending = { plan: nextPlan, template: candidateTemplate };
+          } catch (err) {
+            abortWith({
+              ok: false,
+              reason: 'storage',
+              message: err instanceof Error ? err.message : '写入失败',
+            });
+          }
+        };
+      }),
+  );
 }
 
 /**
@@ -224,11 +453,141 @@ export async function deleteSession(id: string): Promise<void> {
 }
 
 export async function findActiveSession(): Promise<Session | undefined> {
-  const all = await idbGetAll<Session>('sessions');
-  return all
+  const active = await idbGetAllByIndex<Session>('sessions', 'status', 'active');
+  return active
     .map(normalizeSession)
-    .filter((s) => s.status === 'active')
     .sort((a, b) => b.startedAt - a.startedAt)[0];
+}
+
+/** Wave 1C.3：首屏阶段一默认只加载最近 40 条记录 + 全部 active 会话，消除双重全表扫描 */
+export const BOOT_RECENT_SESSION_LIMIT = 40;
+
+export interface BootSnapshot {
+  settings: AppSettings;
+  plans: Plan[];
+  sessions: Session[];
+  activeSession: Session | null;
+  templateSnap: TemplateRepositorySnapshot;
+  isComplete: boolean;
+  totalSessionCount: number;
+}
+
+/**
+ * Wave 1C.3：单笔只读事务完成启动首阶段读取（settings + plans + meta + active + 最近 N 条会话）。
+ *
+ * · 彻底消除原先 `listSessions() + findActiveSession()` 的双重全表扫描与多余连接争抢；
+ * · 若总记录数 > recentLimit，返回 `isComplete = false`，由 StoreProvider 在首屏绘制后后台补齐完整历史。
+ */
+export function loadBootSnapshot(recentLimit = BOOT_RECENT_SESSION_LIMIT): Promise<BootSnapshot> {
+  const cap = Math.max(1, Math.floor(recentLimit));
+  return openDb().then(
+    (db) =>
+      new Promise<BootSnapshot>((resolve, reject) => {
+        let t: IDBTransaction;
+        try {
+          t = db.transaction(['settings', 'plans', 'sessions', 'meta'], 'readonly');
+        } catch (err) {
+          reject(new StorageError('读取启动快照失败', err));
+          return;
+        }
+        let settled = false;
+        const fail = (cause: unknown) => {
+          if (settled) return;
+          settled = true;
+          reject(cause instanceof StorageError ? cause : new StorageError('读取启动快照失败', cause));
+        };
+
+        let settingsRow: AppSettings | undefined;
+        let rawPlans: Plan[] = [];
+        let rawMeta: Array<{ key?: unknown; value?: unknown }> = [];
+        let totalSessionCount = 0;
+        let rawActive: Session[] = [];
+        const rawRecent: Session[] = [];
+
+        t.onerror = () => fail(t.error);
+        t.onabort = () => fail(t.error);
+        t.oncomplete = () => {
+          if (settled) return;
+          settled = true;
+          const settings: AppSettings = { ...DEFAULT_SETTINGS, ...(settingsRow ?? {}) };
+          const plans = [...rawPlans].sort((a, b) => a.createdAt - b.createdAt);
+          const templates: ExerciseTemplate[] = [];
+          const invalid: TemplateRepositorySnapshot['invalid'] = [];
+          for (const row of rawMeta) {
+            const key = typeof row.key === 'string' ? row.key : '';
+            if (!key.startsWith(EXERCISE_TEMPLATE_PREFIX)) continue;
+            const parsed = validateExerciseTemplate(row.value);
+            if (parsed.ok) templates.push(parsed.template);
+            else invalid.push({ key, issues: parsed.issues });
+          }
+          const activeList = rawActive
+            .map(normalizeSession)
+            .sort((a, b) => b.startedAt - a.startedAt);
+          const byId = new Map<string, Session>();
+          for (const s of activeList) byId.set(s.id, s);
+          for (const s of rawRecent) {
+            const norm = normalizeSession(s);
+            if (!byId.has(norm.id)) byId.set(norm.id, norm);
+          }
+          const sessions = [...byId.values()].sort((a, b) => b.startedAt - a.startedAt);
+          resolve({
+            settings,
+            plans,
+            sessions,
+            activeSession: activeList[0] ?? null,
+            templateSnap: { templates, invalid },
+            isComplete: sessions.length >= totalSessionCount,
+            totalSessionCount,
+          });
+        };
+
+        try {
+          const stReq = t.objectStore('settings').get('app');
+          stReq.onsuccess = () => {
+            settingsRow = stReq.result as AppSettings | undefined;
+          };
+          stReq.onerror = () => fail(stReq.error);
+
+          const plReq = t.objectStore('plans').getAll();
+          plReq.onsuccess = () => {
+            rawPlans = (plReq.result ?? []) as Plan[];
+          };
+          plReq.onerror = () => fail(plReq.error);
+
+          const mtReq = t.objectStore('meta').getAll();
+          mtReq.onsuccess = () => {
+            rawMeta = (mtReq.result ?? []) as Array<{ key?: unknown; value?: unknown }>;
+          };
+          mtReq.onerror = () => fail(mtReq.error);
+
+          const sessStore = t.objectStore('sessions');
+          const cntReq = sessStore.count();
+          cntReq.onsuccess = () => {
+            totalSessionCount = cntReq.result ?? 0;
+          };
+          cntReq.onerror = () => fail(cntReq.error);
+
+          const actReq = sessStore.index('status').getAll('active');
+          actReq.onsuccess = () => {
+            rawActive = (actReq.result ?? []) as Session[];
+          };
+          actReq.onerror = () => fail(actReq.error);
+
+          const curReq = sessStore.index('startedAt').openCursor(null, 'prev');
+          curReq.onsuccess = () => {
+            const cursor = curReq.result;
+            if (!cursor || rawRecent.length >= cap) return;
+            rawRecent.push(cursor.value as Session);
+            if (rawRecent.length < cap) {
+              cursor.continue();
+            }
+          };
+          curReq.onerror = () => fail(curReq.error);
+        } catch (err) {
+          fail(err);
+        }
+      }),
+  );
 }
 
 /* ── 设置 ─────────────────────────────── */
@@ -409,7 +768,7 @@ export type ValidateResult =
  * 旧备份里的 1.0.0 元数据仍按现有规则**只提示不拒绝**（validateBackup 的
  * warnings：srcVersion !== currentAppVersion），冻结/历史文件不改。
  */
-export const CURRENT_APP_VERSION = '0.1.14';
+export const CURRENT_APP_VERSION = '0.1.19';
 
 export function validateBackup(raw: unknown, currentAppVersion = CURRENT_APP_VERSION): ValidateResult {
   if (typeof raw !== 'object' || raw === null) return { ok: false, error: '文件不是有效的 JSON 对象' };

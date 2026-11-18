@@ -159,6 +159,8 @@ export function ExerciseEditor({
   const [weightMode, setWeightMode] = useState<WeightMode>(boot.weightMode);
   const [dumbbellBasis, setDumbbellBasis] = useState<DumbbellBasis | undefined>(boot.dumbbellBasis);
   const [remember, setRemember] = useState(boot.remember);
+  const [customizedSets, setCustomizedSets] = useState<number[]>(boot.customizedSets);
+  const [customizedRounds, setCustomizedRounds] = useState<number[]>(boot.customizedRounds);
   /** 记忆元数据必须随最终名称/身份变化（不能用原身份的 mode/revision 套新身份） */
   const [memory, setMemory] = useState<NonNullable<ExerciseEditorInitial['memory']>>(
     initial.memory ?? { mode: 'none', revision: null },
@@ -238,6 +240,8 @@ export function ExerciseEditor({
     setWeightMode(next.weightMode);
     setDumbbellBasis(next.dumbbellBasis);
     setRemember(next.remember);
+    setCustomizedSets(next.customizedSets);
+    setCustomizedRounds(next.customizedRounds);
     setMemory(opts.memory);
     setConfigBaseline(opts.baseline);
   };
@@ -303,11 +307,22 @@ export function ExerciseEditor({
     clearErr('sets');
     const parsed = parseField(next, { label: '组数', min: 1, max: MAX_STRAIGHT_SETS, integer: true });
     if (parsed.ok && parsed.value !== null) {
+      const count = parsed.value as number;
+      setCustomizedSets((prev) => prev.filter((s) => s <= count));
       setStraightRows((rows) => {
-        const count = parsed.value as number;
         const out = rows.slice(0, count);
+        const inheritSet1 =
+          customizedSets.length === 0 && rows.length > 0 && (weightMode !== 'bodyweight' || Number(rows[0].weight) > 0)
+            ? rows[0]
+            : null;
         while (out.length < count) {
-          out.push({ setIndex: out.length + 1, weight: '', repsMin: '', repsMax: '', toFailure: false });
+          out.push({
+            setIndex: out.length + 1,
+            weight: inheritSet1 ? inheritSet1.weight : '',
+            repsMin: rows[0] && customizedSets.length === 0 ? rows[0].repsMin : '',
+            repsMax: rows[0] && customizedSets.length === 0 ? rows[0].repsMax : '',
+            toFailure: false,
+          });
         }
         return out.map((row, i) => ({ ...row, setIndex: i + 1 }));
       });
@@ -339,6 +354,7 @@ export function ExerciseEditor({
     if (parsed === null) return;
     const current = effectiveRounds;
     if (parsed < current) {
+      setCustomizedRounds((prev) => prev.filter((r) => r <= parsed));
       setStageOverrides((prev) => {
         const out: Record<number, StageRow[]> = {};
         for (const [k, v] of Object.entries(prev)) if (Number(k) <= parsed) out[Number(k)] = v;
@@ -351,7 +367,14 @@ export function ExerciseEditor({
       });
       setActiveRound((r) => Math.min(r, parsed));
     } else if (parsed > current) {
-      // R02：新增轮默认继承**紧邻上一轮**的结构（不是最初全局默认）
+      // R02：新增轮默认继承**紧邻上一轮**的结构；若上一轮已单独微调则新轮也视为独立轮，否则继续跟随第 1 轮
+      if (customizedRounds.includes(current)) {
+        setCustomizedRounds((prev) => {
+          const nextSet = new Set(prev);
+          for (let r = current + 1; r <= parsed; r += 1) nextSet.add(r);
+          return [...nextSet].sort((a, b) => a - b);
+        });
+      }
       setStageOverrides((prev) => {
         const out = { ...prev };
         const effective = (r: number): StageRow[] => out[r] ?? cloneStageRows(stages);
@@ -371,31 +394,153 @@ export function ExerciseEditor({
   };
 
   const updateStraightRow = (setIndex: number, patch: Partial<StraightRow>) => {
-    setStraightRows((rows) => rows.map((row) => (row.setIndex === setIndex ? { ...row, ...patch } : row)));
+    const onlyFailure = 'toFailure' in patch && Object.keys(patch).length === 1;
+    if (onlyFailure) {
+      setStraightRows((rows) => rows.map((row) => (row.setIndex === setIndex ? { ...row, ...patch } : row)));
+      markDirty();
+      return;
+    }
+    if (setIndex >= 2) {
+      setCustomizedSets((prev) => (prev.includes(setIndex) ? prev : [...prev, setIndex].sort((a, b) => a - b)));
+      setStraightRows((rows) => rows.map((row) => (row.setIndex === setIndex ? { ...row, ...patch } : row)));
+      markDirty();
+      return;
+    }
+    // 编辑第 1 组：同步至所有未单独修改的后续组（旧 bodyweight 下显式填 0 不强行污染空白第 2 组）
+    const followPatch: Partial<StraightRow> = {};
+    if (patch.repsMin !== undefined) followPatch.repsMin = patch.repsMin;
+    if (patch.repsMax !== undefined) followPatch.repsMax = patch.repsMax;
+    if (patch.weight !== undefined) {
+      const trimmed = patch.weight.trim();
+      const num = Number(trimmed);
+      if (weightMode !== 'bodyweight' || (trimmed !== '' && Number.isFinite(num) && num > 0)) {
+        followPatch.weight = patch.weight;
+      }
+    }
+    setStraightRows((rows) =>
+      rows.map((row) => {
+        if (row.setIndex === 1) return { ...row, ...patch };
+        if (customizedSets.includes(row.setIndex)) return row;
+        return Object.keys(followPatch).length > 0 ? { ...row, ...followPatch } : row;
+      }),
+    );
+    markDirty();
+  };
+
+  const syncSet1ToAll = () => {
+    setStraightRows((rows) => {
+      const first = rows[0];
+      if (!first) return rows;
+      return rows.map((row, idx) =>
+        idx === 0
+          ? row
+          : {
+              ...row,
+              weight: first.weight,
+              repsMin: first.repsMin,
+              repsMax: first.repsMax,
+              toFailure: first.toFailure,
+            },
+      );
+    });
+    setCustomizedSets([]);
     markDirty();
   };
 
   const updateStage = (roundIndex: number, id: string, patch: Partial<StageRow>) => {
-    // R02 FIX2（F2）：每一轮（含第 1 轮）都写自己的 override，绝不改共享默认模板。
+    if (roundIndex >= 2) {
+      setCustomizedRounds((prev) =>
+        prev.includes(roundIndex) ? prev : [...prev, roundIndex].sort((a, b) => a - b),
+      );
+      setStageOverrides((prev) => {
+        const rows = prev[roundIndex] ?? cloneStageRows(stages);
+        return { ...prev, [roundIndex]: rows.map((row) => (row.id === id ? { ...row, ...patch } : row)) };
+      });
+      markDirty();
+      return;
+    }
+    // 编辑第 1 轮：自动同步至所有未单独微调（!customizedRounds）的后续轮；已微调轮保持独立
+    const r1Current = stagesForRound(1);
+    const stageIdx = r1Current.findIndex((row) => row.id === id);
     setStageOverrides((prev) => {
-      const rows = prev[roundIndex] ?? cloneStageRows(stages);
-      return { ...prev, [roundIndex]: rows.map((row) => (row.id === id ? { ...row, ...patch } : row)) };
+      const r1Rows = prev[1] ?? cloneStageRows(stages);
+      const idx = stageIdx >= 0 ? stageIdx : r1Rows.findIndex((row) => row.id === id);
+      const nextR1 = r1Rows.map((row, i) => (i === idx ? { ...row, ...patch } : row));
+      const out: Record<number, StageRow[]> = { ...prev, 1: nextR1 };
+      for (let r = 2; r <= effectiveRounds; r += 1) {
+        if (customizedRounds.includes(r)) continue;
+        const rRows = prev[r] ?? cloneStageRows(stages);
+        if (idx >= 0 && idx < rRows.length) {
+          out[r] = rRows.map((row, i) => (i === idx ? { ...row, ...patch, id: row.id } : row));
+        }
+      }
+      return out;
     });
+    if (effectiveRounds > 1 && customizedRounds.length === 0 && !baselineMeta.hasRound1Override) {
+      setStages((prevStages) =>
+        prevStages.map((row, i) => (i === stageIdx ? { ...row, ...patch, id: row.id } : row)),
+      );
+    }
     markDirty();
   };
 
   const addStage = (roundIndex: number) => {
     if (stagesForRound(roundIndex).length >= stageLimitForRound(roundIndex)) return;
+    if (roundIndex >= 2) {
+      setCustomizedRounds((prev) =>
+        prev.includes(roundIndex) ? prev : [...prev, roundIndex].sort((a, b) => a - b),
+      );
+      setStageOverrides((prev) => {
+        const rows = prev[roundIndex] ?? cloneStageRows(stages);
+        return {
+          ...prev,
+          [roundIndex]: [
+            ...rows,
+            { id: newStageId(), label: `第 ${rows.length + 1} 阶段`, weight: '', repsMin: '', repsMax: '', toFailure: false, rest: '15' },
+          ],
+        };
+      });
+      markDirty();
+      return;
+    }
+    const sharedNewId = newStageId();
     setStageOverrides((prev) => {
-      const rows = prev[roundIndex] ?? cloneStageRows(stages);
-      return {
-        ...prev,
-        [roundIndex]: [
-          ...rows,
-          { id: newStageId(), label: `第 ${rows.length + 1} 阶段`, weight: '', repsMin: '', repsMax: '', toFailure: false, rest: '15' },
-        ],
+      const r1Rows = prev[1] ?? cloneStageRows(stages);
+      const newStageBase = {
+        label: `第 ${r1Rows.length + 1} 阶段`,
+        weight: '',
+        repsMin: '',
+        repsMax: '',
+        toFailure: false,
+        rest: '15',
       };
+      const out: Record<number, StageRow[]> = {
+        ...prev,
+        1: [...r1Rows, { id: sharedNewId, ...newStageBase }],
+      };
+      for (let r = 2; r <= effectiveRounds; r += 1) {
+        if (customizedRounds.includes(r)) continue;
+        const rRows = prev[r] ?? cloneStageRows(stages);
+        if (rRows.length < stageLimitForRound(r)) {
+          out[r] = [...rRows, { id: sharedNewId, ...newStageBase }];
+        }
+      }
+      return out;
     });
+    if (effectiveRounds > 1 && customizedRounds.length === 0 && !baselineMeta.hasRound1Override) {
+      setStages((prevStages) => [
+        ...prevStages,
+        {
+          id: sharedNewId,
+          label: `第 ${prevStages.length + 1} 阶段`,
+          weight: '',
+          repsMin: '',
+          repsMax: '',
+          toFailure: false,
+          rest: '15',
+        },
+      ]);
+    }
     markDirty();
   };
 
@@ -406,10 +551,62 @@ export function ExerciseEditor({
       return;
     }
     if (stagesForRound(roundIndex).length <= stageMinForRound(roundIndex)) return;
+    if (roundIndex >= 2) {
+      setCustomizedRounds((prev) =>
+        prev.includes(roundIndex) ? prev : [...prev, roundIndex].sort((a, b) => a - b),
+      );
+      setStageOverrides((prev) => {
+        const rows = prev[roundIndex] ?? cloneStageRows(stages);
+        return { ...prev, [roundIndex]: rows.filter((row) => row.id !== id) };
+      });
+      markDirty();
+      return;
+    }
+    const r1Current = stagesForRound(1);
+    const stageIdx = r1Current.findIndex((row) => row.id === id);
     setStageOverrides((prev) => {
-      const rows = prev[roundIndex] ?? cloneStageRows(stages);
-      return { ...prev, [roundIndex]: rows.filter((row) => row.id !== id) };
+      const r1Rows = prev[1] ?? cloneStageRows(stages);
+      const idx = stageIdx >= 0 ? stageIdx : r1Rows.findIndex((row) => row.id === id);
+      const out: Record<number, StageRow[]> = {
+        ...prev,
+        1: r1Rows.filter((_, i) => i !== idx),
+      };
+      for (let r = 2; r <= effectiveRounds; r += 1) {
+        if (customizedRounds.includes(r)) continue;
+        const rRows = prev[r] ?? cloneStageRows(stages);
+        if (rRows.length > stageMinForRound(r) && idx >= 0 && idx < rRows.length) {
+          out[r] = rRows.filter((_, i) => i !== idx);
+        }
+      }
+      return out;
     });
+    if (effectiveRounds > 1 && customizedRounds.length === 0 && !baselineMeta.hasRound1Override) {
+      setStages((prevStages) => prevStages.filter((_, i) => i !== stageIdx));
+    }
+    markDirty();
+  };
+
+  const syncRound1ToAll = () => {
+    if (submittingRef.current) return;
+    const r1Rows = cloneStageRows(stagesForRound(1));
+    setStageOverrides((prev) => {
+      const out: Record<number, StageRow[]> = { ...prev, 1: cloneStageRows(r1Rows) };
+      for (let r = 2; r <= effectiveRounds; r += 1) {
+        out[r] = cloneStageRows(r1Rows);
+      }
+      return out;
+    });
+    if (!baselineMeta.hasRound1Override) {
+      setStages(cloneStageRows(r1Rows));
+    }
+    setRoundRestInSecOverrides((prev) => {
+      const r1Rest = prev[1];
+      if (r1Rest === undefined) return {};
+      const out: Record<number, number> = {};
+      for (let r = 1; r <= effectiveRounds; r += 1) out[r] = r1Rest;
+      return out;
+    });
+    setCustomizedRounds([]);
     markDirty();
   };
 
@@ -491,6 +688,8 @@ export function ExerciseEditor({
           weightMode,
           dumbbellBasis,
           remember,
+          customizedSets,
+          customizedRounds,
         }),
         activeRound,
         memory: { ...memory },
@@ -1013,6 +1212,34 @@ export function ExerciseEditor({
                   {errText('rest') ? <span style={{ color: 'var(--brick)', fontSize: 12 }}>{errText('rest')}</span> : null}
                 </div>
               </div>
+              {straightRows.length > 1 ? (
+                <div
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    gap: 8,
+                    flexWrap: 'wrap',
+                    fontSize: 12,
+                    color: 'var(--ink-3)',
+                  }}
+                >
+                  <span>
+                    {customizedSets.length === 0
+                      ? `修改第 1 组会自动同步到第 2–${straightRows.length} 组；单独修改某组即独立`
+                      : `第 ${customizedSets.join('、')} 组已单独微调`}
+                  </span>
+                  <button
+                    type="button"
+                    className="btn btn-ghost btn-sm"
+                    data-testid="editor-sync-set1-all"
+                    onClick={syncSet1ToAll}
+                    style={{ minHeight: 28, padding: '0 8px', fontSize: 11.5 }}
+                  >
+                    同步第 1 组到全部组
+                  </button>
+                </div>
+              ) : null}
               {straightRows.map((row, i) => (
                 <div key={row.setIndex} data-testid={`group-row-${i}`} style={{ border: '1px solid var(--rule)', padding: 10, display: 'flex', flexDirection: 'column', gap: 8 }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
@@ -1107,19 +1334,48 @@ export function ExerciseEditor({
                 </div>
               </div>
               {effectiveRounds > 1 ? (
-                <div className="segmented" role="group" aria-label="逐轮配置" style={{ flexWrap: 'wrap' }}>
-                  {Array.from({ length: effectiveRounds }, (_, idx) => idx + 1).map((r) => (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  <div className="segmented" role="group" aria-label="逐轮配置" style={{ flexWrap: 'wrap' }}>
+                    {Array.from({ length: effectiveRounds }, (_, idx) => idx + 1).map((r) => (
+                      <button
+                        key={r}
+                        type="button"
+                        data-testid={`round-tab-${r}`}
+                        aria-pressed={activeRound === r}
+                        onClick={() => setActiveRound(r)}
+                        style={{ fontSize: 12, minWidth: 72 }}
+                      >
+                        第 {r} 轮 · {stagesForRound(r).length} 阶段
+                        {r >= 2 && customizedRounds.includes(r) ? ' *' : ''}
+                      </button>
+                    ))}
+                  </div>
+                  <div
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      gap: 8,
+                      flexWrap: 'wrap',
+                      fontSize: 12,
+                      color: 'var(--ink-3)',
+                    }}
+                  >
+                    <span data-testid="editor-round-sync-status">
+                      {customizedRounds.length === 0
+                        ? `改第 1 轮会自动同步第 2–${effectiveRounds} 轮；切到第 2/3 轮单改即独立`
+                        : `第 ${customizedRounds.join('、')} 轮已独立微调（不受第 1 轮联动覆盖）`}
+                    </span>
                     <button
-                      key={r}
                       type="button"
-                      data-testid={`round-tab-${r}`}
-                      aria-pressed={activeRound === r}
-                      onClick={() => setActiveRound(r)}
-                      style={{ fontSize: 12, minWidth: 72 }}
+                      className="btn btn-ghost btn-sm"
+                      data-testid="editor-sync-round1-all"
+                      onClick={syncRound1ToAll}
+                      style={{ minHeight: 28, padding: '0 8px', fontSize: 11.5 }}
                     >
-                      第 {r} 轮 · {stagesForRound(r).length} 阶段
+                      同步第 1 轮到全部轮
                     </button>
-                  ))}
+                  </div>
                 </div>
               ) : null}
               {stagesForRound(activeRound).map((stage, i) => {

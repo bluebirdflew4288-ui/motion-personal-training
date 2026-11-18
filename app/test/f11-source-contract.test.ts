@@ -155,9 +155,17 @@ describe('F11 F09 准备触感：单通道、每手势一次', () => {
   it('全应用不再有生产代码调用那个原生未实现的 vibrateNow', () => {
     const sources = [
       read('../src/pages/Session.tsx'),
+      read('../src/pages/session/useSessionPersistence.ts'),
+      read('../src/pages/session/SessionExerciseCard.tsx'),
+      read('../src/pages/session/SessionHeader.tsx'),
+      read('../src/pages/session/SessionWarmupSection.tsx'),
+      read('../src/pages/session/SessionFinishSheet.tsx'),
+      read('../src/pages/plans/PlansPage.tsx'),
+      read('../src/pages/plans/PlanDayEditor.tsx'),
       read('../src/pages/Settings.tsx'),
       read('../src/ui/SwipeActionCard.tsx'),
       read('../src/lib/deletionFeedback.ts'),
+      read('../src/lib/haptics.ts'),
     ];
     for (const s of sources) expect(stripComments(s)).not.toContain('vibrateNow(');
   });

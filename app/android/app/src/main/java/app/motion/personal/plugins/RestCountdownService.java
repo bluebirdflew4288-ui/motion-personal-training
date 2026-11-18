@@ -403,7 +403,7 @@ public class RestCountdownService extends Service {
         RestReminderGate.Result gate;
         try {
             gate = RestReminderStore.transition(this,
-                cur -> RestReminderState.cancelIfCurrent(cur, inToken, inGen, true));
+                cur -> RestReminderState.cancelFromNotification(cur, inToken, inGen));
         } catch (Exception e) {
             RestReminderStore.diag(this, RestDiagLog.KIND_FGS_FAILED,
                 "cancel:" + e.getClass().getSimpleName());
@@ -421,13 +421,14 @@ public class RestCountdownService extends Service {
                 "cancel-rejected:" + (gate.durable ? "stale-or-noop" : "persist-failed"));
             return;
         }
-        // 真正取消成功：取消基础 alarm（按旧身份）并停本段
+        // 真正取消成功：取消基础 alarm（按旧身份）并停本段，同时唤醒同进程前端对账
         try {
             cancelBaseAlarmFor(inToken, inGen);
         } catch (Exception ignored) {
             // 取消失败不阻断停服务
         }
         stopSelfSafely("cancelled-from-notification");
+        RestReminderStore.notifyUserCancelled(inToken, inGen);
     }
 
     /**

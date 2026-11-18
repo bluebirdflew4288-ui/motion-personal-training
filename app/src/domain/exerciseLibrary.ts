@@ -10,6 +10,7 @@
 
 import type { ExerciseTemplate } from './types';
 import { exerciseIdFromName, normalizeExerciseName } from './identity';
+import { pinyinMatchRank } from './pinyinInitials';
 import { EXERCISE_LIBRARY, type LibraryEntry } from './presets/library';
 
 export interface ExerciseCatalogEntry {
@@ -18,6 +19,8 @@ export interface ExerciseCatalogEntry {
   name: string;
   en?: string;
   group?: LibraryEntry['group'];
+  /** 常见俗称 / 简称（来自内置库，用于检索召回） */
+  aliases?: string[];
   /** 是否来自内置动作库 */
   builtin: boolean;
   /** 是否有已记住的完整配置（模板记忆） */
@@ -64,6 +67,7 @@ export function mergeExerciseCatalog(
       name: item.name.trim(),
       ...(item.en ? { en: item.en } : {}),
       group: item.group,
+      ...(item.aliases?.length ? { aliases: item.aliases } : {}),
       builtin: true,
       hasTemplate: false,
       templateRevision: null,
@@ -72,11 +76,14 @@ export function mergeExerciseCatalog(
 
   for (const tpl of templates) {
     const id = tpl.exerciseId;
+    const prev = byId.get(id);
     byId.set(id, {
       exerciseId: id,
       name: tpl.name.trim(),
-      ...(tpl.en ? { en: tpl.en } : {}),
-      builtin: byId.get(id)?.builtin ?? false,
+      ...(tpl.en ? { en: tpl.en } : prev?.en ? { en: prev.en } : {}),
+      ...(prev?.group ? { group: prev.group } : {}),
+      ...(prev?.aliases?.length ? { aliases: prev.aliases } : {}),
+      builtin: prev?.builtin ?? false,
       hasTemplate: true,
       templateRevision: tpl.revision,
     });
@@ -86,21 +93,63 @@ export function mergeExerciseCatalog(
 }
 
 /**
- * 搜索动作库（按名称 / 英文名 / 分组）。
+ * 搜索动作库（按名称 / 拼音全拼与不完整音节前缀 / 拼音首字母 / 俗称别名 / 英文名 / 分组）。
  * 空查询返回全部（已按拼音排序）。
- * 大小写与全半角按 normalizeExerciseName 归一，中文输入直接 includes；
- * 英文额外用大写原名匹配（保留可读英文缩写）。
+ * 命中结果按相关度分层（名称直接命中 > 动作名句首拼音命中 > 动作名句中拼音命中 > 别名命中 > 分组/英文词首 > 英文子串），
+ * 同层内保持稳定拼音序，确保输入 `Yin` 时「引体向上」排在最前而非英文含 `yin`（如 `LYING`）的动作。
  */
 export function searchExerciseCatalog(entries: ExerciseCatalogEntry[], query: string): ExerciseCatalogEntry[] {
   const raw = query.trim();
   if (!raw) return entries;
   const key = normalizeExerciseName(raw);
-  return entries.filter((e) => {
-    if (normalizeExerciseName(e.name).includes(key)) return true;
-    if (e.en && e.en.toLowerCase().includes(raw.toLowerCase())) return true;
-    if (e.group && e.group.includes(raw)) return true;
-    return false;
+  const lower = raw.toLowerCase();
+
+  const scored: Array<{ entry: ExerciseCatalogEntry; tier: number; idx: number }> = [];
+  entries.forEach((e, idx) => {
+    const normName = normalizeExerciseName(e.name);
+    let tier = 99;
+    if (normName.startsWith(key)) {
+      tier = 0;
+    } else if (normName.includes(key)) {
+      tier = 1;
+    } else {
+      const nameRank = pinyinMatchRank(e.name, raw);
+      const aliasBestRank = e.aliases?.length
+        ? Math.min(
+            ...e.aliases.map((alias) => {
+              if (normalizeExerciseName(alias).includes(key)) return 0;
+              const r = pinyinMatchRank(alias, raw);
+              return r >= 0 ? r + 1 : 99;
+            }),
+          )
+        : 99;
+      if (nameRank === 0) {
+        tier = 2;
+      } else if (nameRank === 1 || aliasBestRank <= 1) {
+        tier = 3;
+      } else if (nameRank === 2) {
+        tier = 4;
+      } else if (nameRank === 3 || aliasBestRank < 99) {
+        tier = 5;
+      } else if (e.group && e.group.includes(raw)) {
+        tier = 6;
+      } else if (e.en) {
+        const enLower = e.en.toLowerCase();
+        const words = enLower.split(/[\s/-]+/);
+        if (words.some((w) => w.startsWith(lower))) {
+          tier = 7;
+        } else if (enLower.includes(lower)) {
+          tier = 8;
+        }
+      }
+    }
+    if (tier < 99) {
+      scored.push({ entry: e, tier, idx });
+    }
   });
+
+  scored.sort((a, b) => (a.tier !== b.tier ? a.tier - b.tier : a.idx - b.idx));
+  return scored.map((s) => s.entry);
 }
 
 /** 由模板记忆生成合并目录（便捷入口，UI G2 可直接调用） */

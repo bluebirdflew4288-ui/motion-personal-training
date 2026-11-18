@@ -12,19 +12,55 @@ import {
 import { handleBackIntent, registerPageLeaveGuard } from '../lib/nativeBack';
 import { Sheet } from '../ui/Sheet';
 import { fmtDateWithWeek, fmtDuration, fmtTime, fmtWeight } from '../lib/format';
-import type { Session, SessionSet } from '../domain/types';
+import type { CardioEntry, Session, SessionSet } from '../domain/types';
+import {
+  MAX_INCLINE_PCT,
+  MAX_SPEED_KMH,
+  MAX_STAIR_LEVEL,
+  MAX_TEXT,
+  MIN_INCLINE_PCT,
+  MIN_SPEED_KMH,
+  MIN_STAIR_LEVEL,
+} from '../domain/limits';
 import { isSetLogged, summarizeSession, withSet } from '../domain/session';
 import { sessionKindOf } from '../domain/sessionKind';
-import { describeCardioParams, liveElapsedMs } from '../domain/cardio';
+import { describeCardioParams, liveElapsedMs, validateCardioList } from '../domain/cardio';
+import {
+  appendBlankGroupToHistoryExercise,
+  canRemoveBlankGroupFromHistoryExercise,
+  correctHistoryCardioEntry,
+  historyAppendGroupBlocker,
+  removeBlankGroupFromHistoryExercise,
+  updateHistoryExerciseNote,
+  updateHistorySessionNote,
+} from '../domain/historyEdit';
+import { detectSessionPRs } from '../domain/prDetector';
 import { Confirm } from '../ui/Confirm';
 import { DraftCell } from '../ui/DraftCell';
+import { HistoryCalendar } from '../ui/HistoryCalendar';
+import { consumePendingFinishReceipt, ReceiptSlipSheet } from '../ui/ReceiptSlipSheet';
 import { deleteSession } from '../db/repo';
 import { atomicDeleteRest, revisionOf } from '../db/tx';
 
+export const HISTORY_BATCH_SIZE = 30;
+
 export function HistoryPage() {
-  const { sessions } = useStore();
+  const { sessions, historyHydrated, ensureFullHistory } = useStore();
   const [query, setQuery] = useState('');
   const [month, setMonth] = useState<string>('all');
+  const [viewMode, setViewMode] = useState<'list' | 'calendar'>('list');
+  const [visibleCount, setVisibleCount] = useState<number>(HISTORY_BATCH_SIZE);
+  const loadMoreRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!historyHydrated) {
+      void ensureFullHistory();
+    }
+  }, [historyHydrated, ensureFullHistory]);
+
+  useEffect(() => {
+    setVisibleCount(HISTORY_BATCH_SIZE);
+  }, [month, query]);
 
   /**
    * 历史列表包含完全休息记录（可见），
@@ -46,7 +82,7 @@ export function HistoryPage() {
       set.add(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`);
     }
     return [...set].sort().reverse();
-  }, [completed]);
+  }, [completedAll]);
 
   /** 列表展示**包含**休息记录（历史可见），但训练次数统计排除 */
   const filtered = useMemo(() => {
@@ -70,16 +106,49 @@ export function HistoryPage() {
     return list;
   }, [completedAll, month, query]);
 
-  const grouped = useMemo(() => {
-    const map = new Map<string, typeof filtered>();
+  /** 日级训练次数基于完整筛选集计算，避免分页边界把同一天的 2 次训练暂时拆成“1 次” */
+  const dayTrainCounts = useMemo(() => {
+    const counts = new Map<string, number>();
     for (const s of filtered) {
+      const key = fmtDateWithWeek(s.startedAt);
+      const prev = counts.get(key) ?? 0;
+      counts.set(key, sessionKindOf(s) !== 'rest' ? prev + 1 : prev);
+    }
+    return counts;
+  }, [filtered]);
+
+  const visibleItems = useMemo(
+    () => filtered.slice(0, visibleCount),
+    [filtered, visibleCount],
+  );
+  const remainingCount = Math.max(0, filtered.length - visibleItems.length);
+
+  useEffect(() => {
+    if (remainingCount <= 0) return undefined;
+    const node = loadMoreRef.current;
+    if (!node || typeof IntersectionObserver === 'undefined') return undefined;
+    const obs = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) {
+          setVisibleCount((cur) => Math.min(filtered.length, cur + HISTORY_BATCH_SIZE));
+        }
+      },
+      { rootMargin: '240px 0px' },
+    );
+    obs.observe(node);
+    return () => obs.disconnect();
+  }, [remainingCount, filtered.length]);
+
+  const grouped = useMemo(() => {
+    const map = new Map<string, typeof visibleItems>();
+    for (const s of visibleItems) {
       const key = fmtDateWithWeek(s.startedAt);
       const arr = map.get(key) ?? [];
       arr.push(s);
       map.set(key, arr);
     }
     return [...map.entries()];
-  }, [filtered]);
+  }, [visibleItems]);
 
   return (
     <main className="page page-top page-bottom-space">
@@ -87,14 +156,16 @@ export function HistoryPage() {
         <h1 className="h-serif" style={{ fontSize: 26 }}>
           训练历史
         </h1>
-        <span className="mono-label">{completed.length} 次完成</span>
+        <span className="mono-label">
+          {!historyHydrated ? '正在读取…' : `${completed.length} 次完成`}
+        </span>
       </header>
       <hr className="rule-line" style={{ marginTop: 8 }} />
 
-      <div style={{ display: 'flex', gap: 8, marginTop: 12, flexWrap: 'wrap' }}>
+      <div style={{ display: 'flex', gap: 8, marginTop: 12, flexWrap: 'wrap', alignItems: 'center' }}>
         <input
           className="input"
-          style={{ flex: '1 1 180px', minHeight: 42, fontSize: 15 }}
+          style={{ flex: '1 1 160px', minHeight: 42, fontSize: 15 }}
           placeholder="搜索日期 / 动作 / 备注"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
@@ -108,11 +179,35 @@ export function HistoryPage() {
             </option>
           ))}
         </select>
+        <div className="segmented" role="group" aria-label="历史浏览视图" style={{ flex: '0 0 auto' }}>
+          <button
+            type="button"
+            data-testid="history-view-list"
+            aria-pressed={viewMode === 'list'}
+            onClick={() => setViewMode('list')}
+            style={{ fontSize: 13, padding: '0 12px', minHeight: 38 }}
+          >
+            列表
+          </button>
+          <button
+            type="button"
+            data-testid="history-view-calendar"
+            aria-pressed={viewMode === 'calendar'}
+            onClick={() => setViewMode('calendar')}
+            style={{ fontSize: 13, padding: '0 12px', minHeight: 38 }}
+          >
+            月历
+          </button>
+        </div>
       </div>
 
       {/* G2：只有休息记录时也不能显示 EMPTY —— 休息是可见记录，可查看/撤销。
           空态以"可展示记录"为准；上方的训练次数仍排除休息。 */}
-      {!completedAll.length ? (
+      {!completedAll.length && !historyHydrated ? (
+        <div className="empty" style={{ marginTop: 24 }} role="status">
+          <div className="empty-title">正在读取训练历史…</div>
+        </div>
+      ) : !completedAll.length ? (
         <div className="empty" style={{ marginTop: 24 }}>
           <div className="empty-mark">EMPTY</div>
           <h2 className="empty-title">还没有任何记录</h2>
@@ -123,83 +218,125 @@ export function HistoryPage() {
             去开始训练
           </button>
         </div>
+      ) : viewMode === 'calendar' ? (
+        <HistoryCalendar
+          sessions={query.trim() ? filtered : completedAll}
+          initialMonthKey={month !== 'all' ? month : undefined}
+        />
       ) : !filtered.length ? (
         <div className="empty" style={{ marginTop: 24 }}>
           <div className="empty-title">没有符合条件的记录</div>
           <p className="empty-body">换个关键词或清空筛选看看。</p>
         </div>
       ) : (
-        grouped.map(([day, list]) => (
-          <section key={day} style={{ marginTop: 18 }}>
-            <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between' }}>
-              <h2 className="h-section" style={{ fontSize: 15 }}>
-                {day}
-              </h2>
-              {/* 日级"次数"同样排除休息，避免把休息显示成"1 次"训练 */}
-              <span className="mono-label">
-                {list.filter((x) => sessionKindOf(x) !== 'rest').length} 次
-              </span>
-            </div>
-            <div className="rows" style={{ marginTop: 2 }}>
-              {list.map((s) => {
-                const sum = summarizeSession(s, s.endedAt ?? Date.now());
-                const kind = sessionKindOf(s);
-                return (
-                  <button key={s.id} className="row" onClick={() => navigate(`/history/${s.id}`)}>
-                    <span
-                      style={{
-                        flex: 'none',
-                        width: 46,
-                        fontFamily: 'var(--f-serif)',
-                        fontSize: 17,
-                        fontWeight: 700,
-                        color: 'var(--brick)',
-                      }}
+        <>
+          {grouped.map(([day, list]) => (
+            <section key={day} style={{ marginTop: 18 }}>
+              <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between' }}>
+                <h2 className="h-section" style={{ fontSize: 15 }}>
+                  {day}
+                </h2>
+                {/* 日级"次数"同样排除休息，避免把休息显示成"1 次"训练 */}
+                <span className="mono-label">
+                  {dayTrainCounts.get(day) ?? list.filter((x) => sessionKindOf(x) !== 'rest').length} 次
+                </span>
+              </div>
+              <div className="rows" style={{ marginTop: 2 }}>
+                {list.map((s) => {
+                  const sum = summarizeSession(s, s.endedAt ?? Date.now());
+                  const kind = sessionKindOf(s);
+                  return (
+                    <button
+                      key={s.id}
+                      className="row"
+                      data-testid="history-session-row"
+                      onClick={() => navigate(`/history/${s.id}`)}
                     >
-                      {fmtTime(s.startedAt)}
-                    </span>
-                    <span className="row-main">
-                      <span className="row-title">
-                        {s.day.dayName}
-                        {s.cycleIndexAtStart !== undefined ? '' : ''}
+                      <span
+                        style={{
+                          flex: 'none',
+                          width: 46,
+                          fontFamily: 'var(--f-serif)',
+                          fontSize: 17,
+                          fontWeight: 700,
+                          color: 'var(--brick)',
+                        }}
+                      >
+                        {fmtTime(s.startedAt)}
                       </span>
-                      <span className="row-sub">
-                        {kind === 'rest' ? (
-                          <>完全休息 · 不计入训练次数</>
-                        ) : (
-                          <>
-                            {sum.completedSets > 0 ? `${sum.completedSets} 组 · ` : ''}
-                            {fmtDuration(sum.durationMs)}
-                            {sum.cardioMs > 0 ? ` · 有氧 ${fmtDuration(sum.cardioMs)}` : ''}
-                            {sum.partialGroups ? ` · ${sum.partialGroups} 部分` : ''}
-                            {s.note ? ' · 有备注' : ''}
-                          </>
-                        )}
+                      <span className="row-main">
+                        <span className="row-title">
+                          {s.day.dayName}
+                          {s.cycleIndexAtStart !== undefined ? '' : ''}
+                        </span>
+                        <span className="row-sub">
+                          {kind === 'rest' ? (
+                            <>完全休息 · 不计入训练次数</>
+                          ) : (
+                            <>
+                              {sum.completedSets > 0 ? `${sum.completedSets} 组 · ` : ''}
+                              {fmtDuration(sum.durationMs)}
+                              {sum.cardioMs > 0 ? ` · 有氧 ${fmtDuration(sum.cardioMs)}` : ''}
+                              {sum.partialGroups ? ` · ${sum.partialGroups} 部分` : ''}
+                              {s.note ? ' · 有备注' : ''}
+                            </>
+                          )}
+                        </span>
                       </span>
-                    </span>
-                    <span className="row-end" style={{ color: 'var(--ink-4)' }}>
-                      ›
-                    </span>
-                  </button>
-                );
-              })}
+                      <span className="row-end" style={{ color: 'var(--ink-4)' }}>
+                        ›
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            </section>
+          ))}
+          {remainingCount > 0 ? (
+            <div ref={loadMoreRef} style={{ marginTop: 18, textAlign: 'center' }}>
+              <button
+                type="button"
+                className="btn btn-ghost"
+                data-testid="history-load-more"
+                style={{ width: '100%' }}
+                onClick={() =>
+                  setVisibleCount((cur) => Math.min(filtered.length, cur + HISTORY_BATCH_SIZE))
+                }
+              >
+                加载更多（剩余 {remainingCount} 条）
+              </button>
             </div>
-          </section>
-        ))
+          ) : null}
+        </>
       )}
     </main>
   );
 }
 
 export function HistoryDetailPage({ id }: { id: string }) {
-  const { sessions, refreshSessions, pushToast, saveHistorySession } = useStore();
+  const { sessions, historyHydrated, ensureFullHistory, refreshSessions, pushToast, saveHistorySession } =
+    useStore();
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [receiptOpen, setReceiptOpen] = useState(false);
   const deletingRef = useRef(false);
   const session = sessions.find((s) => s.id === id);
 
+  useEffect(() => {
+    if (!session && !historyHydrated) {
+      void ensureFullHistory();
+    }
+  }, [session, historyHydrated, ensureFullHistory]);
+
+  useEffect(() => {
+    if (session && sessionKindOf(session) !== 'rest' && consumePendingFinishReceipt(id)) {
+      setReceiptOpen(true);
+    }
+  }, [id, session]);
+
   /** 编辑草稿：编辑期间不动正式历史，保存才写库（审计任务 H） */
   const [draft, setDraft] = useState<Session | null>(null);
+  const [openExNotes, setOpenExNotes] = useState<Record<string, boolean>>({});
   const [saving, setSaving] = useState(false);
   /** 离页守卫弹层：**本次**被拦下的导航意图（保存 / 放弃 / 留下 三选一） */
   const [leavePrompt, setLeavePrompt] = useState<BlockedNavigation | null>(null);
@@ -241,6 +378,7 @@ export function HistoryDetailPage({ id }: { id: string }) {
     draftRef.current = null;
     baselineRef.current = '';
     setDraft(null);
+    setOpenExNotes({});
     setCellErrors({});
     setLeavePrompt(null);
     setLeaveBusy(false);
@@ -269,6 +407,31 @@ export function HistoryDetailPage({ id }: { id: string }) {
   const hasCellErrors = Object.keys(cellErrors).length > 0;
   const editing = draft !== null;
   const view = draft ?? session;
+  const prReport = useMemo(
+    () => (view && sessionKindOf(view) !== 'rest' ? detectSessionPRs(sessions, view) : null),
+    [sessions, view],
+  );
+
+  const clearCellKeysWithPrefix = (prefix: string) => {
+    const prevErr = cellErrorsRef.current;
+    let errChanged = false;
+    const nextErr = { ...prevErr };
+    for (const k of Object.keys(nextErr)) {
+      if (k.startsWith(prefix)) {
+        delete nextErr[k];
+        errChanged = true;
+      }
+    }
+    if (errChanged) {
+      cellErrorsRef.current = nextErr;
+      setCellErrors(nextErr);
+    }
+    for (const k of Array.from(rawStateRef.current.keys())) {
+      if (k.startsWith(prefix)) {
+        rawStateRef.current.delete(k);
+      }
+    }
+  };
 
   /**
    * **同步**判断当前是否不可安全离页（全部读 ref，不看可能滞后的 React state）：
@@ -333,6 +496,15 @@ export function HistoryDetailPage({ id }: { id: string }) {
   }, []);
 
   if (!session) {
+    if (!historyHydrated) {
+      return (
+        <main className="page page-top page-bottom-space">
+          <div className="empty" style={{ marginTop: 32 }} role="status">
+            <div className="empty-title">正在读取记录…</div>
+          </div>
+        </main>
+      );
+    }
     return (
       <main className="page page-top page-bottom-space">
         <div className="empty" style={{ marginTop: 32 }}>
@@ -355,6 +527,68 @@ export function HistoryDetailPage({ id }: { id: string }) {
     setDraft(next);
   };
 
+  /** Wave 3B：更新单动作备注 */
+  const updateDraftExerciseNote = (exId: string, note: string) => {
+    const d = draftRef.current;
+    if (!d) return;
+    const res = updateHistoryExerciseNote(d, exId, note);
+    if (!res.ok) {
+      pushToast(res.message, 'error');
+      return;
+    }
+    draftRef.current = res.session;
+    setDraft(res.session);
+  };
+
+  /** Wave 3B：在历史动作末尾补录一组 / 一轮 */
+  const handleAppendBlankGroup = (exId: string) => {
+    const d = draftRef.current;
+    if (!d) return;
+    const res = appendBlankGroupToHistoryExercise(d, exId);
+    if (!res.ok) {
+      pushToast(res.message, 'error');
+      return;
+    }
+    draftRef.current = res.session;
+    setDraft(res.session);
+  };
+
+  /** Wave 3B：移除误建的完全空白组 / 轮 */
+  const handleRemoveBlankGroup = (exId: string, roundIndex: number) => {
+    const d = draftRef.current;
+    if (!d) return;
+    const prevEx = d.exercises.find((e) => e.id === exId);
+    const removedSetIds = prevEx
+      ? prevEx.sets.filter((s) => s.roundIndex === roundIndex).map((s) => s.id)
+      : [];
+    const res = removeBlankGroupFromHistoryExercise(d, exId, roundIndex);
+    if (!res.ok) {
+      pushToast(res.message, 'error');
+      return;
+    }
+    for (const sid of removedSetIds) {
+      clearCellKeysWithPrefix(`${sid}:`);
+    }
+    draftRef.current = res.session;
+    setDraft(res.session);
+  };
+
+  /** Wave 3B：修正历史有氧记录的有效时长或关键参数 */
+  const updateDraftCardio = (
+    entry: CardioEntry,
+    patch: Parameters<typeof correctHistoryCardioEntry>[2],
+  ) => {
+    const d = draftRef.current;
+    if (!d) return;
+    const res = correctHistoryCardioEntry(d, entry.id, patch);
+    if (!res.ok) {
+      pushToast(res.message, 'error');
+      return;
+    }
+    draftRef.current = res.session;
+    setDraft(res.session);
+  };
+
   /** 保存草稿 → 正式历史；返回 true=已写库。失败保留草稿不丢输入。
    *  （V3-01：受约束入口 + revision 冲突保护） */
   const saveDraft = async (): Promise<boolean> => {
@@ -371,8 +605,16 @@ export function HistoryDetailPage({ id }: { id: string }) {
       pushToast('有未完成或不合法的数字输入，已阻止保存。请先修正。', 'error');
       return false;
     }
+    if ((d.note ?? '').length > MAX_TEXT) {
+      pushToast(`训练备注最多 ${MAX_TEXT} 个字符，已阻止保存。`, 'error');
+      return false;
+    }
     // R01：保存前统一校验所有数值，NaN/Infinity/负数/非整数一律拒绝
     for (const ex of d.exercises) {
+      if ((ex.note ?? '').length > MAX_TEXT) {
+        pushToast(`「${ex.name}」的动作备注超过 ${MAX_TEXT} 字上限，已阻止保存。`, 'error');
+        return false;
+      }
       for (const st of ex.sets) {
         if (st.reps !== null && (!Number.isFinite(st.reps) || st.reps < 0 || !Number.isInteger(st.reps))) {
           pushToast(`「${ex.name}」有一组的次数不是合法整数，已阻止保存。`, 'error');
@@ -382,6 +624,13 @@ export function HistoryDetailPage({ id }: { id: string }) {
           pushToast(`「${ex.name}」有一组的重量不是合法数值，已阻止保存。`, 'error');
           return false;
         }
+      }
+    }
+    if ((d.cardio ?? []).length > 0) {
+      const cardioIssues = validateCardioList(d.cardio, d.endedAt ?? Date.now());
+      if (cardioIssues.length > 0) {
+        pushToast(`有氧记录校验未通过：${cardioIssues[0].message}`, 'error');
+        return false;
       }
     }
     setSaving(true);
@@ -411,6 +660,7 @@ export function HistoryDetailPage({ id }: { id: string }) {
   const startEditing = () => {
     cellErrorsRef.current = {};
     setCellErrors({});
+    setOpenExNotes({});
     rawStateRef.current.clear();
     setDraftRevision(revisionOf(session));
     // 记录进入纠错时的原始字节：用于 dirty 判定
@@ -499,6 +749,9 @@ export function HistoryDetailPage({ id }: { id: string }) {
   const activeExercises = view!.exercises.filter(
     (e) => e.status !== 'skipped' && e.sets.some((st) => isSetLogged(st)),
   );
+  const kind = sessionKindOf(session);
+  const canCorrect = kind !== 'rest';
+  const cardioList = view!.cardio ?? [];
 
   return (
     <main className="page page-top page-bottom-space">
@@ -507,6 +760,16 @@ export function HistoryDetailPage({ id }: { id: string }) {
           ‹ 历史
         </button>
         <div style={{ flex: 1 }} />
+        {canCorrect ? (
+          <button
+            type="button"
+            className="btn btn-ghost btn-sm"
+            data-testid="history-open-receipt"
+            onClick={() => setReceiptOpen(true)}
+          >
+            小票
+          </button>
+        ) : null}
         <button
           className="btn btn-ghost btn-sm"
           style={{ color: 'var(--brick)' }}
@@ -627,43 +890,198 @@ export function HistoryDetailPage({ id }: { id: string }) {
         </section>
       ) : null}
 
-      {/* 有氧明细：与力量同一条历史，时长单列（不并入总时长） */}
-      {(session.cardio ?? []).length ? (
+      {/* 有氧明细：与力量同一条历史，时长单列（不并入总时长）；Wave 3B 支持修正时长与参数 */}
+      {cardioList.length || kind === 'cardio' ? (
         <section style={{ marginTop: 16 }}>
-          <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between' }}>
+          <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 10 }}>
             <h2 className="h-section">有氧</h2>
-            <span className="mono-label">共 {fmtDuration(sum.cardioMs)}</span>
-          </div>
-          {(session.cardio ?? []).map((c) => (
-            <div key={c.id} className="slip" style={{ marginTop: 8, padding: '10px 14px' }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
-                <span style={{ fontWeight: 600 }}>{c.name}</span>
-                <span className="mono-label">{fmtDuration(liveElapsedMs(c, session.endedAt ?? Date.now()))}</span>
-              </div>
-              <div style={{ fontSize: 12.5, color: 'var(--ink-3)', marginTop: 4 }}>
-                {describeCardioParams(c.preset, c.currentParams)} · {c.segments.length} 段
-              </div>
-              {c.segments.map((seg) => (
-                <div
-                  key={seg.id}
-                  style={{
-                    display: 'flex',
-                    justifyContent: 'space-between',
-                    fontSize: 12,
-                    color: 'var(--ink-2)',
-                    padding: '3px 0',
-                    borderBottom: '1px dashed var(--rule)',
-                  }}
-                >
-                  <span style={{ fontFamily: 'var(--f-mono)' }}>
-                    {fmtDuration(seg.startElapsedMs)} –{' '}
-                    {seg.endElapsedMs === null ? '进行中' : fmtDuration(seg.endElapsedMs)}
-                  </span>
-                  <span>{describeCardioParams(c.preset, seg.params)}</span>
-                </div>
-              ))}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span className="mono-label">共 {fmtDuration(sum.cardioMs)}</span>
+              {kind === 'cardio' ? (
+                editing ? (
+                  <span className="tag tag-brick">编辑中</span>
+                ) : (
+                  <button
+                    className="btn btn-ghost btn-sm"
+                    onClick={startEditing}
+                    style={{ minHeight: 44 }}
+                  >
+                    纠正数据
+                  </button>
+                )
+              ) : null}
             </div>
-          ))}
+          </div>
+
+          {kind === 'cardio' && editing ? (
+            <p style={{ fontSize: 13, color: 'var(--ink-3)', margin: '6px 0 0', lineHeight: 1.6 }}>
+              可修正忘关计时器导致的异常时长或器械参数。修改只影响本条历史记录。
+            </p>
+          ) : null}
+
+          {cardioList.map((c) => {
+            const totalSec = Math.max(
+              0,
+              Math.round(liveElapsedMs(c, view!.endedAt ?? Date.now()) / 1000),
+            );
+            const curMin = Math.floor(totalSec / 60);
+            const curSec = totalSec % 60;
+            return (
+              <div key={c.id} className="slip" style={{ marginTop: 8, padding: '10px 14px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
+                  <span style={{ fontWeight: 600 }}>{c.name}</span>
+                  <span className="mono-label">
+                    {fmtDuration(liveElapsedMs(c, view!.endedAt ?? Date.now()))}
+                  </span>
+                </div>
+
+                {!editing ? (
+                  <>
+                    <div style={{ fontSize: 12.5, color: 'var(--ink-3)', marginTop: 4 }}>
+                      {describeCardioParams(c.preset, c.currentParams)} · {c.segments.length} 段
+                    </div>
+                    {c.segments.map((seg) => (
+                      <div
+                        key={seg.id}
+                        style={{
+                          display: 'flex',
+                          justifyContent: 'space-between',
+                          fontSize: 12,
+                          color: 'var(--ink-2)',
+                          padding: '3px 0',
+                          borderBottom: '1px dashed var(--rule)',
+                        }}
+                      >
+                        <span style={{ fontFamily: 'var(--f-mono)' }}>
+                          {fmtDuration(seg.startElapsedMs)} –{' '}
+                          {seg.endElapsedMs === null ? '进行中' : fmtDuration(seg.endElapsedMs)}
+                        </span>
+                        <span>{describeCardioParams(c.preset, seg.params)}</span>
+                      </div>
+                    ))}
+                  </>
+                ) : (
+                  <div
+                    data-testid={`history-cardio-edit-${c.id}`}
+                    style={{
+                      marginTop: 8,
+                      paddingTop: 8,
+                      borderTop: '1px dashed var(--rule)',
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: 10,
+                    }}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                      <span style={{ fontSize: 12.5, color: 'var(--ink-3)', width: 56, flex: 'none' }}>
+                        有效时长
+                      </span>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 12, color: 'var(--ink-3)' }}>
+                        <DraftCell
+                          value={curMin}
+                          integer
+                          min={0}
+                          max={1440}
+                          width={74}
+                          unit="分"
+                          ariaLabel={`${c.name} 分钟`}
+                          onValidityChange={(ok) => setCellValid(`cardio:${c.id}:min`, ok)}
+                          onDraftState={(dirty, valid) => setCellRaw(`cardio:${c.id}:min`, dirty, valid)}
+                          onCommit={(v) => {
+                            const nextMin = v ?? 0;
+                            const nextSec = nextMin === 1440 ? 0 : curSec;
+                            updateDraftCardio(c, { durationSec: nextMin * 60 + nextSec });
+                          }}
+                        />
+                      </label>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 12, color: 'var(--ink-3)' }}>
+                        <DraftCell
+                          value={curSec}
+                          integer
+                          min={0}
+                          max={curMin >= 1440 ? 0 : 59}
+                          width={68}
+                          unit="秒"
+                          ariaLabel={`${c.name} 秒`}
+                          onValidityChange={(ok) => setCellValid(`cardio:${c.id}:sec`, ok)}
+                          onDraftState={(dirty, valid) => setCellRaw(`cardio:${c.id}:sec`, dirty, valid)}
+                          onCommit={(v) => {
+                            const nextSec = v ?? 0;
+                            updateDraftCardio(c, { durationSec: curMin * 60 + nextSec });
+                          }}
+                        />
+                      </label>
+                    </div>
+
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                      <span style={{ fontSize: 12.5, color: 'var(--ink-3)', width: 56, flex: 'none' }}>
+                        强度参数
+                      </span>
+                      {c.preset === 'treadmill-incline' ? (
+                        <>
+                          <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 12, color: 'var(--ink-3)' }}>
+                            速度
+                            <DraftCell
+                              value={c.currentParams.speedKmh ?? null}
+                              required
+                              min={MIN_SPEED_KMH}
+                              max={MAX_SPEED_KMH}
+                              width={78}
+                              unit="km/h"
+                              ariaLabel={`${c.name} 速度`}
+                              onValidityChange={(ok) => setCellValid(`cardio:${c.id}:speed`, ok)}
+                              onDraftState={(dirty, valid) => setCellRaw(`cardio:${c.id}:speed`, dirty, valid)}
+                              onCommit={(v) => {
+                                if (v === null) return;
+                                updateDraftCardio(c, { params: { speedKmh: v } });
+                              }}
+                            />
+                          </label>
+                          <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 12, color: 'var(--ink-3)' }}>
+                            坡度
+                            <DraftCell
+                              value={c.currentParams.inclinePct ?? null}
+                              required
+                              min={MIN_INCLINE_PCT}
+                              max={MAX_INCLINE_PCT}
+                              width={74}
+                              unit="%"
+                              ariaLabel={`${c.name} 坡度`}
+                              onValidityChange={(ok) => setCellValid(`cardio:${c.id}:incline`, ok)}
+                              onDraftState={(dirty, valid) => setCellRaw(`cardio:${c.id}:incline`, dirty, valid)}
+                              onCommit={(v) => {
+                                if (v === null) return;
+                                updateDraftCardio(c, { params: { inclinePct: v } });
+                              }}
+                            />
+                          </label>
+                        </>
+                      ) : (
+                        <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 12, color: 'var(--ink-3)' }}>
+                          档位
+                          <DraftCell
+                            value={c.currentParams.level ?? null}
+                            integer
+                            required
+                            min={MIN_STAIR_LEVEL}
+                            max={MAX_STAIR_LEVEL}
+                            width={76}
+                            ariaLabel={`${c.name} 档位`}
+                            onValidityChange={(ok) => setCellValid(`cardio:${c.id}:level`, ok)}
+                            onDraftState={(dirty, valid) => setCellRaw(`cardio:${c.id}:level`, dirty, valid)}
+                            onCommit={(v) => {
+                              if (v === null) return;
+                              updateDraftCardio(c, { params: { level: v } });
+                            }}
+                          />
+                        </label>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </section>
       ) : null}
 
@@ -703,21 +1121,57 @@ export function HistoryDetailPage({ id }: { id: string }) {
 
         {view!.exercises.map((ex) => {
           const validSets = ex.sets.filter(isSetLogged);
+          const achievements = prReport?.bySessionExerciseId.get(ex.id) ?? [];
+          const appendBlocker = editing ? historyAppendGroupBlocker(ex) : null;
           return (
             <div key={ex.id} className="slip" style={{ marginTop: 10, padding: '12px 14px' }}>
               <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 10 }}>
-                <span
-                  style={{
-                    fontFamily: 'var(--f-sans)',
-                    fontSize: 16,
-                    fontWeight: 600,
-                    lineHeight: 1.4,
-                    overflowWrap: 'anywhere',
-                    minWidth: 0,
-                  }}
-                >
-                  {ex.name}
-                </span>
+                <div style={{ minWidth: 0 }}>
+                  <span
+                    style={{
+                      fontFamily: 'var(--f-sans)',
+                      fontSize: 16,
+                      fontWeight: 600,
+                      lineHeight: 1.4,
+                      overflowWrap: 'anywhere',
+                    }}
+                  >
+                    {ex.name}
+                  </span>
+                  {achievements.length > 0 ? (
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 4 }}>
+                      {achievements.map((ach, aIdx) => (
+                        <span
+                          key={`${ach.kind}-${aIdx}`}
+                          data-testid={ach.isPr ? `history-pr-stamp-${ex.id}` : `history-first-stamp-${ex.id}`}
+                          title={ach.detailText}
+                          style={
+                            ach.isPr
+                              ? {
+                                  display: 'inline-block',
+                                  padding: '1px 6px',
+                                  border: '1px solid var(--brick)',
+                                  color: 'var(--brick)',
+                                  fontFamily: 'var(--f-sans)',
+                                  fontSize: 11,
+                                  fontWeight: 700,
+                                }
+                              : {
+                                  display: 'inline-block',
+                                  padding: '1px 6px',
+                                  border: '1px solid var(--rule-strong)',
+                                  color: 'var(--ink-3)',
+                                  fontSize: 11,
+                                }
+                          }
+                        >
+                          {ach.stampLabel}
+                          {ach.isPr ? ` · ${ach.detailText}` : ''}
+                        </span>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
                 {ex.status === 'skipped' ? (
                   <span className="tag tag-quiet" style={{ flex: 'none' }}>跳过</span>
                 ) : validSets.length ? (
@@ -743,94 +1197,133 @@ export function HistoryDetailPage({ id }: { id: string }) {
                   </div>
                 ) : null
               ) : (
-                /* 编辑态：逐组改次数 / 重量 / 完成状态 */
+                /* 编辑态：逐组改次数 / 重量 / 完成状态 + 补录组 / 删除空白组 + 单动作备注 */
                 <div style={{ marginTop: 8 }}>
-                  {ex.sets.map((st) => (
-                    <div
-                      key={st.id}
-                      style={{
-                        display: 'flex',
-                        alignItems: 'center',
-                        gap: 8,
-                        padding: '8px 0',
-                        borderTop: '1px dashed var(--rule)',
-                        flexWrap: 'wrap',
-                      }}
-                    >
-                      <span style={{ fontFamily: 'var(--f-mono)', fontSize: 12, color: 'var(--ink-4)', width: 56, flex: 'none' }}>
-                        {ex.target.kind === 'dropSet' ? `R${st.roundIndex}S${st.stageIndex}` : `第 ${st.roundIndex} 组`}
-                      </span>
-                      <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 12, color: 'var(--ink-3)' }}>
-                        次数
-                        <DraftCell
-                          value={st.reps}
-                          integer
-                          min={0}
-                          max={9999}
-                          width={74}
-                          ariaLabel={`${ex.name} 第 ${st.roundIndex} 轮 阶段 ${st.stageIndex} 次数`}
-                          onValidityChange={(ok) => setCellValid(`${st.id}:reps`, ok)}
-                          onDraftState={(dirty, valid) => setCellRaw(`${st.id}:reps`, dirty, valid)}
-                          onCommit={(v) => updateDraftSet(ex.id, st.id, { reps: v })}
-                        />
-                      </label>
-                      <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 12, color: 'var(--ink-3)' }}>
-                        重量
-                        <DraftCell
-                          value={st.weightKg}
-                          min={0}
-                          max={9999}
-                          width={84}
-                          unit="kg"
-                          ariaLabel={`${ex.name} 第 ${st.roundIndex} 轮 阶段 ${st.stageIndex} 重量`}
-                          onValidityChange={(ok) => setCellValid(`${st.id}:weight`, ok)}
-                          onDraftState={(dirty, valid) => setCellRaw(`${st.id}:weight`, dirty, valid)}
-                          onCommit={(v) => updateDraftSet(ex.id, st.id, { weightKg: v })}
-                        />
-                      </label>
-                      <button
-                        className={`btn btn-sm ${st.status === 'done' ? 'btn-primary' : 'btn-ghost'}`}
-                        style={{ minWidth: 72, minHeight: 44 }}
-                        onClick={() =>
-                          updateDraftSet(ex.id, st.id, {
-                            status: st.status === 'done' ? 'blank' : 'done',
-                          })
-                        }
+                  {ex.sets.map((st) => {
+                    const showRemoveBlank =
+                      st.stageIndex === 1 && canRemoveBlankGroupFromHistoryExercise(ex, st.roundIndex);
+                    return (
+                      <div
+                        key={st.id}
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: 8,
+                          padding: '8px 0',
+                          borderTop: '1px dashed var(--rule)',
+                          flexWrap: 'wrap',
+                        }}
                       >
-                        {st.status === 'done' ? '已完成' : '未完成'}
-                      </button>
+                        <span style={{ fontFamily: 'var(--f-mono)', fontSize: 12, color: 'var(--ink-4)', width: 56, flex: 'none' }}>
+                          {ex.target.kind === 'dropSet' ? `R${st.roundIndex}S${st.stageIndex}` : `第 ${st.roundIndex} 组`}
+                        </span>
+                        <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 12, color: 'var(--ink-3)' }}>
+                          次数
+                          <DraftCell
+                            value={st.reps}
+                            integer
+                            min={0}
+                            max={9999}
+                            width={74}
+                            ariaLabel={`${ex.name} 第 ${st.roundIndex} 轮 阶段 ${st.stageIndex} 次数`}
+                            onValidityChange={(ok) => setCellValid(`${st.id}:reps`, ok)}
+                            onDraftState={(dirty, valid) => setCellRaw(`${st.id}:reps`, dirty, valid)}
+                            onCommit={(v) => updateDraftSet(ex.id, st.id, { reps: v })}
+                          />
+                        </label>
+                        <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 12, color: 'var(--ink-3)' }}>
+                          重量
+                          <DraftCell
+                            value={st.weightKg}
+                            min={0}
+                            max={9999}
+                            width={84}
+                            unit="kg"
+                            ariaLabel={`${ex.name} 第 ${st.roundIndex} 轮 阶段 ${st.stageIndex} 重量`}
+                            onValidityChange={(ok) => setCellValid(`${st.id}:weight`, ok)}
+                            onDraftState={(dirty, valid) => setCellRaw(`${st.id}:weight`, dirty, valid)}
+                            onCommit={(v) => updateDraftSet(ex.id, st.id, { weightKg: v })}
+                          />
+                        </label>
+                        <button
+                          className={`btn btn-sm ${st.status === 'done' ? 'btn-primary' : 'btn-ghost'}`}
+                          style={{ minWidth: 72, minHeight: 44 }}
+                          onClick={() =>
+                            updateDraftSet(ex.id, st.id, {
+                              status: st.status === 'done' ? 'blank' : 'done',
+                            })
+                          }
+                        >
+                          {st.status === 'done' ? '已完成' : '未完成'}
+                        </button>
+                        {showRemoveBlank ? (
+                          <button
+                            type="button"
+                            className="btn btn-ghost btn-sm"
+                            data-testid={`history-remove-blank-group-${ex.id}-${st.roundIndex}`}
+                            style={{ color: 'var(--brick)', minHeight: 38, fontSize: 12 }}
+                            onClick={() => handleRemoveBlankGroup(ex.id, st.roundIndex)}
+                          >
+                            {ex.target.kind === 'dropSet' ? '删空轮' : '删空组'}
+                          </button>
+                        ) : null}
+                      </div>
+                    );
+                  })}
+
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 6, flexWrap: 'wrap' }}>
+                    <button
+                      type="button"
+                      className="btn btn-ghost btn-sm"
+                      data-testid={`history-append-group-${ex.id}`}
+                      disabled={Boolean(appendBlocker)}
+                      title={appendBlocker ?? undefined}
+                      onClick={() => handleAppendBlankGroup(ex.id)}
+                    >
+                      {ex.target.kind === 'dropSet' ? '+ 补录一轮' : '+ 补录一组'}
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-ghost btn-sm"
+                      data-testid={`history-toggle-ex-note-${ex.id}`}
+                      onClick={() =>
+                        setOpenExNotes((prev) => ({ ...prev, [ex.id]: !prev[ex.id] }))
+                      }
+                    >
+                      {openExNotes[ex.id]
+                        ? '收起动作备注'
+                        : ex.note
+                          ? '编辑动作备注'
+                          : '+ 动作备注'}
+                    </button>
+                  </div>
+
+                  {openExNotes[ex.id] ? (
+                    <div style={{ marginTop: 8 }}>
+                      <textarea
+                        className="input"
+                        data-testid={`history-ex-note-${ex.id}`}
+                        aria-label={`${ex.name} 动作备注`}
+                        placeholder={`${ex.name} 的动作备注（可选）`}
+                        value={ex.note ?? ''}
+                        style={{ minHeight: 54, fontSize: 13.5 }}
+                        onChange={(e) => updateDraftExerciseNote(ex.id, e.target.value)}
+                      />
                     </div>
-                  ))}
+                  ) : ex.note ? (
+                    <div style={{ marginTop: 6, fontSize: 13, color: 'var(--ink-3)', fontStyle: 'italic' }}>
+                      {ex.note}
+                    </div>
+                  ) : null}
                 </div>
               )}
 
-              {ex.note ? (
+              {!editing && ex.note ? (
                 <div style={{ marginTop: 6, fontSize: 13, color: 'var(--ink-3)', fontStyle: 'italic' }}>{ex.note}</div>
               ) : null}
             </div>
           );
         })}
-
-        {editing ? (
-          <div style={{ display: 'flex', gap: 8, marginTop: 14 }}>
-            <button
-              className="btn btn-primary"
-              style={{ flex: 1, minHeight: 48 }}
-              disabled={saving || hasCellErrors}
-              onClick={() => void saveDraft()}
-            >
-              {saving ? '保存中…' : hasCellErrors ? '请先修正红框字段' : '保存修改'}
-            </button>
-            <button
-              className="btn btn-ghost"
-              style={{ flex: 1, minHeight: 48 }}
-              disabled={saving}
-              onClick={cancelEditing}
-            >
-              取消
-            </button>
-          </div>
-        ) : null}
       </section>
       )}
 
@@ -851,9 +1344,13 @@ export function HistoryDetailPage({ id }: { id: string }) {
             onChange={(e) => {
               const d = draftRef.current;
               if (!d) return;
-              const next = { ...d, note: e.target.value };
-              draftRef.current = next;
-              setDraft(next);
+              const res = updateHistorySessionNote(d, e.target.value);
+              if (!res.ok) {
+                pushToast(res.message, 'error');
+                return;
+              }
+              draftRef.current = res.session;
+              setDraft(res.session);
             }}
           />
         ) : (
@@ -862,6 +1359,27 @@ export function HistoryDetailPage({ id }: { id: string }) {
           </p>
         )}
       </section>
+
+      {editing && canCorrect ? (
+        <div style={{ display: 'flex', gap: 8, marginTop: 14 }}>
+          <button
+            className="btn btn-primary"
+            style={{ flex: 1, minHeight: 48 }}
+            disabled={saving || hasCellErrors}
+            onClick={() => void saveDraft()}
+          >
+            {saving ? '保存中…' : hasCellErrors ? '请先修正红框字段' : '保存修改'}
+          </button>
+          <button
+            className="btn btn-ghost"
+            style={{ flex: 1, minHeight: 48 }}
+            disabled={saving}
+            onClick={cancelEditing}
+          >
+            取消
+          </button>
+        </div>
+      ) : null}
 
       <div style={{ marginTop: 20, display: 'flex', gap: 8 }}>
         <button className="btn btn-ghost" style={{ flex: 1 }} onClick={() => requestLeaveNav('/stats')}>
@@ -983,6 +1501,16 @@ export function HistoryDetailPage({ id }: { id: string }) {
           }
         }}
       />
+
+      {canCorrect ? (
+        <ReceiptSlipSheet
+          open={receiptOpen}
+          session={view!}
+          allSessions={sessions}
+          onClose={() => setReceiptOpen(false)}
+          pushToast={pushToast}
+        />
+      ) : null}
     </main>
   );
 }

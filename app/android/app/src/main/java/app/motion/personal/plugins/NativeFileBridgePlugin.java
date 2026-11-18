@@ -5,6 +5,7 @@ import android.content.ContentResolver;
 import android.content.Intent;
 import android.net.Uri;
 import android.os.Bundle;
+import android.util.Base64;
 
 import androidx.activity.result.ActivityResult;
 
@@ -403,6 +404,97 @@ public class NativeFileBridgePlugin extends Plugin {
             startActivityForResult(call, intent, "exportJsonResult");
         } catch (Exception e) {
             // 启动失败：清暂存并放行
+            spool().discard(token);
+            releaseOperation();
+            call.setKeepAlive(false);
+            call.reject("无法打开系统保存界面：" + BackupIo.describe(e), "SAF_LAUNCH_FAILED", e);
+        }
+    }
+
+    /**
+     * Wave 3D.2：导出本地生成的 PNG 小票图片（SAF 创建文档 + 暂存防大 Bundle + 写入回读 SHA-256 校验）。
+     * 零网络请求、零额外存储权限。
+     */
+    @PluginMethod
+    public void exportPng(PluginCall call) {
+        String filename = call.getString(OPT_FILENAME);
+        String base64 = call.getString("base64");
+
+        if (filename == null || filename.trim().isEmpty()) {
+            call.reject("缺少文件名", "MISSING_FILENAME");
+            return;
+        }
+        if (base64 == null || base64.trim().isEmpty()) {
+            call.reject("缺少要写入的图片数据", "MISSING_CONTENT");
+            return;
+        }
+
+        final String requestId = newRequestId();
+        synchronized (this) {
+            if (!OP_NONE.equals(pendingOp)) {
+                call.reject("正在处理另一个文件操作，请稍后再试", "OPERATION_IN_PROGRESS");
+                return;
+            }
+            pendingOp = OP_EXPORT;
+            pendingPhase = PHASE_WAITING;
+            pendingRequestId = requestId;
+        }
+
+        final byte[] originalBytes;
+        try {
+            int commaIdx = base64.indexOf(',');
+            String payload = commaIdx >= 0 ? base64.substring(commaIdx + 1) : base64;
+            originalBytes = Base64.decode(payload, Base64.DEFAULT);
+        } catch (Exception e) {
+            releaseOperation();
+            call.reject("图片数据解码失败：" + BackupIo.describe(e), "ENCODE_FAILED", e);
+            return;
+        }
+
+        // 校验非空且具备标准 PNG 文件头（89 50 4E 47 0D 0A 1A 0A）
+        if (originalBytes == null
+                || originalBytes.length < 8
+                || (originalBytes[0] & 0xFF) != 0x89
+                || originalBytes[1] != 0x50
+                || originalBytes[2] != 0x4E
+                || originalBytes[3] != 0x47) {
+            releaseOperation();
+            call.reject("生成的图片格式不完整，已取消保存", "INVALID_PNG");
+            return;
+        }
+
+        final String token;
+        try {
+            token = spool().stageBytes(originalBytes);
+        } catch (Exception e) {
+            releaseOperation();
+            call.reject("准备导出图片失败：" + BackupIo.describe(e), "SPOOL_FAILED", e);
+            return;
+        }
+
+        final int stagedBytes = originalBytes.length;
+        final String stagedSha = BackupIo.sha256Hex(originalBytes);
+
+        // 关键：从 PluginCall options 中移除 Base64 大串，避免 Activity stopped 时触发 TransactionTooLargeException
+        call.getData().remove("base64");
+        call.getData().put(OPT_TOKEN, token);
+        call.getData().put(OPT_FILENAME, filename);
+        call.getData().put(OPT_REQUEST_ID, requestId);
+        call.getData().put(OPT_STAGED_BYTES, stagedBytes);
+        call.getData().put(OPT_STAGED_SHA, stagedSha);
+        pendingToken = token;
+        spool().markPending(token);
+
+        call.setKeepAlive(true);
+
+        Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("image/png");
+        intent.putExtra(Intent.EXTRA_TITLE, filename);
+
+        try {
+            startActivityForResult(call, intent, "exportJsonResult");
+        } catch (Exception e) {
             spool().discard(token);
             releaseOperation();
             call.setKeepAlive(false);

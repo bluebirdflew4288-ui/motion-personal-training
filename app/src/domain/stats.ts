@@ -4,18 +4,27 @@
    · 计划未完成的组不算已完成组
    · 递减组按大组计数
    · 部分完成的大组单独统计，不伪装成完整组
+   · 纯有氧场次不稀释力量「平均组数/次」，有氧场次与时长独立呈现（Wave 2B.1）
+   · 周频连续推算 8 个自然 ISO 周并为空缺周补 0（Wave 2B.2）
    · 删除/纠正记录后重算，不做增量累加
-   · 不跨动作/跨重量合成力量分数 */
+   · 不跨动作/跨重量合成力量分数；辅助重量按「越小越强」单独计算最佳值（Wave 2B.3） */
 
 import type { DumbbellBasis, Session, WeightMode } from './types';
 import { summarizeSession } from './session';
 import { sessionKindOf } from './sessionKind';
 import { isoWeekKey } from '../lib/format';
-import { comparabilityLabel } from './identity';
+import { comparabilityLabel, exerciseIdFromName, normalizeExerciseName } from './identity';
 import { collectMovementFragments, type MovementFragment } from './comparability';
+import { EXERCISE_LIBRARY, type LibraryEntry } from './presets/library';
+import { matchesPinyinInitials } from './pinyinInitials';
+
+export const OVERVIEW_WEEK_SPAN = 8;
 
 export interface Overview {
   totalSessions: number;
+  strengthSessions: number;
+  cardioSessions: number;
+  totalCardioMs: number;
   totalSets: number;
   totalMs: number;
   avgDurationMs: number;
@@ -26,10 +35,46 @@ export interface Overview {
   lastSessionAt: number | null;
 }
 
-export function buildOverview(sessions: Session[]): Overview {
+/** 以锚点时间所在周的周一为终点，向前生成连续 N 个自然 ISO 周（无记录周补 0，跨年与夏令时安全） */
+export function buildConsecutiveIsoWeeks(
+  anchorTs: number,
+  weekMap: ReadonlyMap<string, { count: number; sets: number }>,
+  span = OVERVIEW_WEEK_SPAN,
+): Array<{ key: string; label: string; count: number; sets: number }> {
+  const anchor = new Date(anchorTs);
+  const monday = new Date(anchor.getFullYear(), anchor.getMonth(), anchor.getDate(), 12, 0, 0, 0);
+  const dayOffset = (monday.getDay() + 6) % 7; // 周一 = 0
+  monday.setDate(monday.getDate() - dayOffset);
+
+  const out: Array<{ key: string; label: string; count: number; sets: number }> = [];
+  for (let back = span - 1; back >= 0; back--) {
+    const d = new Date(
+      monday.getFullYear(),
+      monday.getMonth(),
+      monday.getDate() - back * 7,
+      12,
+      0,
+      0,
+      0,
+    );
+    const key = isoWeekKey(d.getTime());
+    const hit = weekMap.get(key);
+    const wkPart = key.split('-W')[1];
+    out.push({
+      key,
+      label: wkPart ? `W${wkPart}` : key,
+      count: hit?.count ?? 0,
+      sets: hit?.sets ?? 0,
+    });
+  }
+  return out;
+}
+
+export function buildOverview(sessions: Session[], referenceNow?: number): Overview {
   /**
    * 分母：已结束且**不是完全休息**的记录。
    * 完全休息不计入训练次数/周次/日类型/首次最近/平均时长/平均组数。
+   * Wave 2B.1：纯有氧场次计入总场次与有氧统计，但不计入力量 `avgSetsPerSession` 分母。
    */
   const done = sessions.filter(
     (s) => s.status === 'completed' && s.endedAt && sessionKindOf(s) !== 'rest',
@@ -38,11 +83,28 @@ export function buildOverview(sessions: Session[]): Overview {
   const dayMap = new Map<string, { count: number; sets: number }>();
   let totalSets = 0;
   let totalMs = 0;
+  let totalCardioMs = 0;
+  let strengthSessions = 0;
+  let cardioSessions = 0;
 
   for (const s of done) {
+    const kind = sessionKindOf(s);
     const sum = summarizeSession(s, s.endedAt ?? Date.now());
     totalSets += sum.completedSets;
     totalMs += sum.durationMs;
+    totalCardioMs += sum.cardioMs;
+
+    if (kind !== 'cardio' && s.exercises.length > 0) {
+      strengthSessions += 1;
+    }
+    if (
+      kind === 'cardio' ||
+      sum.cardioMs > 0 ||
+      (s.cardio ?? []).some((c) => c.status === 'done' || c.segments.length > 0)
+    ) {
+      cardioSessions += 1;
+    }
+
     const wk = isoWeekKey(s.startedAt);
     const w = weekMap.get(wk) ?? { count: 0, sets: 0 };
     w.count += 1;
@@ -56,23 +118,32 @@ export function buildOverview(sessions: Session[]): Overview {
     dayMap.set(name, d);
   }
 
-  const weeks = [...weekMap.entries()]
-    .sort((a, b) => (a[0] < b[0] ? 1 : -1))
-    .slice(0, 8)
-    .map(([key, v]) => ({ key, label: key.split('-W')[1] ? `W${key.split('-W')[1]}` : key, ...v }));
-
   const sorted = [...done].sort((a, b) => a.startedAt - b.startedAt);
+  const latestAt = sorted.at(-1)?.startedAt ?? null;
+  const weeks =
+    latestAt === null
+      ? []
+      : buildConsecutiveIsoWeeks(
+          referenceNow !== undefined && Number.isFinite(referenceNow)
+            ? Math.max(latestAt, referenceNow)
+            : latestAt,
+          weekMap,
+          OVERVIEW_WEEK_SPAN,
+        );
 
   return {
     totalSessions: done.length,
+    strengthSessions,
+    cardioSessions,
+    totalCardioMs,
     totalSets,
     totalMs,
     avgDurationMs: done.length ? Math.round(totalMs / done.length) : 0,
-    avgSetsPerSession: done.length ? Math.round((totalSets / done.length) * 10) / 10 : 0,
-    weeks: weeks.reverse(),
+    avgSetsPerSession: strengthSessions ? Math.round((totalSets / strengthSessions) * 10) / 10 : 0,
+    weeks,
     byDayName: [...dayMap.entries()].map(([name, v]) => ({ name, ...v })).sort((a, b) => b.count - a.count),
     firstSessionAt: sorted[0]?.startedAt ?? null,
-    lastSessionAt: sorted.at(-1)?.startedAt ?? null,
+    lastSessionAt: latestAt,
   };
 }
 
@@ -105,8 +176,12 @@ export interface ExerciseHistoryEntry {
   partialGroups: number;
   /** 已记录阶段行数（真实记录量，不是 完整大组 × 阶段数） */
   loggedStages: number;
-  /** 最大重量（只在该动作确实记录重量时才有意义） */
+  /** 数值最大重量（兼容旧调用方） */
   maxWeightKg: number | null;
+  /** 按口径语义的最佳重量（assisted 为最小辅助重量，其余为最大重量） */
+  bestWeightKg: number | null;
+  /** 单组最多次数 */
+  bestReps: number;
   totalReps: number;
 }
 
@@ -115,6 +190,7 @@ export interface ExerciseHistory {
   name: string;
   entries: ExerciseHistoryEntry[];
   maxWeightKg: number | null;
+  bestWeightKg: number | null;
   bestReps: number;
   /** 本次展示所用的计量口径说明（V3-05：口径必须可见） */
   label: string | null;
@@ -124,9 +200,6 @@ export interface ExerciseHistory {
 
 /**
  * 把查询用的 key 解析成数据里真实的动作身份。
- * 旧调用方可能传动作名称（v1 时代的历史没有 exerciseId），
- * 而 `collectMovementFragments` 按 exerciseId 匹配 —— 这里做一次解析，
- * 保证「按名称查」与「按身份查」命中同一批记录。
  */
 function resolveHistoryKey(done: Session[], key: string): string {
   for (const s of done) {
@@ -141,16 +214,15 @@ function resolveHistoryKey(done: Session[], key: string): string {
 
 /**
  * 单个动作跨次表现（V3-05：必须按计量口径筛选）。
- * key 用动作身份 exerciseId；`mode` 用于把「负重 +20kg」和「辅助 70kg」分开。
- * 不传 mode 时由调用方决定口径；直接调用本函数且有多种口径时，
- * 只会返回与**最近一次记录**同口径的数据，避免把不同语义的重量算成一条曲线。
  */
 export function buildExerciseHistory(
   sessions: Session[],
   key: string,
   mode?: { weightMode: WeightMode; dumbbellBasis: DumbbellBasis },
 ): ExerciseHistory | null {
-  const done = sessions.filter((s) => s.status === 'completed' && s.endedAt).sort((a, b) => a.startedAt - b.startedAt);
+  const done = sessions
+    .filter((s) => s.status === 'completed' && s.endedAt)
+    .sort((a, b) => a.startedAt - b.startedAt);
   const entries: ExerciseHistoryEntry[] = [];
   let name = '';
 
@@ -170,31 +242,32 @@ export function buildExerciseHistory(
       }
     }
   }
-  // 整个历史里没有这个动作的任何实际记录：没有口径可用，也就没有历史
   if (!chosen) return null;
 
-  // 兼容旧调用方：key 可能是 exerciseId，也可能是动作名称。
-  // collectMovementFragments 只认 exerciseId，这里先解析成数据里真实的身份，
-  // 避免「按名称查询」在有 exerciseId 的新数据上查不到任何东西。
   const identity = resolveHistoryKey(done, key);
+  const isAssisted = chosen.weightMode === 'assisted';
 
   for (const s of done) {
-    // V4-04 A：一次训练 = 一条 entry。
-    // 同动作中途转成递减组会在 session 里留下多个同 exerciseId + 同口径的片段，
-    // 旧实现按片段各推一条 entry（一次训练被算成两次，组数/阶段数被拆散）。
-    // V3-05 保留：跨计量口径仍然分开（口径不同就不进这条历史）。
     const perf = collectMovementFragments(s, identity, chosen);
     if (!perf) continue;
     name = name || perf.name;
     const dropFragments = perf.fragments.filter((f) => f.kind === 'dropSet');
+    const flatSets = perf.fragments.flatMap((f) => f.sets);
+    const entryWeights = flatSets
+      .map((st) => st.weightKg)
+      .filter((w): w is number => typeof w === 'number' && Number.isFinite(w));
+    const entryBestWeight = entryWeights.length
+      ? isAssisted
+        ? Math.min(...entryWeights)
+        : Math.max(...entryWeights)
+      : null;
+    const entryBestReps = flatSets.length ? Math.max(...flatSets.map((st) => st.reps ?? 0)) : 0;
+
     entries.push({
       sessionId: s.id,
       at: s.startedAt,
       dayName: s.day.dayName,
-      // V3-05：保留轮/阶段归属，历史与统计不会把扁平阶段误称普通组
-      // V4-04：多片段的记录行全部聚合（每行仍带自己的 roundIndex/stageIndex）
-      sets: perf.fragments.flatMap((f) => f.sets),
-      // 本次有递减片段时按「大组」措辞
+      sets: flatSets,
       targetKind: dropFragments.length ? 'dropSet' : 'straight',
       stageCount: dropFragments.length ? Math.max(1, ...dropFragments.map((f) => f.stageCount)) : 1,
       fragments: perf.fragments,
@@ -203,17 +276,25 @@ export function buildExerciseHistory(
       partialGroups: perf.partialGroups,
       loggedStages: perf.loggedStages,
       maxWeightKg: perf.maxWeightKg,
+      bestWeightKg: entryBestWeight,
+      bestReps: entryBestReps,
       totalReps: perf.totalReps,
     });
   }
   if (!entries.length) return null;
-  const allWeights = entries.map((e) => e.maxWeightKg).filter((w): w is number => w !== null);
-  const bestReps = Math.max(...entries.map((e) => Math.max(...e.sets.map((s) => s.reps ?? 0))));
+  const allMaxWeights = entries.map((e) => e.maxWeightKg).filter((w): w is number => w !== null);
+  const allBestWeights = entries.map((e) => e.bestWeightKg).filter((w): w is number => w !== null);
+  const bestReps = Math.max(...entries.map((e) => e.bestReps));
   return {
     key,
     name,
     entries,
-    maxWeightKg: allWeights.length ? Math.max(...allWeights) : null,
+    maxWeightKg: allMaxWeights.length ? Math.max(...allMaxWeights) : null,
+    bestWeightKg: allBestWeights.length
+      ? isAssisted
+        ? Math.min(...allBestWeights)
+        : Math.max(...allBestWeights)
+      : null,
     bestReps,
     label: chosen
       ? (comparabilityLabel({
@@ -227,12 +308,23 @@ export function buildExerciseHistory(
   };
 }
 
-export function listTrainedExercises(sessions: Session[]): Array<{ key: string; name: string; count: number }> {
+export interface TrainedExerciseItem {
+  key: string;
+  name: string;
+  count: number;
+  group?: LibraryEntry['group'];
+  aliases?: string[];
+  en?: string;
+}
+
+const LIBRARY_BY_ID = new Map<string, LibraryEntry>(
+  EXERCISE_LIBRARY.map((item) => [exerciseIdFromName(item.name), item]),
+);
+
+export function listTrainedExercises(sessions: Session[]): TrainedExerciseItem[] {
   const map = new Map<string, { name: string; count: number }>();
   for (const s of sessions) {
     if (s.status !== 'completed') continue;
-    // V4-04 A：同一次训练里同动作可能有多条片段（中途转递减组），
-    // 但「练过多少次」必须按训练计，不能按片段计。
     const seen = new Set<string>();
     for (const ex of s.exercises) {
       if (!ex.sets.some((st) => st.status === 'done')) continue;
@@ -244,5 +336,44 @@ export function listTrainedExercises(sessions: Session[]): Array<{ key: string; 
       map.set(key, cur);
     }
   }
-  return [...map.entries()].map(([key, v]) => ({ key, ...v })).sort((a, b) => b.count - a.count);
+  return [...map.entries()]
+    .map(([key, v]) => {
+      const meta = LIBRARY_BY_ID.get(key) ?? LIBRARY_BY_ID.get(exerciseIdFromName(v.name));
+      return {
+        key,
+        ...v,
+        ...(meta?.group ? { group: meta.group } : {}),
+        ...(meta?.aliases?.length ? { aliases: meta.aliases } : {}),
+        ...(meta?.en ? { en: meta.en } : {}),
+      };
+    })
+    .sort((a, b) => b.count - a.count);
+}
+
+/** 按部位与关键字 / 拼音首字母 / 别名过滤已训练动作列表（Wave 2B.3） */
+export function filterTrainedExercises(
+  items: readonly TrainedExerciseItem[],
+  opts: { group?: string; query?: string },
+): TrainedExerciseItem[] {
+  const groupFilter = opts.group && opts.group !== 'all' ? opts.group : null;
+  const rawQuery = (opts.query ?? '').trim();
+  const normQuery = rawQuery ? normalizeExerciseName(rawQuery) : '';
+  const lowerQuery = rawQuery.toLowerCase();
+
+  return items.filter((item) => {
+    if (groupFilter && (item.group ?? '其他') !== groupFilter) return false;
+    if (!rawQuery) return true;
+    if (normalizeExerciseName(item.name).includes(normQuery)) return true;
+    if (item.en && item.en.toLowerCase().includes(lowerQuery)) return true;
+    if (item.group && item.group.includes(rawQuery)) return true;
+    if (matchesPinyinInitials(item.name, rawQuery)) return true;
+    if (
+      item.aliases?.some(
+        (alias) => normalizeExerciseName(alias).includes(normQuery) || matchesPinyinInitials(alias, rawQuery),
+      )
+    ) {
+      return true;
+    }
+    return false;
+  });
 }

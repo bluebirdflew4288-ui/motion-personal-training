@@ -73,6 +73,27 @@ public class RestReminderPlugin extends Plugin {
     @Override
     public void load() {
         ensureChannel();
+        RestReminderStore.setUserCancelListener((cancelledToken, cancelledGen) -> {
+            if (getBridge() == null) return;
+            getBridge().executeOnMainThread(() -> {
+                try {
+                    JSObject ev = new JSObject();
+                    ev.put("token", cancelledToken);
+                    ev.put("generation", cancelledGen);
+                    notifyListeners("userCancelled", ev);
+                    if (getBridge().getWebView() != null) {
+                        String safeTok = org.json.JSONObject.quote(cancelledToken);
+                        getBridge().getWebView().evaluateJavascript(
+                            "try{window.dispatchEvent(new CustomEvent('motion:rest-user-cancelled',{detail:{token:"
+                                + safeTok + ",generation:" + cancelledGen + "}}));}catch(e){}",
+                            null
+                        );
+                    }
+                } catch (Exception ignored) {
+                    // 唤醒通知失败不影响持久化状态，前台对账仍可由 inspectIdentity 兜底
+                }
+            });
+        });
     }
 
     /**
@@ -318,6 +339,38 @@ public class RestReminderPlugin extends Plugin {
          * 只新增字段，不改任何既有字段语义。
          */
         ret.put("lastIntentId", cur.lastIntentId);
+        call.resolve(ret);
+    }
+
+    /**
+     * Wave 1B.2：按身份查询持久化提醒状态（用于下拉通知栏点「取消」后返回前台对账）。
+     *
+     * <p>返回 {@code status}: {@code active | fired | cancelled_by_user | cancelled | unknown}。
+     */
+    @PluginMethod
+    public void inspectIdentity(PluginCall call) {
+        String token = call.getData() != null
+            ? RestArgs.tokenOrNull(call.getData().opt("token")) : null;
+        Object rawGen = call.getData() != null ? call.getData().opt("generation") : null;
+        if (org.json.JSONObject.NULL.equals(rawGen)) {
+            rawGen = null;
+        }
+        Long gen = RestCallArgs.parseGeneration(rawGen);
+        boolean hasGen = gen != null;
+        RestReminderState.Snapshot cur = RestReminderStore.read(getContext());
+        String status = RestReminderState.inspectIdentity(
+            cur,
+            token,
+            hasGen ? gen : -1L,
+            hasGen
+        );
+        JSObject ret = new JSObject();
+        ret.put("status", status);
+        ret.put("token", cur.token);
+        ret.put("generation", cur.generation);
+        ret.put("fired", cur.fired);
+        ret.put("lastUserCancelledToken", cur.lastUserCancelledToken);
+        ret.put("lastUserCancelledGeneration", cur.lastUserCancelledGeneration);
         call.resolve(ret);
     }
 
@@ -1171,6 +1224,7 @@ public class RestReminderPlugin extends Plugin {
     @Override
     protected void handleOnDestroy() {
         activityResumed = false;
+        RestReminderStore.setUserCancelListener(null);
         super.handleOnDestroy();
     }
 

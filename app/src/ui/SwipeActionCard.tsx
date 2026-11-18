@@ -16,9 +16,11 @@ import {
   LONG_PRESS_MS,
   SWIPE_ACTION_WIDTH,
   SWIPE_JITTER_TOLERANCE,
+  SWIPE_LEFT_EDGE_ZONE_PX,
   SWIPE_PROMPT_BLANK,
   SWIPE_PROMPT_CONFIRM,
   SWIPE_READY_HOLD_MS,
+  SWIPE_READY_TRIGGER_RATIO,
   SWIPE_SETTLE_MS,
   SWIPE_VERTICAL_INTENT_THRESHOLD,
   decideAxis,
@@ -50,7 +52,7 @@ interface Props {
   reorderIndex?: number;
   reorderIds?: string[];
   drag?: CardDragSnapshot | null;
-  onReorderCommit?: (orderedIds: string[], startIds: string[] | null) => void;
+  onReorderCommit?: (orderedIds: string[], startIds: string[] | null) => void | Promise<unknown>;
   deleteRequiresConfirm?: boolean | (() => boolean);
   actionWidth?: number;
 }
@@ -214,7 +216,12 @@ export function SwipeActionCard({
   /** 注册到页面级协调器（共享单一多触点与生命周期取消监听） */
   useEffect(() => registerGestureCancel(cancelPointerGesture), [cancelPointerGesture]);
 
-  /** P1/P2-02：左滑追踪期间若指针移动到卡片外部后释放，立即解除 F09 并清理手势 */
+  /**
+   * 0.1.18 F09 真机修复：
+   * 页面左右存在 16px 边距，用户把卡片左滑到屏幕最左边缘松手时，手指 x < 16px 落在 rootRef 左侧外部。
+   * · 若手指是纵向滑出卡片上下边界释放 → 视为取消手势，不触发删除；
+   * · 若手指仍在卡片纵向带内而在屏幕左边缘外侧释放（且未走元素级 pointerCapture）→ 正常结算 F09 松手删除！
+   */
   useEffect(() => {
     if (phase !== 'tracking') return undefined;
     const onGlobalUp = (ev: Event) => {
@@ -222,22 +229,51 @@ export function SwipeActionCard({
       if (!cur) return;
       if (ev instanceof PointerEvent && ev.pointerId !== cur.pointerId) return;
       const el = rootRef.current;
-      const isInside = Boolean(el && ev.target instanceof Node && el.contains(ev.target));
-      if (!isInside) {
+      if (!el) return;
+      const isInsideDom = Boolean(ev.target instanceof Node && el.contains(ev.target));
+      if (isInsideDom) return;
+
+      const rect = el.getBoundingClientRect();
+      let clientY: number | null = null;
+      if (ev instanceof PointerEvent || ev instanceof MouseEvent) {
+        clientY = ev.clientY;
+      } else if ('changedTouches' in ev) {
+        const touches = (ev as TouchEvent).changedTouches;
+        if (touches && touches.length > 0) clientY = touches[0].clientY;
+      }
+
+      const verticallyOut =
+        clientY !== null && (clientY < rect.top - 28 || clientY > rect.bottom + 28);
+      if (verticallyOut) {
         cur.f09Aborted = true;
         disarmF09();
         cancelPointerGesture();
+        return;
       }
+
+      if (readyToDeleteRef.current && !cur.f09Aborted) {
+        gestureSeqRef.current += 1;
+        sessionRef.current = null;
+        clearPress();
+        disarmF09();
+        setPhase('idle');
+        if (ownsOpen()) cardOpenStore.set(null);
+        setOffset(0);
+        onDelete?.();
+        return;
+      }
+
+      cancelPointerGesture();
     };
-    window.addEventListener('pointerup', onGlobalUp, true);
-    window.addEventListener('mouseup', onGlobalUp, true);
-    window.addEventListener('touchend', onGlobalUp, true);
+    window.addEventListener('pointerup', onGlobalUp, false);
+    window.addEventListener('mouseup', onGlobalUp, false);
+    window.addEventListener('touchend', onGlobalUp, false);
     return () => {
-      window.removeEventListener('pointerup', onGlobalUp, true);
-      window.removeEventListener('mouseup', onGlobalUp, true);
-      window.removeEventListener('touchend', onGlobalUp, true);
+      window.removeEventListener('pointerup', onGlobalUp, false);
+      window.removeEventListener('mouseup', onGlobalUp, false);
+      window.removeEventListener('touchend', onGlobalUp, false);
     };
-  }, [phase, disarmF09, cancelPointerGesture]);
+  }, [phase, disarmF09, cancelPointerGesture, clearPress, ownsOpen, setOffset, onDelete]);
 
   /** F06/F12：只读或记录展开时立即取消手势、收起左滑且不提交排序 */
   useEffect(() => {
@@ -294,11 +330,13 @@ export function SwipeActionCard({
     sessionRef.current = null;
     gestureSeqRef.current += 1;
     setPhase('idle');
-    const { ordered, commit, startIds } = cardDrag.end();
-    if (ordered && commit) {
-      startIdsRef.current = startIds;
-      commit(ordered);
-    }
+    cardDrag.finishDrag(({ ordered, commit, startIds }) => {
+      if (ordered && commit) {
+        startIdsRef.current = startIds;
+        return commit(ordered);
+      }
+      return undefined;
+    });
   };
 
   const beginDrag = (pointerY: number, ownerPointerId: number, ownerSeq: number) => {
@@ -547,6 +585,11 @@ export function SwipeActionCard({
               }
               return;
             }
+            try {
+              e.currentTarget.setPointerCapture?.(e.pointerId);
+            } catch {
+              /* 合成测试事件无活动硬件指针时安全忽略 */
+            }
           }
           if (cur.axis !== 'horizontal') {
             disarmF09();
@@ -561,7 +604,7 @@ export function SwipeActionCard({
           const el = rootRef.current;
           if (el) {
             const rect = el.getBoundingClientRect();
-            if (e.clientY < rect.top - 8 || e.clientY > rect.bottom + 8) {
+            if (e.clientY < rect.top - 24 || e.clientY > rect.bottom + 24) {
               cur.f09Aborted = true;
               disarmF09();
             }
@@ -573,13 +616,28 @@ export function SwipeActionCard({
           }
           if (cur.dxAnchor === null) cur.dxAnchor = dx;
           const targetOffset = cur.base + (dx - cur.dxAnchor);
-          setOffset(clampOffset(targetOffset, ACTION_WIDTH));
+          const visualOffset = readyToDeleteRef.current
+            ? -ACTION_WIDTH
+            : clampOffset(targetOffset, ACTION_WIDTH);
+          setOffset(visualOffset);
 
-          const isAtMax = targetOffset <= -ACTION_WIDTH + SWIPE_JITTER_TOLERANCE;
-          if (isAtMax && !cur.f09Aborted) {
+          const triggerThreshold = -ACTION_WIDTH * SWIPE_READY_TRIGGER_RATIO + SWIPE_JITTER_TOLERANCE;
+          const reachedLeftScreenEdge =
+            e.clientX <= SWIPE_LEFT_EDGE_ZONE_PX && targetOffset <= -ACTION_WIDTH * 0.52;
+          const isAtReadyZone = targetOffset <= triggerThreshold || reachedLeftScreenEdge;
+          const pulledBackToCancel =
+            readyToDeleteRef.current &&
+            targetOffset > -ACTION_WIDTH * 0.55 &&
+            e.clientX > SWIPE_LEFT_EDGE_ZONE_PX + 16;
+
+          if (pulledBackToCancel || cur.f09Aborted) {
+            clearHoldTimer();
+            setReadyToDelete(false);
+          } else if (isAtReadyZone) {
             if (holdTimerRef.current === null && !readyToDeleteRef.current) {
               holdTimerRef.current = window.setTimeout(() => {
                 holdTimerRef.current = null;
+                setOffset(-ACTION_WIDTH);
                 setReadyToDelete(true);
                 if (!hapticFiredRef.current) {
                   hapticFiredRef.current = true;
@@ -587,9 +645,8 @@ export function SwipeActionCard({
                 }
               }, SWIPE_READY_HOLD_MS);
             }
-          } else {
+          } else if (!readyToDeleteRef.current) {
             clearHoldTimer();
-            setReadyToDelete(false);
           }
         }}
         onPointerUp={(e) => {
@@ -664,9 +721,10 @@ export function SwipeActionCard({
         onPointerLeave={(e) => {
           const cur = sessionRef.current;
           if (!cur || e.pointerId !== cur.pointerId) return;
-          clearPress();
-          cur.f09Aborted = true;
-          disarmF09();
+          // 仅在尚未进入横滑时清除长按计时；横滑期间手指滑出左边缘属于正常「滑到屏幕边缘」动作，绝不中断 F09！
+          if (cur.axis === 'undecided') {
+            clearPress();
+          }
         }}
         onContextMenu={(e) => {
           if (isInteractive(e.target)) return;

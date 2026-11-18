@@ -33,7 +33,7 @@ import * as merge from '../src/domain/draftMerge';
 import { createV32Plan } from '../src/domain/presets/v32';
 import type { Session } from '../src/domain/types';
 
-const SESSION_FILE = resolve(process.cwd(), 'src/pages/Session.tsx');
+const SESSION_FILE = resolve(process.cwd(), 'src/pages/session/useSessionPersistence.ts');
 const SOURCE = readFileSync(SESSION_FILE, 'utf8');
 const AST = ts.createSourceFile(SESSION_FILE, SOURCE, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
 

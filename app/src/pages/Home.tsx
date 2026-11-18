@@ -2,9 +2,11 @@
    日期来自设备真实时间；训练日与日历解耦，不会因为隔天自动推进。
    G4：贴纸改为「每个具体 PlanDay 一张」，身份 = planId + day.id。 */
 
-import { useMemo, useState } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import { useStore } from '../store';
 import { navigate } from '../lib/router';
+import { coordinateBackupExport } from '../lib/backupCoordinator';
+import { evaluateBackupNudge } from '../domain/backupNudge';
 import { fmtDate, fmtRelativeDay, fmtWeekday } from '../lib/format';
 import {
   StickerPicker,
@@ -45,6 +47,8 @@ export function Home() {
     setCurrentPlan,
     pushToast,
     sessions,
+    historyHydrated,
+    patchSettings,
     refreshSessions,
     refreshPlans,
   } = useStore();
@@ -64,6 +68,38 @@ export function Home() {
   /** 冲突处理中（避免重复点击）+ 被另一标签页持锁时的明确提示 */
   const [conflictBusy, setConflictBusy] = useState(false);
   const [conflictLockedBy, setConflictLockedBy] = useState<string | null>(null);
+  const [backupExporting, setBackupExporting] = useState(false);
+  const backupExportingRef = useRef(false);
+
+  const backupNudge = useMemo(
+    () => (historyHydrated ? evaluateBackupNudge(sessions, settings) : null),
+    [historyHydrated, sessions, settings],
+  );
+
+  async function handleQuickBackupExport() {
+    if (backupExportingRef.current) return;
+    backupExportingRef.current = true;
+    setBackupExporting(true);
+    try {
+      await coordinateBackupExport({
+        patchSettings,
+        pushToast,
+      });
+    } catch (err) {
+      pushToast(`导出失败：${err instanceof Error ? err.message : '未知原因'}`, 'error');
+    } finally {
+      backupExportingRef.current = false;
+      setBackupExporting(false);
+    }
+  }
+
+  async function handleSnoozeBackupNudge() {
+    try {
+      await patchSettings({ lastBackupPromptAt: Date.now() });
+    } catch (err) {
+      pushToast(err instanceof Error ? `未能保存提醒设置：${err.message}` : '未能保存提醒设置', 'error');
+    }
+  }
 
   const plan = useMemo(() => {
     const byId = settings.currentPlanId ? plans.find((p) => p.id === settings.currentPlanId) : undefined;
@@ -403,6 +439,51 @@ export function Home() {
           </div>
         </div>
       </section>
+
+      {/* ── 本地备份温和提醒条（Wave 2D：零 Schema 改动，取消保存绝不误写 lastExportAt） ── */}
+      {backupNudge?.shouldShow ? (
+        <section style={{ marginTop: 12 }} data-testid="backup-nudge-banner">
+          <div
+            className="slip"
+            style={{
+              padding: '10px 12px',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: 10,
+              flexWrap: 'wrap',
+              background: 'var(--paper-2)',
+              borderLeft: '3px solid var(--ink-2)',
+            }}
+          >
+            <div style={{ flex: '1 1 200px', fontSize: 13, color: 'var(--ink-2)', lineHeight: 1.5 }}>
+              {backupNudge.reason === 'never-exported'
+                ? `本地已有 ${backupNudge.unbackedCount} 次训练尚未导出备份`
+                : `距上次备份已超 14 天，新增 ${backupNudge.unbackedCount} 次训练尚未导出备份`}
+            </div>
+            <div style={{ display: 'flex', gap: 6, flex: 'none' }}>
+              <button
+                type="button"
+                className="btn btn-sm btn-primary"
+                data-testid="backup-nudge-export"
+                disabled={backupExporting}
+                onClick={() => void handleQuickBackupExport()}
+              >
+                {backupExporting ? '导出中…' : '立即导出'}
+              </button>
+              <button
+                type="button"
+                className="btn btn-sm btn-ghost"
+                data-testid="backup-nudge-snooze"
+                disabled={backupExporting}
+                onClick={() => void handleSnoozeBackupNudge()}
+              >
+                稍后
+              </button>
+            </div>
+          </div>
+        </section>
+      ) : null}
 
       {/* ── 继续未结束训练 ───────────── */}
       {activeSession ? (

@@ -880,6 +880,54 @@ export function withSet(session: Session, exId: string, setId: string, patch: Pa
   };
 }
 
+/**
+ * 训练中首组 / 第 1 轮填写正重量时自动预填后续同阶段空白组（0.1.18）。
+ * · 仅当修改对象位于 `roundIndex === 1` 且 `patch.weightKg > 0` 时触发（0 kg 显式自重绝不污染后续空白组）；
+ * · 仅同步到同动作中 `roundIndex > 1`、同 `stageIndex`、未跳过、`status === 'blank'` 且 `reps === null`、
+ *   且尚未被单独改成其它重量（`s.weightKg === null || s.weightKg === prevFirstWeight`）的组；
+ * · 修改第 2/3 轮（组）时只改该组自身，绝不反向或向后覆盖。
+ */
+export function withSetAndPrefillFollowingWeight(
+  session: Session,
+  exId: string,
+  setId: string,
+  patch: Partial<SessionSet>,
+  hasLocalWeightDraft?: (otherSetId: string) => boolean,
+): Session {
+  const updated = withSet(session, exId, setId, patch);
+  const nextWeight = patch.weightKg;
+  if (typeof nextWeight !== 'number' || !Number.isFinite(nextWeight) || nextWeight <= 0) {
+    return updated;
+  }
+  const prevEx = session.exercises.find((e) => e.id === exId);
+  const targetBefore = prevEx?.sets.find((s) => s.id === setId);
+  if (!prevEx || !targetBefore || targetBefore.roundIndex !== 1) {
+    return updated;
+  }
+  const skippedRounds = new Set(
+    prevEx.groups.filter((g) => g.skipped).map((g) => g.index),
+  );
+  const prevFirstWeight = targetBefore.weightKg;
+  const stageIdx = targetBefore.stageIndex;
+
+  return {
+    ...updated,
+    exercises: updated.exercises.map((ex) => {
+      if (ex.id !== exId) return ex;
+      const sets = ex.sets.map((s) => {
+        if (s.id === setId) return s;
+        if (s.roundIndex <= 1 || s.stageIndex !== stageIdx) return s;
+        if (skippedRounds.has(s.roundIndex)) return s;
+        if (s.status !== 'blank' || hasReps(s)) return s;
+        if (hasLocalWeightDraft?.(s.id)) return s;
+        if (s.weightKg !== null && s.weightKg !== prevFirstWeight) return s;
+        return { ...s, weightKg: nextWeight };
+      });
+      return { ...ex, sets };
+    }),
+  };
+}
+
 export function withExercise(session: Session, exId: string, patch: Partial<SessionExercise>): Session {
   return {
     ...session,

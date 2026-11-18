@@ -134,6 +134,16 @@ interface RestReminderPluginShape {
     /** 附加字段（旧原生可能没有）：当前身份的用户意图水位 */
     lastIntentId?: number;
   }>;
+  /** Wave 1B.2：按身份对账持久化状态（识别用户在系统通知栏主动点「取消」） */
+  inspectIdentity?: (options: {
+    token: string;
+    generation?: number | null;
+  }) => Promise<{
+    status?: string;
+    token?: string | null;
+    generation?: number;
+    fired?: boolean;
+  }>;
   getStatus(): Promise<{
     notificationsGranted: boolean;
     appNotificationsEnabled?: boolean;
@@ -324,6 +334,46 @@ export async function getActiveRest(): Promise<RestActiveIdentity> {
     };
   } catch {
     return { available: false, active: false, token: null, generation: 0, fired: false };
+  }
+}
+
+export type RestIdentityStatus =
+  | 'active'
+  | 'fired'
+  | 'cancelled_by_user'
+  | 'cancelled'
+  | 'unknown';
+
+/**
+ * Wave 1B.2：向原生对账指定 (token, generation) 是否已被用户在通知栏主动取消。
+ */
+export async function inspectRestIdentity(identity: {
+  token: string;
+  generation?: number | null;
+}): Promise<{ available: boolean; status: RestIdentityStatus }> {
+  const p = getPlugin();
+  if (!p || typeof p.inspectIdentity !== 'function' || !identity.token) {
+    return { available: false, status: 'unknown' };
+  }
+  try {
+    const payload: { token: string; generation?: number } = { token: identity.token };
+    if (typeof identity.generation === 'number' && Number.isFinite(identity.generation) && identity.generation >= 0) {
+      payload.generation = Math.floor(identity.generation);
+    }
+    const r = await p.inspectIdentity(payload);
+    const s = r.status;
+    if (
+      s === 'active' ||
+      s === 'fired' ||
+      s === 'cancelled_by_user' ||
+      s === 'cancelled' ||
+      s === 'unknown'
+    ) {
+      return { available: true, status: s };
+    }
+    return { available: true, status: 'unknown' };
+  } catch {
+    return { available: false, status: 'unknown' };
   }
 }
 

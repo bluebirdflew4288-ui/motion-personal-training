@@ -36,6 +36,30 @@ public final class RestReminderStore {
      * 让旧正编号重新可被接受。缺省 null 与旧数据兼容。
      */
     private static final String KEY_LAST_INTENT_TOKEN = "lastIntentToken";
+    private static final String KEY_LAST_USER_CANCEL_TOKEN = "lastUserCancelledToken";
+    private static final String KEY_LAST_USER_CANCEL_GEN = "lastUserCancelledGeneration";
+
+    /** 同进程内通知栏点击「取消」时的即时唤醒钩子（页面仍可见未触发 visibilitychange 时秒级同步） */
+    public interface UserCancelListener {
+        void onUserCancelled(String token, long generation);
+    }
+
+    private static volatile UserCancelListener userCancelListener;
+
+    public static void setUserCancelListener(UserCancelListener listener) {
+        userCancelListener = listener;
+    }
+
+    public static void notifyUserCancelled(String token, long generation) {
+        UserCancelListener l = userCancelListener;
+        if (l != null && token != null && generation >= 0L) {
+            try {
+                l.onUserCancelled(token, generation);
+            } catch (Exception ignored) {
+                // 旁路唤醒异常不影响已落盘的取消结果
+            }
+        }
+    }
     /**
      * 最小本地诊断（有界、不含 token/训练内容）。
      *
@@ -90,7 +114,9 @@ public final class RestReminderStore {
             p.getBoolean(KEY_FIRED, false),
             p.getInt(KEY_NOTIF_ID, 0),
             p.getLong(KEY_LAST_INTENT, 0L),
-            p.getString(KEY_LAST_INTENT_TOKEN, null)
+            p.getString(KEY_LAST_INTENT_TOKEN, null),
+            p.getString(KEY_LAST_USER_CANCEL_TOKEN, null),
+            p.getLong(KEY_LAST_USER_CANCEL_GEN, -1L)
         );
     }
 
@@ -128,6 +154,8 @@ public final class RestReminderStore {
                 .putInt(KEY_NOTIF_ID, snap.notifId)
                 .putLong(KEY_LAST_INTENT, snap.lastIntentId)
                 .putString(KEY_LAST_INTENT_TOKEN, snap.lastIntentToken)
+                .putString(KEY_LAST_USER_CANCEL_TOKEN, snap.lastUserCancelledToken)
+                .putLong(KEY_LAST_USER_CANCEL_GEN, snap.lastUserCancelledGeneration)
                 .commit();
         } catch (Exception e) {
             return false;

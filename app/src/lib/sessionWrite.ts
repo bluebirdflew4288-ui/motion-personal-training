@@ -12,7 +12,7 @@
 
    本模块只做纯函数/队列判定，不读写 React 状态、不直接写库。 */
 
-import type { PendingDraft } from '../domain/draftMerge';
+import type { PendingDraft, PersistOutcome } from '../domain/draftMerge';
 import type { Session } from '../domain/types';
 import { rebaseStaleSession } from './pairedCommit';
 
@@ -100,4 +100,38 @@ export function pendingDraftFromIntent(
   token: number,
 ): PendingDraft {
   return { token, session: next, baseRevision, baseSession };
+}
+
+/**
+ * Wave 1C.2：尚未开始执行事务的连续普通输入写槽（CoalescedOrdinarySlot）。
+ *
+ * 当第一笔 IDB 事务（或前序 paired 操作）仍在途时，用户在步进器上快速连点产生的
+ * 多笔普通 `applyChange` 不必逐笔排成 N 次独立 IDB 读写：
+ * · 保留**首批**未开始写槽的 `baseSessionAtCall` 与 `baseRevisionAtCall`（保证与前序 paired 的三方合并以及失败救援基线完整覆盖整段累积变化）；
+ * · 持续把目标快照更新为**最新一击**的 `latestNext`；
+ * · 一旦该槽进入队列执行（`started = true`）或遇到 paired / 显式版本屏障（`sealOrdinarySlot`），立即封口，后续点击进入新槽；
+ * · 该槽最终落库或失败时，向所有合并进来的调用方 Promise 广播同一真实 `PersistOutcome`。
+ */
+export interface CoalescedOrdinarySlot {
+  started: boolean;
+  sealed: boolean;
+  readonly baseSessionAtCall: Session;
+  readonly baseRevisionAtCall: number;
+  readonly viewBeforeFirst: Session | null;
+  latestNext: Session;
+  reservedSeq: number | null;
+  waiters: Array<(outcome: PersistOutcome) => void>;
+}
+
+export function sealOrdinarySlot(slot: CoalescedOrdinarySlot | null | undefined): void {
+  if (slot && !slot.started) {
+    slot.sealed = true;
+  }
+}
+
+export function settleOrdinarySlot(slot: CoalescedOrdinarySlot, outcome: PersistOutcome): void {
+  const callbacks = slot.waiters.splice(0, slot.waiters.length);
+  for (const fn of callbacks) {
+    fn(outcome);
+  }
 }

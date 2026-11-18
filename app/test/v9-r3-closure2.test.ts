@@ -148,7 +148,7 @@ describe('N05b · 同一次历史事件只允许一个订阅者执行恢复', ()
 });
 
 describe('N06 · dirty 导入时必须在分流前登记等待中的新 ID', () => {
-  const SRC = read('src/pages/Plans.tsx');
+  const SRC = read('src/pages/plans/PlansPage.tsx');
 
   it('pendingNewPlanIdRef 的登记早于 isAnyDirty 分流', () => {
     const importBlock = SRC.slice(SRC.indexOf('onImported={(imported: Plan) => {'));

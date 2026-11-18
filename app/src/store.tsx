@@ -18,15 +18,17 @@ import React, {
   useState,
 } from 'react';
 import {
+  atomicSavePlanWithTemplate,
   DEFAULT_SETTINGS,
   ensureSeed,
-  findActiveSession,
   listPlans,
   listSessions,
+  loadBootSnapshot,
   loadSettings,
   savePlan as persistPlan,
   saveSettings as persistSettings,
   type AppSettings,
+  type PlanTemplateWriteResult,
 } from './db/repo';
 import {
   atomicCreateSession,
@@ -53,6 +55,8 @@ export interface SaveArgs {
   expectedRevision?: number;
   /** 结束后是否推进循环 */
   advanceCycle?: boolean;
+  /** Wave 3A：结束训练时是否单事务把动作编排同步回原计划训练日（默认 false） */
+  syncBackToPlanDay?: boolean;
   /** 锁校验级别 */
   lockPolicy?: 'required' | 'optional';
 }
@@ -63,6 +67,10 @@ interface StoreValue {
   settings: AppSettings;
   plans: Plan[];
   sessions: Session[];
+  /** Wave 1C.3：全部历史记录是否已完成全量水合（≤40 条首阶段即为 true；>40 条首屏后后台补齐） */
+  historyHydrated: boolean;
+  /** Wave 1C.3：按需幂等拉齐完整历史（统计/历史/上次参考兜底使用） */
+  ensureFullHistory: () => Promise<Session[]>;
   activeSession: Session | null;
   /** 未结束训练列表（正常情况下长度 ≤ 1，旧数据可能更多） */
   activeSessions: Session[];
@@ -77,6 +85,11 @@ interface StoreValue {
   refreshPlans: () => Promise<void>;
   refreshSessions: () => Promise<void>;
   upsertPlan: (plan: Plan) => Promise<Plan>;
+  /** Wave 2A：单事务保存计划 + 可选动作配置记忆（冲突或失败整体回滚） */
+  upsertPlanWithTemplate: (
+    plan: Plan,
+    templateWrite?: { template: ExerciseTemplate; expectedRevision: number | null },
+  ) => Promise<PlanTemplateWriteResult>;
 
   /** 只更新内存（写事务成功后调用；不落库） */
   syncSessionLocal: (next: Session) => void;
@@ -129,12 +142,44 @@ function mergeSession(list: Session[], next: Session): Session[] {
   return copy;
 }
 
+/**
+ * Wave 1C.3：后台全量历史水合与内存并发改动的 revision 安全合并。
+ *
+ * · 内存中有而 DB 快照尚无的新建会话：保留内存最新记录；
+ * · 同 id 同时存在：以 revision 更高（相等时优先内存）的一方为准，绝不覆盖用户刚录入的组次；
+ * · 按 startedAt 倒序输出。
+ */
+export function mergeHydratedSessions(memList: Session[], dbList: Session[]): Session[] {
+  const byId = new Map<string, Session>();
+  for (const db of dbList) {
+    byId.set(db.id, db);
+  }
+  for (const mem of memList) {
+    const existing = byId.get(mem.id);
+    if (!existing) {
+      byId.set(mem.id, mem);
+      continue;
+    }
+    const memRev = typeof mem.revision === 'number' ? mem.revision : 0;
+    const dbRev = typeof existing.revision === 'number' ? existing.revision : 0;
+    if (memRev >= dbRev) {
+      byId.set(mem.id, mem);
+    }
+  }
+  return [...byId.values()].sort((a, b) => b.startedAt - a.startedAt);
+}
+
 export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [ready, setReady] = useState(false);
   const [initError, setInitError] = useState<string | null>(null);
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [plans, setPlans] = useState<Plan[]>([]);
   const [sessions, setSessions] = useState<Session[]>([]);
+  const [historyHydrated, setHistoryHydrated] = useState(false);
+  const historyHydratedRef = useRef(false);
+  const sessionsRef = useRef<Session[]>([]);
+  const fullHistoryInFlightRef = useRef<Promise<Session[]> | null>(null);
+  const hydrationEpochRef = useRef(0);
   const [exerciseTemplates, setExerciseTemplates] = useState<ExerciseTemplate[]>([]);
   const [exerciseTemplateError, setExerciseTemplateError] = useState<string | null>(null);
   const [activeSession, setActiveSessionState] = useState<Session | null>(null);
@@ -165,11 +210,55 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const refreshSessions = useCallback(async () => {
+    hydrationEpochRef.current += 1;
+    fullHistoryInFlightRef.current = null;
     const all = await listSessions();
+    historyHydratedRef.current = true;
+    setHistoryHydrated(true);
+    sessionsRef.current = all;
     setSessions(all);
     // 内存里的 activeSession 跟着库走，避免不一致
     const active = all.filter((s) => s.status === 'active').sort((a, b) => b.startedAt - a.startedAt);
     setActiveSessionState(active[0] ?? null);
+  }, []);
+
+  const ensureFullHistory = useCallback((): Promise<Session[]> => {
+    if (historyHydratedRef.current) {
+      return Promise.resolve(sessionsRef.current);
+    }
+    if (fullHistoryInFlightRef.current) {
+      return fullHistoryInFlightRef.current;
+    }
+    const epoch = hydrationEpochRef.current;
+    const job = listSessions()
+      .then((dbAll) => {
+        if (epoch !== hydrationEpochRef.current) {
+          return sessionsRef.current;
+        }
+        let merged = dbAll;
+        setSessions((prev) => {
+          merged = mergeHydratedSessions(prev, dbAll);
+          sessionsRef.current = merged;
+          return merged;
+        });
+        setActiveSessionState((cur) => {
+          if (cur && cur.status === 'active') return cur;
+          const active = merged
+            .filter((s) => s.status === 'active')
+            .sort((a, b) => b.startedAt - a.startedAt);
+          return active[0] ?? null;
+        });
+        historyHydratedRef.current = true;
+        setHistoryHydrated(true);
+        return merged;
+      })
+      .finally(() => {
+        if (fullHistoryInFlightRef.current === job) {
+          fullHistoryInFlightRef.current = null;
+        }
+      });
+    fullHistoryInFlightRef.current = job;
+    return job;
   }, []);
 
   const refreshExerciseTemplates = useCallback(async () => {
@@ -195,29 +284,36 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     let cancelled = false;
+    let stage2Timer: number | null = null;
     (async () => {
       try {
         await ensureSeed();
-        const [s, p, sess, active, templateSnap] = await Promise.all([
-          loadSettings(),
-          listPlans(),
-          listSessions(),
-          findActiveSession(),
-          readExerciseTemplates(),
-        ]);
+        const boot = await loadBootSnapshot();
         if (cancelled) return;
-        setSettings(s);
-        applyTheme(s.theme);
-        setPlans(p);
-        setSessions(sess);
-        setExerciseTemplates(templateSnap.templates);
+        setSettings(boot.settings);
+        applyTheme(boot.settings.theme);
+        setPlans(boot.plans);
+        sessionsRef.current = boot.sessions;
+        setSessions(boot.sessions);
+        setExerciseTemplates(boot.templateSnap.templates);
         setExerciseTemplateError(
-          templateSnap.invalid.length
-            ? `动作配置记忆有 ${templateSnap.invalid.length} 条损坏项（${templateSnap.invalid[0].key}），本次不会把它当作“无记忆”`
+          boot.templateSnap.invalid.length
+            ? `动作配置记忆有 ${boot.templateSnap.invalid.length} 条损坏项（${boot.templateSnap.invalid[0].key}），本次不会把它当作“无记忆”`
             : null,
         );
-        setActiveSessionState(active ?? null);
+        setActiveSessionState(boot.activeSession);
+        historyHydratedRef.current = boot.isComplete;
+        setHistoryHydrated(boot.isComplete);
         setReady(true);
+        if (!boot.isComplete) {
+          stage2Timer = window.setTimeout(() => {
+            if (!cancelled) {
+              void ensureFullHistory().catch(() => {
+                /* 后台水合异常保留首阶段结果，消费全量历史的页面进入时会再次幂等拉取 */
+              });
+            }
+          }, 0);
+        }
       } catch (err) {
         if (cancelled) return;
         setInitError(err instanceof Error ? err.message : '本地数据库初始化失败');
@@ -226,8 +322,11 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     })();
     return () => {
       cancelled = true;
+      if (stage2Timer !== null) {
+        window.clearTimeout(stage2Timer);
+      }
     };
-  }, []);
+  }, [ensureFullHistory]);
 
   // system 主题跟随系统变化
   useEffect(() => {
@@ -315,11 +414,46 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     return saved;
   }, []);
 
+  const upsertPlanWithTemplate = useCallback(
+    async (
+      plan: Plan,
+      templateWrite?: { template: ExerciseTemplate; expectedRevision: number | null },
+    ): Promise<PlanTemplateWriteResult> => {
+      const r = await atomicSavePlanWithTemplate(plan, templateWrite);
+      if (!r.ok) return r;
+      setPlans((list) => {
+        const idx = list.findIndex((p) => p.id === r.plan.id);
+        if (idx < 0) return [...list, r.plan];
+        const next = [...list];
+        next[idx] = r.plan;
+        return next;
+      });
+      if (r.template) {
+        try {
+          await refreshExerciseTemplates();
+        } catch (err) {
+          pushToast(
+            err instanceof Error ? `动作配置记忆刷新失败：${err.message}` : '动作配置记忆刷新失败',
+            'error',
+          );
+        }
+      }
+      return r;
+    },
+    [pushToast, refreshExerciseTemplates],
+  );
+
   /** activeSession 始终只指向 status==='active' 的训练（与数据库查询同一条件） */
   const setActiveSessionLocal = useCallback((s: Session | null) => {
     const onlyActive = s && s.status === 'active' ? s : null;
     setActiveSessionState(onlyActive);
-    if (s) setSessions((list) => mergeSession(list, s));
+    if (s) {
+      setSessions((list) => {
+        const next = mergeSession(list, s);
+        sessionsRef.current = next;
+        return next;
+      });
+    }
   }, []);
 
   /**
@@ -332,7 +466,11 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       if (cur && cur.id === next.id) return null;
       return cur;
     });
-    setSessions((list) => mergeSession(list, next));
+    setSessions((list) => {
+      const merged = mergeSession(list, next);
+      sessionsRef.current = merged;
+      return merged;
+    });
   }, []);
 
   const clearActive = useCallback(() => setActiveSessionState(null), []);
@@ -422,6 +560,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           sessionId: next.id,
           editorId: args.editorId,
           advanceCycle: args.advanceCycle,
+          syncBackToPlanDay: args.syncBackToPlanDay,
           expectedVersion: args.expectedRevision,
           lockPolicy: args.lockPolicy ?? 'required',
         },
@@ -461,6 +600,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       settings,
       plans,
       sessions,
+      historyHydrated,
+      ensureFullHistory,
       activeSession,
       activeSessions,
       toasts,
@@ -473,6 +614,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       refreshPlans,
       refreshSessions,
       upsertPlan,
+      upsertPlanWithTemplate,
       syncSessionLocal,
       setActiveSessionLocal,
       clearActive,
@@ -492,6 +634,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       settings,
       plans,
       sessions,
+      historyHydrated,
+      ensureFullHistory,
       activeSession,
       activeSessions,
       toasts,
@@ -504,6 +648,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       refreshPlans,
       refreshSessions,
       upsertPlan,
+      upsertPlanWithTemplate,
       syncSessionLocal,
       setActiveSessionLocal,
       clearActive,

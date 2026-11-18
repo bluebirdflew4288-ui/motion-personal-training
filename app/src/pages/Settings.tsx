@@ -139,11 +139,19 @@ export function SettingsPage() {
     refreshSettings,
     pushToast,
     sessions,
+    historyHydrated,
+    ensureFullHistory,
     plans,
     refreshPlans,
     refreshSessions,
     refreshExerciseTemplates,
   } = useStore();
+
+  useEffect(() => {
+    if (!historyHydrated) {
+      void ensureFullHistory();
+    }
+  }, [historyHydrated, ensureFullHistory]);
   const fileRef = useRef<HTMLInputElement>(null);
   /** 需求 2：休息提醒的真实授权/渠道状态（不可用时如实显示，不假装已开启） */
   const [restCap, setRestCap] = useState<RestReminderStatus | null>(null);
@@ -665,8 +673,14 @@ export function SettingsPage() {
           <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 14 }}>
             <span style={{ color: 'var(--ink-3)' }}>本地数据</span>
             <span>
-              {plans.length} 个计划 · {completed} 次完成
-              {restCount ? ` · ${restCount} 天完全休息` : ''} · {active} 个进行中
+              {!historyHydrated ? (
+                '正在读取记录计数…'
+              ) : (
+                <>
+                  {plans.length} 个计划 · {completed} 次完成
+                  {restCount ? ` · ${restCount} 天完全休息` : ''} · {active} 个进行中
+                </>
+              )}
             </span>
           </div>
           <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 14, marginTop: 4 }}>

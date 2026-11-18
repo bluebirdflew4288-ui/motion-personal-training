@@ -1,7 +1,7 @@
 {
   "name": "motion-training-app",
   "private": true,
-  "version": "0.1.14",
+  "version": "0.1.19",
   "type": "module",
   "description": "MOTION — 个人训练工作区（离线优先的本地训练记录 Web App）",
   "engines": {

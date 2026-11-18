@@ -8,7 +8,13 @@ const TABS = [
   { path: '/settings', label: '设置', ico: '设', match: (p: string) => p.startsWith('/settings') },
 ];
 
-export function TabBar({ path }: { path: string }) {
+export function TabBar({
+  path,
+  onPreload,
+}: {
+  path: string;
+  onPreload?: (targetPath: string) => void;
+}) {
   // 训练执行页占满全屏，不显示 tabbar（避免误触与遮挡输入）
   if (path.startsWith('/session')) return null;
   return (
@@ -21,6 +27,9 @@ export function TabBar({ path }: { path: string }) {
               key={t.path}
               href={`#${t.path}`}
               aria-current={active ? 'page' : undefined}
+              onPointerDown={() => {
+                onPreload?.(t.path);
+              }}
               onClick={(e) => {
                 e.preventDefault();
                 navigate(t.path);

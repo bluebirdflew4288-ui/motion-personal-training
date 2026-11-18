@@ -10,6 +10,7 @@ import { fmtCountdown } from '../lib/format';
 import {
   cancelRestReminder,
   getActiveRest,
+  inspectRestIdentity,
   newRestToken,
   scheduleRestReminder,
   type RestScheduleOrigin,
@@ -205,6 +206,7 @@ export function useRestTimer(
           scheduleRestReminder(t, ms, pendingOriginRef.current, deadlineAtMs, intentId),
         cancel: (identity) => cancelRestReminder(identity),
         getActive: () => getActiveRest(),
+        inspectIdentity: (identity) => inspectRestIdentity(identity),
       },
       (t, g) => onCommitRef.current?.(t, g),
       /**
@@ -465,6 +467,36 @@ export function useRestTimer(
   }, [controller, persist, bumpCancelDuty]);
 
   /**
+   * Wave 1B.2：用户在系统持续通知栏点击「取消」后的前后台对账收口。
+   *
+   * 仅当当前处于 running 态且原生按精确 (token, generation) 确认 `cancelled_by_user` 时，
+   * 静默收起页面计时条并清理快照（不再补发冗余 cancel IPC，不闪「提醒未取消」横幅）。
+   */
+  const reconcileUserCancel = useCallback(async () => {
+    if (controller.isDisposed) return;
+    const tokBefore = tokenRef.current;
+    if (!tokBefore || liveStateRef.current.status !== 'running') return;
+    const outcome = await controller.reconcileForeground();
+    if (outcome !== 'cancelled_by_user') return;
+    if (
+      controller.isDisposed ||
+      tokenRef.current !== tokBefore ||
+      liveStateRef.current.status !== 'running'
+    ) {
+      return;
+    }
+    setEndsAt(null);
+    setPausedRemaining(null);
+    tokenRef.current = null;
+    setToken(null);
+    sourceRef.current = null;
+    setSource(null);
+    genRef.current = 0;
+    persist({ token: null, status: 'running', endsAt: null, pausedRemaining: null });
+    bumpCancelDuty();
+  }, [controller, persist, bumpCancelDuty]);
+
+  /**
    * 重建恢复（BRIEF 第2项）。
    *
    * 只在**首次挂载**执行一次；恢复后：
@@ -705,6 +737,7 @@ export function useRestTimer(
           endsAt: decision.endsAt,
           pausedRemaining: null,
         });
+        void reconcileUserCancel();
       }
       return;
     }
@@ -732,7 +765,34 @@ export function useRestTimer(
     });
     // sessionId 必须进依赖：否则 prop 从 A 变 B 时 effect 不重跑，
     // 会继续显示 A 的计时（REVIEW-2 收尾 P2 的真实失败原因）
-  }, [controller, persist, sessionId]);
+  }, [controller, persist, reconcileUserCancel, sessionId]);
+
+  /**
+   * Wave 1B.2：监听页面回前台（visibilitychange / focus）与原生即时广播
+   * （motion:rest-user-cancelled），把通知栏「取消」同步回页面计时态。
+   */
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof document === 'undefined') return undefined;
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') {
+        void reconcileUserCancel();
+      }
+    };
+    const onFocus = () => {
+      void reconcileUserCancel();
+    };
+    const onUserCancelled = () => {
+      void reconcileUserCancel();
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    window.addEventListener('focus', onFocus);
+    window.addEventListener('motion:rest-user-cancelled', onUserCancelled);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('focus', onFocus);
+      window.removeEventListener('motion:rest-user-cancelled', onUserCancelled);
+    };
+  }, [reconcileUserCancel]);
 
   /**
    * controller 生命周期与 effect setup/cleanup **正确配对**（REVIEW-4 修正）。
@@ -882,19 +942,26 @@ export function RestTimerBar({ timer }: { timer: RestTimerApi }) {
    *       责任不能因为条消失就静默。</li>
    * </ul>
    */
+  const standaloneNotice = !active || remainingMs === null;
   const cancelNotice =
     timer.cancelFailed && timer.cancelPending ? (
       <div
         role="status"
         data-rest-cancel-notice="failed"
         style={{
-          position: 'sticky',
-          top: 0,
-          zIndex: 31,
+          ...(standaloneNotice
+            ? {
+                position: 'sticky' as const,
+                top: 0,
+                zIndex: 31,
+                padding: 'calc(8px + var(--safe-top, 0px)) 12px 8px',
+                margin: 'calc(-1 * var(--safe-top, 0px)) -16px 0',
+              }
+            : {
+                padding: '8px 12px',
+              }),
           background: 'var(--brick)',
           color: 'var(--paper)',
-          padding: '8px 12px',
-          margin: '0 -16px',
           display: 'flex',
           alignItems: 'center',
           gap: 10,
@@ -920,14 +987,21 @@ export function RestTimerBar({ timer }: { timer: RestTimerApi }) {
   const done = remainingMs === 0;
   const bar = (
     <div
+      data-rest-sticky-bar="true"
       style={{
-        position: 'sticky',
-        top: 0,
-        zIndex: 30,
+        ...(cancelNotice
+          ? {
+              padding: 'calc(8px + var(--safe-top, 0px)) 12px 8px',
+            }
+          : {
+              position: 'sticky' as const,
+              top: 0,
+              zIndex: 30,
+              padding: 'calc(8px + var(--safe-top, 0px)) 12px 8px',
+              margin: 'calc(-1 * var(--safe-top, 0px)) -16px 0',
+            }),
         background: done ? 'var(--brick)' : 'var(--ink)',
         color: 'var(--paper)',
-        padding: '8px 12px',
-        margin: '0 -16px',
         display: 'flex',
         alignItems: 'center',
         gap: 10,
@@ -1015,13 +1089,21 @@ export function RestTimerBar({ timer }: { timer: RestTimerApi }) {
     </div>
   );
 
-  // 计时条与取消失败提示可能同时存在（暂停后取消失败就是这种状态）
+  // 计时条与取消失败提示可能同时存在（暂停后取消失败就是这种状态）：合并在同一吸顶容器内，避免两层 top:0 互相覆盖
   if (!cancelNotice) return bar;
   return (
-    <>
+    <div
+      data-rest-sticky-stack="true"
+      style={{
+        position: 'sticky',
+        top: 0,
+        zIndex: 31,
+        margin: 'calc(-1 * var(--safe-top, 0px)) -16px 0',
+      }}
+    >
       {bar}
       {cancelNotice}
-    </>
+    </div>
   );
 }
 

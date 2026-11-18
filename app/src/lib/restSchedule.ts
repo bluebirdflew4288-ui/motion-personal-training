@@ -64,6 +64,16 @@ export interface RestScheduleOps {
      */
     lastIntentId?: number;
   }>;
+  /**
+   * Wave 1B.2：按身份对账持久化状态（识别用户在系统通知栏主动点「取消」）。
+   */
+  inspectIdentity?: (identity: {
+    token: string;
+    generation?: number | null;
+  }) => Promise<{
+    available: boolean;
+    status: 'active' | 'fired' | 'cancelled_by_user' | 'cancelled' | 'unknown';
+  }>;
 }
 
 /** 一次排程意图 */
@@ -648,6 +658,53 @@ export class RestScheduleController {
       deadlineAtMs: null,
       intentId: 0,
     };
+  }
+
+  /**
+   * Wave 1B.2：页面回前台 / 收到通知栏取消事件时向原生对账当前活动休息段。
+   *
+   * 仅当原生明确回报该 (token, generation) 为 `cancelled_by_user`、且本控制器当前仍持有
+   * 该意图（未被用户切换/暂停/卸载）时：
+   *   · 静默释放本控制器归属（不再补发冗余 cancel IPC，避免误触发「提醒未取消」横幅）；
+   *   · 结清与该 token 匹配的旧取消责任；
+   *   · 返回 `'cancelled_by_user'` 供上层 Hook 静默收束页面倒计时并清理本地快照。
+   */
+  async reconcileForeground(): Promise<'cancelled_by_user' | 'unchanged'> {
+    if (this.disposed || !this.current || !this.ops.inspectIdentity) {
+      return 'unchanged';
+    }
+    const seqAtStart = this.current.seq;
+    const tok = this.current.token;
+    const gen = this.current.generation;
+    let res: {
+      available: boolean;
+      status: 'active' | 'fired' | 'cancelled_by_user' | 'cancelled' | 'unknown';
+    };
+    try {
+      res = await this.ops.inspectIdentity({ token: tok, generation: gen });
+    } catch {
+      return 'unchanged';
+    }
+    if (this.disposed || !this.current || this.current.seq !== seqAtStart || this.current.token !== tok) {
+      return 'unchanged';
+    }
+    if (res.available && res.status === 'cancelled_by_user') {
+      this.current = null;
+      this.pendingCancel = null;
+      this.identityGapPending = false;
+      const before = this.duties.length;
+      if (before > 0) {
+        this.duties = this.duties.filter(
+          (d) => !(d.token === tok && (gen === null || d.generation === gen)),
+        );
+        if (this.duties.length !== before) {
+          this.dutiesResolvedByReconcile += before - this.duties.length;
+          this.notifyDutyChange();
+        }
+      }
+      return 'cancelled_by_user';
+    }
+    return 'unchanged';
   }
 
   /**

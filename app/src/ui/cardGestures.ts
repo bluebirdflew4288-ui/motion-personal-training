@@ -20,13 +20,18 @@ export const AXIS_THRESHOLD = 10;
 /** 左滑操作层宽度（与 SwipeActionCard 保持一致） */
 export const SWIPE_ACTION_WIDTH = 140;
 /**
- * F09：左滑到达最大操作区后需保持约 750ms 才能进入删除就绪态。
+ * F09：左滑到位后停顿进入「松开即删」就绪态的时长（ms）。
+ * 0.1.18 真机反馈调优：由 750ms 缩短至 380ms，既避开 80–160ms 快速横扫展开操作区，又无需久按屏幕边缘。
  */
-export const SWIPE_READY_HOLD_MS = 750;
+export const SWIPE_READY_HOLD_MS = 380;
+/** F09：进入删除就绪判定的左滑位移比例（0.78 × 140 ≈ 109px，无需滑满到底） */
+export const SWIPE_READY_TRIGGER_RATIO = 0.78;
+/** F09：手指靠近屏幕左边缘的感应宽度（px）；中段起滑推至左边缘即视为到位 */
+export const SWIPE_LEFT_EDGE_ZONE_PX = 40;
 /** F09：手势停留时的微小手指抖动容差（px） */
-export const SWIPE_JITTER_TOLERANCE = 8;
-/** F09-FIX1：就绪后或左滑中识别为明确纵向移动意图的 Y 位移阈值（px） */
-export const SWIPE_VERTICAL_INTENT_THRESHOLD = 20;
+export const SWIPE_JITTER_TOLERANCE = 12;
+/** F09-FIX1：左滑中识别为明确纵向脱离意图的 Y 位移阈值（px；留足单手拇指自然弧线余量） */
+export const SWIPE_VERTICAL_INTENT_THRESHOLD = 48;
 /** F09：就绪状态提示文案（空白直删 vs 有风险先确认） */
 export const SWIPE_PROMPT_BLANK = '松开手指可删除';
 export const SWIPE_PROMPT_CONFIRM = '松开以确认删除';

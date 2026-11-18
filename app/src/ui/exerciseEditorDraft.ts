@@ -83,6 +83,10 @@ export interface EditorState {
   weightMode: WeightMode;
   dumbbellBasis: DumbbellBasis | undefined;
   remember: boolean;
+  /** 0.1.18 智能跟随锁：已单独修改或初始即异构的普通组序号（>=2）；未在其中的组默认跟随第 1 组 */
+  customizedSets: number[];
+  /** 0.1.18 智能跟随锁：已单独修改或初始即异构的轮序号（>=2）；未在其中的轮默认跟随第 1 轮 */
+  customizedRounds: number[];
 }
 
 export interface ConfigBaseline {
@@ -148,6 +152,8 @@ export function cloneEditorState(state: EditorState): EditorState {
     stages: cloneStageRows(state.stages),
     stageOverrides,
     roundRestInSecOverrides: { ...state.roundRestInSecOverrides },
+    customizedSets: [...state.customizedSets],
+    customizedRounds: [...state.customizedRounds],
   };
 }
 
@@ -237,6 +243,48 @@ export function buildEditorState(initial: ExerciseEditorInitial): EditorState {
       }
     }
   }
+
+  const customizedSets: number[] = [];
+  const firstSet = straightRows[0];
+  if (firstSet) {
+    for (let i = 1; i < straightRows.length; i += 1) {
+      const row = straightRows[i];
+      if (
+        row.weight !== firstSet.weight ||
+        row.repsMin !== firstSet.repsMin ||
+        row.repsMax !== firstSet.repsMax ||
+        row.toFailure !== firstSet.toFailure
+      ) {
+        customizedSets.push(row.setIndex);
+      }
+    }
+  }
+
+  const stageContentSignature = (rows: StageRow[]): string =>
+    JSON.stringify(
+      rows.map((r) => ({
+        label: r.label,
+        weight: r.weight,
+        repsMin: r.repsMin,
+        repsMax: r.repsMax,
+        toFailure: r.toFailure,
+        rest: r.rest,
+      })),
+    );
+  const round1Rows = stageOverrides[1] ?? stages;
+  const round1Sig = stageContentSignature(round1Rows);
+  const baseRestInSec = initial.target.kind === 'dropSet' ? initial.target.restInSec : 15;
+  const round1RestIn = roundRestInSecOverrides[1] ?? baseRestInSec;
+  const customizedRounds: number[] = [];
+  const roundTotal = Math.max(1, rounds);
+  for (let r = 2; r <= roundTotal; r += 1) {
+    const rRows = stageOverrides[r] ?? stages;
+    const rRestIn = roundRestInSecOverrides[r] ?? baseRestInSec;
+    if (stageContentSignature(rRows) !== round1Sig || rRestIn !== round1RestIn) {
+      customizedRounds.push(r);
+    }
+  }
+
   return {
     name: initial.name,
     en: initial.en ?? '',
@@ -254,6 +302,8 @@ export function buildEditorState(initial: ExerciseEditorInitial): EditorState {
     weightMode: initial.target.weightMode,
     dumbbellBasis: initial.target.dumbbellBasis,
     remember: initial.memory?.mode === 'first',
+    customizedSets,
+    customizedRounds,
   };
 }
 

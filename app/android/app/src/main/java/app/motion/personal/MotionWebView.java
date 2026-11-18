@@ -5,6 +5,7 @@ import android.content.Context;
 import android.util.AttributeSet;
 import android.view.ActionMode;
 import android.view.DragEvent;
+import android.view.HapticFeedbackConstants;
 import android.view.MotionEvent;
 import android.webkit.JavascriptInterface;
 
@@ -30,6 +31,7 @@ public class MotionWebView extends CapacitorWebView {
     @SuppressLint("JavascriptInterface")
     private void initSelectionGuard() {
         addJavascriptInterface(new JsSelectionGuard(), "__motionSelectionGuard");
+        addJavascriptInterface(new JsHapticsBridge(), "__motionHaptics");
     }
 
     /** 判定当前操作是否位于允许原生选词/复制粘贴的文本输入控件中。 */
@@ -132,6 +134,21 @@ public class MotionWebView extends CapacitorWebView {
         @JavascriptInterface
         public void setFocusEditable(boolean editable) {
             selectionGuardState.updateAndGet(s -> WebViewSelectionPolicy.withFocusEditable(s, editable));
+        }
+    }
+
+    private final class JsHapticsBridge {
+        @JavascriptInterface
+        public void dragLift() {
+            post(() -> {
+                try {
+                    if (isAttachedToWindow() && getWindowVisibility() == VISIBLE) {
+                        performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
+                    }
+                } catch (Throwable ignored) {
+                    // 系统触感不可用时静默忽略
+                }
+            });
         }
     }
 }

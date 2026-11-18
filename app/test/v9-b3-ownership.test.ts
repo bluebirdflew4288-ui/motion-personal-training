@@ -8,7 +8,7 @@ import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 const read = (p: string) => readFileSync(resolve(process.cwd(), p), 'utf8');
-const PLANS = read('src/pages/Plans.tsx');
+const PLANS = `${read('src/pages/plans/PlansPage.tsx')}\n${read('src/pages/plans/PlanDayEditor.tsx')}`;
 const CARDIO = read('src/ui/CardioPanel.tsx');
 const ROUTER = read('src/lib/router.ts');
 const REPO = read('src/db/repo.ts');

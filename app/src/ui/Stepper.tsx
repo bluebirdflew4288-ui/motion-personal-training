@@ -73,12 +73,22 @@ export function NumberStepper({
   const [draft, setDraft] = useState<string>(rawDraft ?? (value === null ? '' : String(value)));
   const [focused, setFocused] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  /**
+   * Wave 1C.2：步进器的同步乐观基准。
+   * 解决连续快速连点 + / − 时，在异步 IDB 落库重渲染回来前重复读取旧 props `value`
+   * 导致 `8 -> 9 -> 9` 丢步的问题。外部 `value` 或 `disabled` 变化时自动对齐。
+   */
+  const optimisticValueRef = useRef<number | null>(value);
 
   const round = (n: number) => {
     const p = 10 ** decimals;
     return Math.round(n * p) / p;
   };
   const clamp = (n: number) => Math.min(max, Math.max(min, round(n)));
+
+  useEffect(() => {
+    optimisticValueRef.current = value;
+  }, [value, disabled]);
 
   // 外部值变化（撤销、沿用、步进按钮）时同步草稿——但聚焦输入期间不打断用户
   useEffect(() => {
@@ -120,6 +130,7 @@ export function NumberStepper({
     setDraft(normalized);
     if (normalized === '' || normalized === '.') {
       // 空串 / 单个小数点：本次输入**没有**形成干净数字 → 登记风险
+      optimisticValueRef.current = null;
       reportRawRisk(true);
       onRawDraftChange?.(normalized);
       onChange(null);
@@ -129,9 +140,11 @@ export function NumberStepper({
     if (Number.isFinite(n)) {
       // 尾随小数点仍是可继续输入的 raw（如 7.）；actual 数值提交规则不变。
       const incompleteDecimal = isUnfinishedNumberDraft(normalized);
+      const clamped = clamp(n);
+      optimisticValueRef.current = clamped;
       reportRawRisk(incompleteDecimal);
       onRawDraftChange?.(incompleteDecimal ? normalized : null);
-      onChange(clamp(n));
+      onChange(clamped);
       return;
     }
     // 解析失败（例如 "1.2.3" 归一后仍非法）：同样登记风险
@@ -140,8 +153,10 @@ export function NumberStepper({
   };
 
   const bump = (dir: 1 | -1) => {
-    const base = value ?? min;
+    if (disabled) return;
+    const base = optimisticValueRef.current ?? value ?? min;
     const next = clamp(base + dir * step);
+    optimisticValueRef.current = next;
     setDraft(String(next));
     // 步进一定产生干净数字 → 风险解除
     reportRawRisk(false);

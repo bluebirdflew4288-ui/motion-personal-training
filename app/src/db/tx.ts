@@ -28,6 +28,7 @@ import type { ExerciseTemplate, Plan, Session } from '../domain/types';
 import { localDateKey } from '../domain/localDate';
 import { finalizeCardioForFinish } from '../domain/cardio';
 import { hasAnyRealContent } from '../domain/sessionContent';
+import { applySessionArrangementToPlan } from '../domain/sessionToPlanSync';
 import { MAX_CARDIO_ENTRIES, MAX_PLANS } from '../domain/limits';
 import { validateExerciseTemplate } from './templates';
 
@@ -75,7 +76,7 @@ export type WriteIntent =
    * 旧实现用可选 `finalizeCardio` flag，任何漏传的 UI 入口都会留下
    * "终态但仍有 running/未封口段"的损坏记录 —— 因此不再提供关闭开关。
    */
-  | { kind: 'finish'; advanceCycle: boolean }
+  | { kind: 'finish'; advanceCycle: boolean; syncBackToPlanDay?: boolean }
   /** 放弃训练：当前必须是 active；已终态则幂等返回 */
   | { kind: 'discard' }
   /** 历史纠错：当前必须是终态记录；只改当下合法版本 */
@@ -616,14 +617,44 @@ export function atomicWriteSession(opts: WriteOptions): Promise<WriteResult> {
                 writeNext(next);
                 return;
               }
-              // finish：需要事务内最新计划来算游标
+              // finish：需要事务内最新计划来算游标（及可选 Wave 3A 单事务同步回原计划训练日）
               const planId = base.planId;
               const planReq = plans!.get(planId);
               planReq.onsuccess = () => {
                 const curPlan = planReq.result as Plan | undefined;
+                let workingPlan: Plan | undefined = curPlan;
+                if (intent.syncBackToPlanDay) {
+                  if (!curPlan) {
+                    abort(
+                      fail(
+                        'state-conflict',
+                        '原计划已不存在，无法将今日动作编排同步回计划（训练尚未结束，取消勾选后可正常结束）',
+                        current,
+                      ),
+                    );
+                    return;
+                  }
+                  const synced = applySessionArrangementToPlan(
+                    curPlan,
+                    base.day.dayId,
+                    withDefaults(base)!,
+                    terminalAt,
+                  );
+                  if (!synced.ok) {
+                    abort(fail('state-conflict', synced.message, current));
+                    return;
+                  }
+                  workingPlan = synced.plan;
+                }
                 const shouldAdvance =
-                  intent.advanceCycle && !base.advancedCycle && !!curPlan && curPlan.days.length > 0;
-                const movedPlan = shouldAdvance && curPlan ? pushCycle(curPlan) : undefined;
+                  intent.advanceCycle && !base.advancedCycle && !!workingPlan && workingPlan.days.length > 0;
+                const movedPlan = shouldAdvance && workingPlan ? pushCycle(workingPlan) : undefined;
+                const planToPersist =
+                  movedPlan && workingPlan
+                    ? { ...workingPlan, ...movedPlan }
+                    : intent.syncBackToPlanDay
+                      ? workingPlan
+                      : undefined;
                 /**
                  * 第2阶段：以**库内 current 的锚点与参数**结算有氧
                  * （不接受调用方传入的 endedAtMs/segments 作为已保存事实）。
@@ -641,14 +672,14 @@ export function atomicWriteSession(opts: WriteOptions): Promise<WriteResult> {
                   endedAt: terminalAt,
                   advancedCycle: Boolean(shouldAdvance),
                   // 从**事务内最新计划**读游标：不信任 UI 预先算好的 cycleIndexAfter
-                  cycleIndexAfter: movedPlan ? movedPlan.cursor : (curPlan?.cursor ?? base.cycleIndexAtStart),
+                  cycleIndexAfter: movedPlan ? movedPlan.cursor : (workingPlan?.cursor ?? base.cycleIndexAtStart),
                   revision: curRev + 1,
                 };
                 // 训练备注等文本允许由调用方提供（只有文本字段，不含实际记录）
                 if (typeof session.note === 'string') next.note = session.note;
                 try {
                   sessions.put(next);
-                  if (movedPlan && curPlan) plans!.put({ ...curPlan, ...movedPlan });
+                  if (planToPersist) plans!.put(planToPersist);
                 } catch (err) {
                   abort(fail('storage', err instanceof Error ? err.message : '写入失败', current));
                   return;
@@ -658,7 +689,12 @@ export function atomicWriteSession(opts: WriteOptions): Promise<WriteResult> {
                  * put 只是把请求排进队列；提交阶段仍可能失败（审查 V4D12 注入的 abort）。
                  * 结果暂存到 pendingSuccess，由下面的 finishWrite(next, …) 统一交给 oncomplete。
                  */
-                finishWrite({ ok: true, revision: next.revision ?? 0, session: next, plan: movedPlan ?? curPlan });
+                finishWrite({
+                  ok: true,
+                  revision: next.revision ?? 0,
+                  session: next,
+                  plan: planToPersist ?? workingPlan,
+                });
               };
               planReq.onerror = () => abort(fail('storage', '无法读取计划，结束已取消', current));
               return;
@@ -873,13 +909,19 @@ export function atomicFinishSession(args: {
     expectedVersion?: number | null;
     /** 结束时是否推进循环；不传则读 session.advancedCycle 的意图 */
     advanceCycle?: boolean;
+    /** Wave 3A：同一事务内是否把今日动作编排写回原计划训练日（默认 false） */
+    syncBackToPlanDay?: boolean;
     lockPolicy?: 'required' | 'optional';
   };
 }): Promise<WriteResult> {
   const { session, guard } = args;
   const advanceCycle = guard?.advanceCycle ?? session.advancedCycle ?? false;
   return atomicWriteSession({
-    intent: { kind: 'finish', advanceCycle },
+    intent: {
+      kind: 'finish',
+      advanceCycle,
+      ...(guard?.syncBackToPlanDay ? { syncBackToPlanDay: true } : {}),
+    },
     session,
     editorId: guard?.editorId,
     expectedRevision: typeof guard?.expectedVersion === 'number' ? guard.expectedVersion : undefined,

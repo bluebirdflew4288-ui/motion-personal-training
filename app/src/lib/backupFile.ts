@@ -29,6 +29,15 @@ export interface NativeFileBridge {
     | { cancelled: true }
     | { cancelled: false; error: string }
   >;
+  /** Wave 3D.2：可选二进制 PNG 导出桥（Android SAF 创建图片文档并回读校验） */
+  savePng?(
+    filename: string,
+    base64: string,
+  ): Promise<
+    | { saved: true; filename: string; uri?: string; bytes?: number; sha256?: string }
+    | { saved: false; cancelled: true }
+    | { saved: false; cancelled: false; error: string }
+  >;
 }
 
 let nativeBridge: NativeFileBridge | null = null;
@@ -169,4 +178,70 @@ export function fileSizeLabel(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
+}
+
+/**
+ * Wave 3D.2：导出纯本地生成的 PNG 图片（如完赛总结小票）。
+ * · Android 原生：走 SAF 系统保存界面 + SHA-256 回读确认；取消返回 cancelled:true；
+ * · Web / 浏览器：使用 Blob + `<a download>` 下载。
+ */
+export async function exportPngFile(
+  filename: string,
+  base64: string,
+  blob?: Blob | null,
+): Promise<ExportOutcome> {
+  const cleanBase64 = base64.includes(',') ? base64.slice(base64.indexOf(',') + 1) : base64;
+  if (!cleanBase64) {
+    return { ok: false, cancelled: false, error: '生成的图片内容为空' };
+  }
+  if (usesNativeFileUi() && nativeBridge?.savePng) {
+    try {
+      const r = await nativeBridge.savePng(filename, cleanBase64);
+      if (r.saved) {
+        const verdict = verifyNativeExportResult({
+          bytes: r.bytes,
+          sha256: r.sha256,
+          filename: r.filename,
+        });
+        if (!verdict.ok) {
+          return { ok: false, cancelled: false, error: verdict.error };
+        }
+        return {
+          ok: true,
+          filename: verdict.value.filename || filename,
+          via: 'native',
+          bytes: verdict.value.bytes,
+          sha256: verdict.value.sha256,
+        };
+      }
+      if (r.cancelled) return { ok: false, cancelled: true };
+      return { ok: false, cancelled: false, error: r.error };
+    } catch (err) {
+      return { ok: false, cancelled: false, error: err instanceof Error ? err.message : '保存图片失败' };
+    }
+  }
+
+  try {
+    let targetBlob = blob ?? null;
+    if (!targetBlob) {
+      const bin = atob(cleanBase64);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i += 1) {
+        bytes[i] = bin.charCodeAt(i);
+      }
+      targetBlob = new Blob([bytes], { type: 'image/png' });
+    }
+    const url = URL.createObjectURL(targetBlob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.rel = 'noopener';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+    return { ok: true, filename, via: 'browser' };
+  } catch (err) {
+    return { ok: false, cancelled: false, error: err instanceof Error ? err.message : '浏览器下载图片失败' };
+  }
 }
