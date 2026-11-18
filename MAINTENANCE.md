@@ -8,40 +8,11 @@
 
 上述六项维护修复已随 **0.1.8** 候选包构建（2026-10-30）；本轮训练编辑/删除/手势整合（统一编辑器、左滑删除、长按拖动排序、模板记忆与 v3 备份）已随 **0.1.9** 候选包构建（2026-11-02）。N01（持续休息通知正文点击回到应用）与 R01（未完成轮沿用上一完整轮）已随 **0.1.10** 完整 release 包构建（2026-11-15），但 **0.1.10 已被用户真机拒收**（G01 长按出现原生文本选择菜单与选择手柄，G02 删除操作/横幅为橙色而非红色），不作为验收通过。G01/G02 返工已随 **0.1.11 / versionCode 12** 完整 release 包构建（2026-11-15），**待 Codex 独立真机验收**。以上均**尚未经过真机验收**。源码检查、真实 DOM 回归、JVM 测试与构建验证都不等于手机实物验收；CI 目前仅有配置，没有远端运行通过的结论。
 
-当前最新完整签名 release 候选包为 **0.2.0 / versionCode 21**（2026-11-18）。[MOTION-0.2.0-release.apk](apk/MOTION-0.2.0-release.apk)（4,238,877 字节，SHA-256 `aff30ea4960f302a824332c2fdaa5695ee695d95915c39d8027b471f20a5f058`）。Wave 4 新增跨计划器械档位备忘、动感单车／椭圆机／划船机／自由有氧四种预设，以及可取消选中的训练日分部标签。全量备份导出为 v4，可恢复合法的 v1–v3 备份。共享计划模板可导入 v1 或 v2，新字段要求 v2。电脑端全量回归、Wave 4 浏览器验证 9 项和正式 APK 验包 25 项通过。荣耀覆盖安装和设备体验待验。
+当前已验收的签名版为 **0.2.0 / versionCode 21**（2026-11-18）。[MOTION-0.2.0-release.apk](apk/MOTION-0.2.0-release.apk)（4,238,877 字节，SHA-256 `aff30ea4960f302a824332c2fdaa5695ee695d95915c39d8027b471f20a5f058`）。Wave 4 新增跨计划器械档位备忘、动感单车／椭圆机／划船机／自由有氧四种预设，以及可取消选中的训练日分部标签。全量备份导出为 v4，可恢复合法的 v1–v3 备份。共享计划模板可导入 v1 或 v2，新字段要求 v2。电脑端全量回归、Wave 4 浏览器验证 9 项和正式 APK 验包 25 项通过。用户已确认本版通过。
 
-上一完整签名 release 候选包为 **0.1.19 / versionCode 20**（2026-11-18）。[MOTION-0.1.19-release.apk](apk/MOTION-0.1.19-release.apk)（4,235,678 字节，SHA-256 `cffb2df612c83f3c9d9448f907b1367e93a5f7d617ebe7d01211a48397bcb4db`）。本版合并趋势图实心红点和 Wave 3，包含完训时可选同步回原计划、历史纠错、渐进提示与配片速算，以及 PR 印章、小票 PNG 导出和历史月历。继续使用 `BackupPayload v3`。电脑端全量回归、Wave 3 Chrome 端到端 12 项及正式 APK 24 项检查通过。用户已试用并放行 Wave 4，具体真机细项未逐条确认。
+常用回滚版为 **0.1.19 / versionCode 20**（2026-11-18）。[MOTION-0.1.19-release.apk](apk/MOTION-0.1.19-release.apk)（4,235,678 字节，SHA-256 `cffb2df612c83f3c9d9448f907b1367e93a5f7d617ebe7d01211a48397bcb4db`）。本版合并趋势图实心红点和 Wave 3，包含完训时可选同步回原计划、历史纠错、渐进提示与配片速算，以及 PR 印章、小票 PNG 导出和历史月历。继续使用 `BackupPayload v3`。电脑端全量回归、Wave 3 Chrome 端到端 12 项及正式 APK 24 项检查通过。用户已试用并放行 Wave 4，具体真机细项未逐条确认。
 
-上一完整签名 release 候选包为 **0.1.18 / versionCode 19**（2026-11-18）：针对 **0.1.17** 荣耀真机反馈完成 Wave 2 五项专项返工优化（保持 `BackupPayload v3` 100% 兼容）：① F09 左滑悬停松手删除调优（`380ms` 悬停、`78%` 位移比 + `40px` 左屏边缘感应、`48px` 拇指弧线容差，并修复滑入页面左 `16px` 边距后松手误取消）；② 统计页纯 SVG 趋势折线图补齐纵轴刻度与横轴中间日期刻度，支持点按任意数据点查看当次日期、重量与有效次数；③ 动作检索升级为 ICU 411 音节二分 + 前缀模糊匹配（同时支持 `WT`/`YT` 首字母与 `Wo`/`Wotui`/`Yin`/`Yinti` 不完整/全拼检索）；④ 计划日卡片置顶描边「完整编排」按钮、训练中卡片正面直露「编辑」按钮；⑤ 配置弹层（`ExerciseEditor` / `DropSetEditor`）智能跟随锁（改第 1 轮/组自动同步未单改后续轮/组，单改第 2/3 轮/组自动独立）及训练中首组正重量自动预填空白后续同阶段组。电脑阶段全套回归（类型检查、101 文件 1322 单测、24 项纯 JVM 原生测试、DOM 134、G1/G2/G04 14、Plans B4R2 19、F11/W02/G2A/R02/G3B/M02 全部专项及 0.1.18 真 Chrome 9 项端到端探针）与完整 Gradle debug+release 构建退出 0；实际 APK 23 项独立验签、16KB zipalign、编译布局 `MotionWebView`、内置资源及 38 个前置条目（含 0.1.15、0.1.16、0.1.17）零漂移校验通过。荣耀已抽测主要流程并提出趋势图红点反馈，首页备份提醒待真机触发（不能把电脑端检查当作真机 PASS），未公开发布。
-
-上一完整签名 release 候选包为 **0.1.17 / versionCode 18**（2026-11-18）：[apk/MOTION-0.1.17-release.apk](apk/MOTION-0.1.17-release.apk)（**4,211,655 字节**，SHA256 `4e3534e1a13ead9d0162f96407fba8abd8f2dcb6a9a64241ba4e82ca503c0a6a`）保留原路径与原字节；完成 Wave 2 初始跨页逻辑弥合升级，用户真机实测提出五项优化要求，已由 0.1.18 返工收口。
-
-上一已真机确认 release 包为 **0.1.16 / versionCode 17**（2026-11-18）：[apk/MOTION-0.1.16-release.apk](apk/MOTION-0.1.16-release.apk)（**4,203,245 字节**，SHA256 `9982baa61f6ef2bd06fe0fa23a694dde81f0d89046c29a5284b18e383c23ba5c`）保留原路径与原字节；针对 **0.1.15** 真机录屏反馈修复卡片松手回落文字残影与冷启动首次切底部 Tab 秒开，**用户已在荣耀真机安装实测确认顺滑通过**。
-
-上一完整签名 release 候选包 **0.1.15 / versionCode 16**（2026-11-18）：[apk/MOTION-0.1.15-release.apk](apk/MOTION-0.1.15-release.apk)（**4,202,146 字节**，SHA256 `969e033031c043d4c73e4024d8f84f64e548fcaec57867e5f62496def5744c81`）保留原路径与原字节；完成 Wave 0 + Wave 1 全量优化，用户已在荣耀真机安装实测并反馈松手回落残影与首次切 Tab 短暂加载，已由 0.1.16 针对性收口。
-
-上一已真机确认 release 包为 **0.1.14 / versionCode 15**（2026-11-18）：[apk/MOTION-0.1.14-release.apk](apk/MOTION-0.1.14-release.apk)（**4,187,477 字节**，SHA256 `1d0a8e696f11924ea9ac358fbe578893324b114ef72f13a05e2b98b91e16aa1e`）保留原路径与原字节；完成非输入区原生长按/`ActionMode`/`dispatchDragEvent` 三层门禁与手势协调器收敛优化，**用户已在荣耀真机安装确认长按拖动排序正常**。中间候选包 0.1.9–0.1.13 完整保留在本机磁盘供回滚，按 `.gitignore` 规则不重复入库。
-
-上一完整签名 release 候选包 **0.1.13 / versionCode 14**（2026-11-17）：[apk/MOTION-0.1.13-release.apk](apk/MOTION-0.1.13-release.apk)（**4,184,602 字节**，SHA256 `c83544e426fa8aa12ebd5ed0c2f998a9ba62f98d8e4ef091f0ac8e386954d27f`）保留原路径与原字节；包含 W02 重量简化、M02 编辑替换动作带入上次记忆、G03 电脑多触点取消修复。
-
-更早完整签名 release 候选包 **0.1.12 / versionCode 13**（2026-11-16）：[apk/MOTION-0.1.12-release.apk](apk/MOTION-0.1.12-release.apk)（**4,182,214 字节**，SHA256 `18c14a0feeefd3aae88f929df2e5cd0e61c2fff8b10efc1dc5b520d13dc054a4`）保留原路径与原字节；电脑验收通过，尚未安装手机，真机通知、文字选择菜单与拖拽等仍待验收。
-
-| 项目 | 当前本地完整签名测试候选包 |
-|---|---|
-| 文件 | [apk/MOTION-0.1.18-release.apk](apk/MOTION-0.1.18-release.apk) |
-| 版本 | versionName **0.1.18** / versionCode **19** |
-| 大小 | **4,218,498 字节** |
-| SHA256 | `b8cec0ee7755e267e2d8a9a4427bc97308faf603cc2d2d3fbbf608e567281679` |
-| 包名 | `app.motion.personal` |
-| 原生 origin | `https://localhost` |
-| 签名证书 SHA256 | `d423bf800e7c275c5cd3c556912a7d64f08f78569675072de84925659fe964bb` |
-| 定位 | 本地完整签名 release 候选包；电脑阶段 23 项验包通过，**待荣耀真机覆盖升级验收**；未公开发布 |
-
-上一版本 **0.1.11 / versionCode 12**（[apk/MOTION-0.1.11-release.apk](apk/MOTION-0.1.11-release.apk)，4,173,989 字节，SHA256 `242dde8f802e97f4db4880f2484883e86e03872123943b8c5c3114833bbd1d24`）及其它旧包保留原路径与原字节。
-
-历史 **0.1.9 / versionCode 10**（[apk/MOTION-0.1.9-release.apk](apk/MOTION-0.1.9-release.apk)，**4,138,326 字节**，SHA256 `59c4a39a874943d4f5b1ff5598d2385e9630ae486eed61630d176f37e4678b31`）保留原路径与原字节；0.1.8 及更早包同样保留原路径与原字节。保留旧包不表示可以直接覆盖降级。
-
-[0.1.2 参考包](apk/MOTION-0.1.2-release.apk)继续保留原路径与原字节：versionCode **3**，**4,061,699 字节**，SHA256 `d4ed05a95ea2649066498b50aa6feafb3e69f58641f02d93f514c946dcb5d4a1`。保留旧包不表示可以直接覆盖降级。
+对应的回滚源码为 Git 提交 `e1c675e`。更早的 APK 在本机 `_archive/maintenance-20261118-020/apk/`；路径与校验值见同目录上一级的 `MANIFEST.json`。详细的旧版本记录可查[整理前的维护说明](https://github.com/bluebirdflew4288-ui/motion-personal-training/blob/2809b5cdc61f5e8eea430c9fe32b83f135a1ad2f/MAINTENANCE.md)。
 
 ## 2. 日常命令与输出
 
@@ -51,7 +22,7 @@
 |---|---|
 | `npm ci` | 按锁文件重建依赖 |
 | `npm run typecheck` | TypeScript 类型检查 |
-| `npm test` | 全量单元测试（101 文件，1322 测试） |
+| `npm test` | 全量单元测试（103 文件，1348 测试） |
 | `npm run android:test:java` | 原生逻辑的纯 JVM 测试（24 个 Java 测试类）；不需要手机或 Android SDK |
 | `npm run android:apk:release` | 完整 Android 打包：SDK 检查 → 类型检查 → 全量单测 → JVM 测试 → `dist-android` → `cap sync` → 静态门禁 → Gradle debug/release；签名目录由 `MOTION_SIGNING_DIR` 指定 |
 | `npm run test:dom` | 真实 DOM 关键缺陷回归测试（10 套件 134 项） |
@@ -87,9 +58,9 @@ Android 完整打包需要 SDK 与必需检查先通过；失败时应在写入 
 
 **不要卸载后重装**：卸载或清除应用数据会删除本机数据库。0.1.7 的此前覆盖升级已由用户确认计划与历史保留；后续每个新包仍需逐次验证，不能沿用该结论。
 
-新包 versionCode 必须递增：当前已构建候选包为 **19**（0.1.18），下一候选至少为 **20**。Android 会限制低版本覆盖，不应直接用旧 APK 降级或通过卸载绕过。确需回退时先明确数据备份、恢复方案与安装身份，再执行经确认的操作。
+新包 versionCode 必须递增：当前版本为 **21**（0.2.0），下一个安装包至少为 **22**。Android 会限制低版本覆盖，不应直接用旧 APK 降级或通过卸载绕过。确需回退时先明确数据备份、恢复方案与安装身份，再执行经确认的操作。
 
-新包使用新文件名，不能覆盖现有 0.1.16、0.1.15、0.1.14、0.1.13、0.1.12、0.1.11、0.1.10、0.1.9、0.1.8、0.1.7、0.1.2 或其他受保护材料。签名文件、密码、个人备份、缓存和浏览器 profile 不入版本库。
+新包应使用新的版本号和文件名。回滚到 0.1.19 时，数据恢复需要升级前的 v3 备份。签名文件、密码、个人备份、缓存和浏览器 profile 留在本机。
 
 ## 5. 真机结论与待验证范围
 
@@ -102,6 +73,6 @@ Android 完整打包需要 SDK 与必需检查先通过；失败时应在写入 
 ## 6. 保留与历史导航
 
 - `app/src/`、`app/test/`、`app/android/`、`app/public/`、锁文件及模板文档是维护输入。
-- 历史 `dist`、`dist-v2`…`dist-v8`、既有 APK、`_rollback/`、`_archive/` 和本机保留的验证材料不因本次文档整理而移动或删除。
+- 本机旧安装包、旧构建和测试证据归档到 `_archive/maintenance-20261118-020/`。恢复位置见归档的 `MANIFEST.json`。
 - `_rollback/v2-snapshot-20261021b/src/` 是历史迁移测试依赖，须与测试一起保留，不能把所有 rollback 当作可清理缓存。
 - [历史索引](docs/history/README.md)提供本次整理前的 README/MAINTENANCE 原文与 SHA256；其中各阶段状态、命令与机器路径只作为当时证据。迁移和恢复背景另见 [GITHUB-SYNC-FOLLOWUP.md](GITHUB-SYNC-FOLLOWUP.md)。
