@@ -43,6 +43,7 @@ import {
   type RestReminderStatus,
   type SettingsTarget,
 } from '../lib/restReminder';
+import { CoachHeaderButton } from '../coach/CoachHeaderButton';
 
 /* 复用 repo 的单一真源（第4阶段对齐候选 0.1.3；不再各写一份） */
 const APP_VERSION = CURRENT_APP_VERSION;
@@ -598,9 +599,12 @@ export function SettingsPage() {
 
   return (
     <main className="page page-top page-bottom-space">
-      <h1 className="h-serif" style={{ fontSize: 26 }}>
-        设置
-      </h1>
+      <header style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
+        <h1 className="h-serif" style={{ fontSize: 26 }}>
+          设置
+        </h1>
+        <CoachHeaderButton compact />
+      </header>
       <hr className="rule-line" style={{ marginTop: 8 }} />
 
       {/* 主题 */}

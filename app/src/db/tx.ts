@@ -580,6 +580,14 @@ export function atomicWriteSession(opts: WriteOptions): Promise<WriteResult> {
                 return;
               }
               if (curStatus !== 'active') {
+                if (intent.kind === 'finish' && curStatus !== 'completed') {
+                  abort(fail('state-conflict', '这条训练已经放弃，不能按完成结束', current));
+                  return;
+                }
+                if (intent.kind === 'discard' && curStatus !== 'discarded') {
+                  abort(fail('state-conflict', '这条训练已经完成，不能再放弃', current));
+                  return;
+                }
                 // ④ 无条件幂等：**不写库**，因此不需要等提交，可以立即返回既有结果。
                 // 注意这不会影响真实写分支的提交确认（那条路径走 finishWrite → oncomplete）。
                 immediateSuccess = {
@@ -590,6 +598,16 @@ export function atomicWriteSession(opts: WriteOptions): Promise<WriteResult> {
                 };
                 // 没有排入任何写入，可以立即返回（不受提交结果影响）
                 done(immediateSuccess);
+                return;
+              }
+              if (expectedRevision !== undefined && expectedRevision !== curRev) {
+                abort(
+                  fail(
+                    'version-conflict',
+                    '这条记录已有新版本，请先确认最新修改已保存后再结束或放弃',
+                    current,
+                  ),
+                );
                 return;
               }
               // 结束/放弃都以**事务内最新记录**为数据底，只应用终态字段，
@@ -940,6 +958,7 @@ export function atomicDiscardSession(args: {
     intent: { kind: 'discard' },
     session,
     editorId: guard?.editorId,
+    expectedRevision: typeof guard?.expectedVersion === 'number' ? guard.expectedVersion : undefined,
     ttlMs: guard?.ttlMs,
     lockPolicy: guard?.lockPolicy ?? 'required',
   });

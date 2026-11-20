@@ -53,6 +53,7 @@ import { normalizeCardioParams, validateCardioParams as checkCardioParams, valid
 import { CARDIO_PRESETS, TRAINING_FOCUSES } from '../domain/types';
 import { parseSetupNote } from '../domain/setupNote';
 import { isLocalDateKey } from '../domain/localDate';
+import { cleanOrphanPairIds, isValidUuidV4 } from '../domain/supersetPair';
 
 export interface ValidationIssue {
   path: string;
@@ -431,6 +432,15 @@ function validatedSetupNote(c: Ctx, value: unknown, path: string): { setupNote?:
   return result.note === undefined ? {} : { setupNote: result.note };
 }
 
+function validatedPairId(c: Ctx, value: unknown, path: string): { pairId?: string } {
+  if (value === undefined) return {};
+  if (!isValidUuidV4(value)) {
+    c.add(path, '超级组配对 ID 必须是合法的 UUID v4');
+    return {};
+  }
+  return { pairId: value.trim().toLowerCase() };
+}
+
 /* ── 计划 ───────────────────────────────── */
 
 function validatePlanExercise(c: Ctx, v: unknown, path: string): PlanExercise | null {
@@ -448,6 +458,7 @@ function validatePlanExercise(c: Ctx, v: unknown, path: string): PlanExercise | 
     restSec: num(c, v.restSec, `${path}.restSec`, { min: 0, max: MAX_REST, integer: true }) ?? 120,
     target,
     ...validatedSetupNote(c, v.setupNote, `${path}.setupNote`),
+    ...validatedPairId(c, v.pairId, `${path}.pairId`),
     note: v.note === undefined ? undefined : str(c, v.note, `${path}.note`, { max: MAX_TEXT, optional: true }),
     substitutes: Array.isArray(v.substitutes)
       ? (v.substitutes.length > MAX_EXERCISES
@@ -470,9 +481,11 @@ function validatePlanDay(c: Ctx, v: unknown, path: string): PlanDay | null {
   } else if (v.exercises.length > MAX_EXERCISES) {
     c.add(`${path}.exercises`, `动作数 ${v.exercises.length} 超过上限 ${MAX_EXERCISES}`);
   } else {
-    exercises = v.exercises
-      .map((ex, i) => validatePlanExercise(c, ex, `${path}.exercises[${i}]`))
-      .filter((x): x is PlanExercise => x !== null);
+    exercises = cleanOrphanPairIds(
+      v.exercises
+        .map((ex, i) => validatePlanExercise(c, ex, `${path}.exercises[${i}]`))
+        .filter((x): x is PlanExercise => x !== null),
+    );
     if (exercises.length !== v.exercises.length) c.add(`${path}.exercises`, '存在无法解析的动作');
   }
   // 计划热身同样要有上限：超限明确拒绝，绝不裁剪。
@@ -689,6 +702,7 @@ function validateSessionExercise(c: Ctx, v: unknown, path: string): SessionExerc
     note: v.note === undefined ? undefined : str(c, v.note, `${path}.note`, { max: MAX_TEXT, optional: true }),
     replacedFrom: v.replacedFrom === undefined ? undefined : str(c, v.replacedFrom, `${path}.replacedFrom`, { max: 200, optional: true }),
     added: typeof v.added === 'boolean' ? v.added : undefined,
+    ...validatedPairId(c, v.pairId, `${path}.pairId`),
   };
 }
 
@@ -711,9 +725,11 @@ function validateSession(c: Ctx, v: unknown, path: string): Session | null {
     if (v.exercises.length > MAX_EXERCISES) {
       c.add(`${path}.exercises`, `动作数 ${v.exercises.length} 超过上限 ${MAX_EXERCISES}`);
     }
-    exercises = v.exercises
-      .map((ex, i) => validateSessionExercise(c, ex, `${path}.exercises[${i}]`))
-      .filter((x): x is SessionExercise => x !== null);
+    exercises = cleanOrphanPairIds(
+      v.exercises
+        .map((ex, i) => validateSessionExercise(c, ex, `${path}.exercises[${i}]`))
+        .filter((x): x is SessionExercise => x !== null),
+    );
     if (exercises.length !== v.exercises.length) c.add(`${path}.exercises`, '存在无法解析的动作');
   }
 

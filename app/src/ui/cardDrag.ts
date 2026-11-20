@@ -11,6 +11,7 @@ import { useSyncExternalStore } from 'react';
 import { SWIPE_SETTLE_MS, TAKEOVER_GUARD_MS, autoScrollVelocity, dropIndexFor, orderAfterDrop } from './cardGestures';
 import { installSelectionGuard } from './selectionGuard';
 import { triggerDragLiftHaptic } from '../lib/haptics';
+import { getPaneScrollContext } from './paneCoords';
 
 const DROP_SETTLE_MS = 130;
 const DROP_SETTLE_TIMEOUT_MS = 160;
@@ -294,11 +295,15 @@ class CardDragStore {
     this.elements = Array.from(
       document.querySelectorAll<HTMLElement>(`[${ZONE_ATTR}="${args.kind}"][${ID_ATTR}]`),
     );
+    const ctx = getPaneScrollContext(this.elements[0] ?? null);
     this.layouts = this.elements.map((el) => {
       const r = el.getBoundingClientRect();
-      return { top: r.top + window.scrollY, height: r.height };
+      return {
+        top: (r.top - ctx.stageTop) / ctx.scale + ctx.scrollTop,
+        height: r.height / ctx.scale,
+      };
     });
-    this.startPageY = args.pointerY + window.scrollY;
+    this.startPageY = (args.pointerY - ctx.stageTop) / ctx.scale + ctx.scrollTop;
     this.startViewportY = args.pointerY;
     this.armPanGuard();
     this.liftSource(args.id);
@@ -343,7 +348,8 @@ class CardDragStore {
   private recompute(): void {
     const snap = this.snap;
     if (!snap || this.settleControl) return;
-    const pageY = this.pointerY + window.scrollY;
+    const ctx = getPaneScrollContext(this.sourceEl ?? this.elements[0] ?? null);
+    const pageY = (this.pointerY - ctx.stageTop) / ctx.scale + ctx.scrollTop;
     const overIndex = dropIndexFor(pageY, this.layouts);
     const offsetY = pageY - this.startPageY;
     if (offsetY !== 0) this.hasMovedSinceLift = true;
@@ -355,18 +361,22 @@ class CardDragStore {
   private liftSource(id: string): void {
     const el = this.elements.find((e) => e.getAttribute(ID_ATTR) === id) ?? null;
     if (!el) return;
+    const ctx = getPaneScrollContext(el);
     const r = el.getBoundingClientRect();
     const shadowEl =
       typeof el.querySelector === 'function'
         ? (el.querySelector<HTMLElement>('.reorder-card-body') ?? el)
         : el;
+    const logicalLeft = (r.left - ctx.stageLeft) / ctx.scale;
+    const logicalTop = (r.top - ctx.stageTop) / ctx.scale;
+    const logicalWidth = r.width / ctx.scale;
     this.sourceEl = el;
     this.sourceShadowEl = shadowEl;
-    this.sourceFixedTop = r.top;
+    this.sourceFixedTop = logicalTop;
     this.sourceStyle = { cssText: el.style.cssText };
     const ph = document.createElement('div');
     ph.setAttribute('data-drag-placeholder', id);
-    ph.style.height = `${r.height}px`;
+    ph.style.height = `${r.height / ctx.scale}px`;
     ph.style.width = '100%';
     ph.style.pointerEvents = 'none';
     ph.style.userSelect = 'none';
@@ -374,9 +384,9 @@ class CardDragStore {
     el.parentElement?.insertBefore(ph, el);
     this.placeholder = ph;
     el.style.position = 'fixed';
-    el.style.left = `${r.left}px`;
-    el.style.top = `${r.top}px`;
-    el.style.width = `${r.width}px`;
+    el.style.left = `${logicalLeft}px`;
+    el.style.top = `${logicalTop}px`;
+    el.style.width = `${logicalWidth}px`;
     el.style.margin = '0';
     el.style.zIndex = '60';
     el.style.pointerEvents = 'none';
@@ -408,7 +418,8 @@ class CardDragStore {
   private applyVisuals(): void {
     const snap = this.snap;
     if (!snap) return;
-    const dy = this.pointerY - this.startViewportY;
+    const ctx = getPaneScrollContext(this.sourceEl ?? this.elements[0] ?? null);
+    const dy = (this.pointerY - this.startViewportY) / ctx.scale;
     this.elements.forEach((el, i) => {
       if (el.getAttribute(ID_ATTR) === snap.id) {
         if (this.hasMovedSinceLift) el.style.transition = 'none';
@@ -450,9 +461,11 @@ class CardDragStore {
     const step = () => {
       this.raf = 0;
       if (!this.snap) return;
-      const v = autoScrollVelocity(this.pointerY, 0, window.innerHeight);
+      const ctx = getPaneScrollContext(this.sourceEl ?? this.elements[0] ?? null);
+      const localPointerY = (this.pointerY - ctx.stageTop) / ctx.scale;
+      const v = autoScrollVelocity(localPointerY, 0, ctx.viewportHeight);
       if (v === 0) return;
-      window.scrollBy(0, v);
+      ctx.scrollBy(v);
       this.recompute();
       this.emit();
       this.raf = window.requestAnimationFrame(step);
@@ -628,19 +641,21 @@ class CardDragStore {
       return;
     }
 
+    const ctx = getPaneScrollContext(sourceEl);
     const phRect = this.placeholder?.getBoundingClientRect() ?? null;
+    const phLogicalTop = phRect ? (phRect.top - ctx.stageTop) / ctx.scale : null;
     const targetSlot = snap.overIndex > snap.fromIndex ? snap.overIndex - 1 : snap.overIndex;
     let targetViewportTop: number;
-    if (targetSlot === snap.fromIndex && phRect) {
-      targetViewportTop = phRect.top;
+    if (targetSlot === snap.fromIndex && phLogicalTop !== null) {
+      targetViewportTop = phLogicalTop;
     } else if (targetSlot >= 0 && targetSlot < this.layouts.length) {
       const slotPageTop =
         targetSlot > snap.fromIndex
           ? this.layouts[targetSlot].top + this.layouts[targetSlot].height - snap.height
           : this.layouts[targetSlot].top;
-      targetViewportTop = slotPageTop - window.scrollY;
+      targetViewportTop = slotPageTop - ctx.scrollTop;
     } else {
-      targetViewportTop = phRect ? phRect.top : this.sourceFixedTop;
+      targetViewportTop = phLogicalTop ?? this.sourceFixedTop;
     }
     const targetDy = targetViewportTop - this.sourceFixedTop;
     const shadowEl = this.sourceShadowEl ?? sourceEl;

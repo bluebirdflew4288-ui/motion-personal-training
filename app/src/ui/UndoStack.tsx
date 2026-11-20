@@ -10,6 +10,9 @@
    本层不新增跨页持久历史（纯渲染当前批）。 */
 
 import { useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
+import { getPaneScopeRoot } from './paneCoords';
+import { usePaneRole } from '../coach/FloatingWindowFrame';
 
 export interface UndoStackItem {
   token: string;
@@ -28,6 +31,7 @@ interface Props {
 }
 
 export function UndoStack({ items, undoneCount, busy, onUndo }: Props) {
+  const paneRole = usePaneRole();
   const boxRef = useRef<HTMLDivElement>(null);
   /**
    * 倒计时刷新信号（只用于触发重渲染）。
@@ -52,10 +56,12 @@ export function UndoStack({ items, undoneCount, busy, onUndo }: Props) {
   useEffect(() => {
     const el = boxRef.current;
     if (!el) return undefined;
-    const rootEl = document.documentElement;
+    const scopeRoot = getPaneScopeRoot(el);
     const apply = () => {
       const h = Math.ceil(el.getBoundingClientRect().height);
-      rootEl.style.setProperty('--undo-lift', `${h + 8}px`);
+      const scaleRaw = Number(scopeRoot.getAttribute('data-pane-scale') ?? '1');
+      const scale = Number.isFinite(scaleRaw) && scaleRaw > 0 ? scaleRaw : 1;
+      scopeRoot.style.setProperty('--undo-lift', `${Math.ceil(h / scale) + 8}px`);
     };
     apply();
     let ro: ResizeObserver | null = null;
@@ -67,13 +73,13 @@ export function UndoStack({ items, undoneCount, busy, onUndo }: Props) {
     return () => {
       ro?.disconnect();
       window.removeEventListener('resize', apply);
-      rootEl.style.removeProperty('--undo-lift');
+      scopeRoot.style.removeProperty('--undo-lift');
     };
-  }, [items.length]);
+  }, [items.length, paneRole]);
 
   if (!items.length) return null;
 
-  return (
+  const node = (
     <div
       className="undo-stack"
       data-testid="delete-undo-stack"
@@ -111,4 +117,9 @@ export function UndoStack({ items, undoneCount, busy, onUndo }: Props) {
       </div>
     </div>
   );
+
+  if (paneRole === 'primary' && typeof document !== 'undefined') {
+    return createPortal(node, document.body);
+  }
+  return node;
 }

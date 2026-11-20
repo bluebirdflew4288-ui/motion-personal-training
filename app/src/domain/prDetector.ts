@@ -9,6 +9,7 @@
 import { comparabilityOf, modeOf } from './comparability';
 import { isSetLogged } from './session';
 import { sessionKindOf } from './sessionKind';
+import { collectSingleMovementIds, filterComparableSetsForExercise } from './supersetPair';
 import type { DumbbellBasis, Session, SessionExercise, WeightMode } from './types';
 import { fmtWeight } from '../lib/format';
 
@@ -49,9 +50,13 @@ interface ValidPositiveSet {
   weightGrams: number | null;
 }
 
-function collectPositiveSets(ex: SessionExercise): ValidPositiveSet[] {
+function collectPositiveSets(
+  ex: SessionExercise,
+  hasSingleStraightHistory = false,
+): ValidPositiveSet[] {
+  const { eligibleSets } = filterComparableSetsForExercise(ex, { hasSingleStraightHistory });
   const out: ValidPositiveSet[] = [];
-  for (const s of ex.sets) {
+  for (const s of eligibleSets) {
     if (!isSetLogged(s)) continue;
     if (typeof s.reps !== 'number' || !Number.isFinite(s.reps) || s.reps <= 0) continue;
     const hasW = typeof s.weightKg === 'number' && Number.isFinite(s.weightKg) && s.weightKg >= 0;
@@ -94,6 +99,7 @@ export function detectSessionPRs(
       sessionKindOf(s) !== 'rest' &&
       isChronologicallyBefore(s, targetSession),
   );
+  const singleIds = collectSingleMovementIds([...priorSessions, targetSession]);
 
   // 将目标会话内的动作按可比口径聚合（保留首个具有正次数记录的实例 ID 作为印章落点）
   const targetGroups = new Map<
@@ -105,7 +111,7 @@ export function detectSessionPRs(
   >();
 
   for (const ex of targetSession.exercises) {
-    const sets = collectPositiveSets(ex);
+    const sets = collectPositiveSets(ex, singleIds.has(ex.exerciseId));
     if (sets.length === 0) continue;
     const key = comparabilityOf(ex);
     const existing = targetGroups.get(key);
@@ -118,6 +124,7 @@ export function detectSessionPRs(
 
   for (const [key, { primaryEx, sets: curSets }] of targetGroups) {
     const { weightMode, dumbbellBasis } = modeOf(primaryEx);
+    const hasSingleStraightHistory = singleIds.has(primaryEx.exerciseId);
 
     let priorSessionCount = 0;
     const priorWeightsGrams: number[] = [];
@@ -128,7 +135,7 @@ export function detectSessionPRs(
       let hitInSession = false;
       for (const pex of ps.exercises) {
         if (comparabilityOf(pex) !== key) continue;
-        const pSets = collectPositiveSets(pex);
+        const pSets = collectPositiveSets(pex, hasSingleStraightHistory);
         if (pSets.length === 0) continue;
         hitInSession = true;
         for (const st of pSets) {

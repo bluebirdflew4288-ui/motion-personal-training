@@ -11,6 +11,7 @@
 import type { ExerciseTarget, Session, SessionExercise, SessionSet, WeightMode, DumbbellBasis } from './types';
 import { comparabilityKey, comparabilityLabel, WEIGHT_MODE_LABEL } from './identity';
 import { roundStagesOf } from './exerciseConfig';
+import { collectSingleMovementIds, filterComparableSetsForExercise } from './supersetPair';
 
 /** 从任意 session 动作取出它的计量口径 */
 export function modeOf(ex: SessionExercise): { weightMode: WeightMode; dumbbellBasis: DumbbellBasis } {
@@ -195,13 +196,18 @@ export interface MovementPerformance {
 }
 
 /** 把单个 SessionExercise 变成一个结构片段 */
-export function fragmentOf(ex: SessionExercise): MovementFragment {
-  const structure = structureOf(ex);
-  const logged = ex.sets
+export function fragmentOf(
+  ex: SessionExercise,
+  opts?: { hasSingleStraightHistory?: boolean },
+): MovementFragment {
+  const { eligibleSets, excludedAmbiguous } = filterComparableSetsForExercise(ex, opts);
+  const filteredEx = excludedAmbiguous ? { ...ex, sets: eligibleSets } : ex;
+  const structure = structureOf(filteredEx);
+  const logged = eligibleSets
     .filter(isLogged)
     .sort((a, b) => a.roundIndex - b.roundIndex || a.stageIndex - b.stageIndex);
   const completeStages = structure
-    .filter((g) => groupIsComplete(ex, g))
+    .filter((g) => groupIsComplete(filteredEx, g))
     .reduce((n, g) => n + g.stageCount, 0);
   return {
     sessionExerciseId: ex.id,
@@ -216,8 +222,8 @@ export function fragmentOf(ex: SessionExercise): MovementFragment {
       roundIndex: s.roundIndex,
       stageIndex: s.stageIndex,
     })),
-    completeGroups: groupsComplete(ex),
-    partialGroups: groupsPartial(ex),
+    completeGroups: groupsComplete(filteredEx),
+    partialGroups: groupsPartial(filteredEx),
     loggedStages: logged.length,
     completeStages,
   };
@@ -270,12 +276,13 @@ export function collectMovementFragments(
   session: Session,
   exerciseId: string,
   mode: { weightMode: WeightMode; dumbbellBasis: DumbbellBasis },
+  opts?: { hasSingleStraightHistory?: boolean },
 ): MovementPerformance | null {
   const matched = session.exercises.filter(
     (ex) => (ex.exerciseId ?? ex.name) === exerciseId && sameMode(modeOf(ex), mode),
   );
   if (!matched.length) return null;
-  const fragments = matched.map(fragmentOf).filter((f) => f.loggedStages > 0);
+  const fragments = matched.map((ex) => fragmentOf(ex, opts)).filter((f) => f.loggedStages > 0);
   if (!fragments.length) return null;
   return perfFromFragments(session, exerciseId, mode, fragments);
 }
@@ -370,6 +377,8 @@ export function buildComparableHistory(
   const done = sessions
     .filter((s) => s.status === 'completed' && s.endedAt)
     .sort((a, b) => a.startedAt - b.startedAt);
+  const singleIds = collectSingleMovementIds(done);
+  const hasSingleStraightHistory = singleIds.has(exerciseId);
 
   // 找出所有出现过的「动作 + 口径」组合
   const modes = new Map<string, { weightMode: WeightMode; dumbbellBasis: DumbbellBasis }>();
@@ -389,7 +398,7 @@ export function buildComparableHistory(
     for (let i = done.length - 1; i >= 0 && !chosen; i--) {
       for (const ex of done[i].exercises) {
         if ((ex.exerciseId ?? ex.name) !== exerciseId) continue;
-        if (!ex.sets.some(isLogged)) continue;
+        if (!filterComparableSetsForExercise(ex, { hasSingleStraightHistory }).eligibleSets.some(isLogged)) continue;
         chosen = modeOf(ex);
         name = ex.name;
         break;
@@ -401,7 +410,7 @@ export function buildComparableHistory(
   const entries: ComparableHistoryEntry[] = [];
   for (const s of done) {
     // V4-04 A：同一次训练里同口径的多个片段聚合成一条（不再一段一条）
-    const perf = collectMovementFragments(s, exerciseId, chosen);
+    const perf = collectMovementFragments(s, exerciseId, chosen, { hasSingleStraightHistory });
     if (!perf) continue;
     name = name || perf.name;
     const sets = perf.fragments.flatMap((f) => f.sets);
@@ -449,13 +458,15 @@ export function listComparabilityModes(
   sessions: Session[],
   exerciseId: string,
 ): Array<{ weightMode: WeightMode; dumbbellBasis: DumbbellBasis; label: string; count: number }> {
+  const singleIds = collectSingleMovementIds(sessions);
+  const hasSingleStraightHistory = singleIds.has(exerciseId);
   const map = new Map<string, { weightMode: WeightMode; dumbbellBasis: DumbbellBasis; count: number }>();
   for (const s of sessions) {
     if (s.status !== 'completed' || !s.endedAt) continue;
     const seen = new Set<string>();
     for (const ex of s.exercises) {
       if ((ex.exerciseId ?? ex.name) !== exerciseId) continue;
-      if (!ex.sets.some(isLogged)) continue;
+      if (!filterComparableSetsForExercise(ex, { hasSingleStraightHistory }).eligibleSets.some(isLogged)) continue;
       const m = modeOf(ex);
       const k = `${m.weightMode}::${m.dumbbellBasis}`;
       if (seen.has(k)) continue;

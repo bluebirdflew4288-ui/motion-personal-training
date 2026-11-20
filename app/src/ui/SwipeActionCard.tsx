@@ -36,6 +36,7 @@ import {
   type CardDragSnapshot,
   type ReorderKind,
 } from './cardDrag';
+import { useOptionalDualWindow } from '../coach/windowState';
 
 interface Props {
   children: React.ReactNode;
@@ -142,8 +143,12 @@ export function SwipeActionCard({
   readyToDeleteRef.current = readyToDelete;
   const hapticFiredRef = useRef(false);
 
-  const lockedRef = useRef(Boolean(locked));
-  lockedRef.current = Boolean(locked);
+  const dual = useOptionalDualWindow();
+  const inMiniPane = Boolean(dual && dual.primaryPane !== 'business');
+  const effectiveLocked = Boolean(locked) || inMiniPane;
+
+  const lockedRef = useRef(effectiveLocked);
+  lockedRef.current = effectiveLocked;
   const disabledRef = useRef(Boolean(disabled));
   disabledRef.current = Boolean(disabled);
 
@@ -275,9 +280,9 @@ export function SwipeActionCard({
     };
   }, [phase, disarmF09, cancelPointerGesture, clearPress, ownsOpen, setOffset, onDelete]);
 
-  /** F06/F12：只读或记录展开时立即取消手势、收起左滑且不提交排序 */
+  /** F06/F12 或业务页处于等比小窗态：立即取消手势、收起左滑且不提交排序 */
   useEffect(() => {
-    if (!locked && !disabled) return;
+    if (!effectiveLocked && !disabled) return;
     gestureSeqRef.current += 1;
     sessionRef.current = null;
     clearPress();
@@ -291,7 +296,7 @@ export function SwipeActionCard({
       if (testId) cardOpenStore.notifyClosing(testId);
       setOffset(0);
     }
-  }, [locked, disabled, reorderId, ownsOpen, setOffset, testId, clearPress, disarmF09]);
+  }, [effectiveLocked, disabled, reorderId, ownsOpen, setOffset, testId, clearPress, disarmF09]);
 
   /** 单张展开的视口外部点击收起（仅当前展开的那一张卡挂载监听） */
   useEffect(() => {
@@ -410,7 +415,8 @@ export function SwipeActionCard({
       data-reorder-kind={reorderId ? reorderKind : undefined}
       data-drag-source={isDragSource ? 'true' : undefined}
       data-reorder-index={reorderIndex}
-      data-gesture-lock={locked ? 'records-expanded' : disabled ? 'readonly' : undefined}
+      data-gesture-lock={locked ? 'records-expanded' : inMiniPane ? 'mini-pane' : disabled ? 'readonly' : undefined}
+      data-mini-pane-lock={inMiniPane ? 'true' : undefined}
       style={{
         position: 'relative',
         overflow: 'hidden',
@@ -512,6 +518,7 @@ export function SwipeActionCard({
         data-drag-handle={reorderId ? 'true' : undefined}
         onPointerDown={(e) => {
           if (disabled || lockedRef.current) return;
+          if ((e.currentTarget as Element).closest?.('[data-pane-stage="true"]')) return;
           if (isInteractive(e.target)) return;
           if (isMultitouchBlocked()) {
             cancelPointerGesture();

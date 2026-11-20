@@ -35,6 +35,7 @@ import { HistoryCalendar } from '../ui/HistoryCalendar';
 import { consumePendingFinishReceipt, ReceiptSlipSheet } from '../ui/ReceiptSlipSheet';
 import { deleteSession } from '../db/repo';
 import { atomicDeleteRest, revisionOf } from '../db/tx';
+import { CoachHeaderButton } from '../coach/CoachHeaderButton';
 
 export const HISTORY_BATCH_SIZE = 30;
 
@@ -146,13 +147,16 @@ export function HistoryPage() {
 
   return (
     <main className="page page-top page-bottom-space">
-      <header style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 12 }}>
+      <header style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
         <h1 className="h-serif" style={{ fontSize: 26 }}>
           训练历史
         </h1>
-        <span className="mono-label">
-          {!historyHydrated ? '正在读取…' : `${completed.length} 次完成`}
-        </span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span className="mono-label">
+            {!historyHydrated ? '正在读取…' : `${completed.length} 次完成`}
+          </span>
+          <CoachHeaderButton compact />
+        </div>
       </header>
       <hr className="rule-line" style={{ marginTop: 8 }} />
 
@@ -775,6 +779,7 @@ export function HistoryDetailPage({ id }: { id: string }) {
         >
           删除
         </button>
+        <CoachHeaderButton compact />
       </header>
 
       <section className="slip torn-bottom" style={{ marginTop: 12, padding: '16px 16px 24px' }}>

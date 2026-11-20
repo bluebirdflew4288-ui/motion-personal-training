@@ -5,6 +5,7 @@
 import { MAX_CARDIO_ENTRIES, MAX_EXERCISES } from './limits';
 import type { CardioEntry, Session, SessionExercise } from './types';
 import { exerciseRemovalProtection, removeExerciseFromSession } from './session';
+import { cleanOrphanPairIds } from './supersetPair';
 
 export type DeleteItemKind = 'exercise' | 'cardio';
 
@@ -148,7 +149,11 @@ export function applyDeleteItem(
   }
   let next: Session;
   if (preview.kind === 'exercise') {
-    next = removeExerciseFromSession(session, preview.itemId).session;
+    const removed = removeExerciseFromSession(session, preview.itemId).session;
+    next = {
+      ...removed,
+      exercises: cleanOrphanPairIds(removed.exercises),
+    };
   } else {
     const entryId = preview.itemId;
     next = {

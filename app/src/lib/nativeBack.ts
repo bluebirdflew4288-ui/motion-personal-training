@@ -21,14 +21,26 @@ import { backStack } from './backIntent';
 import { isNativePlatform } from './platform';
 
 type LeaveGuard = () => boolean | Promise<boolean>;
+type CoachBackHandler = () => boolean;
 
 let leaveGuard: LeaveGuard | null = null;
+let coachBackHandler: CoachBackHandler | null = null;
 let installed = false;
 let removeListener: (() => void) | null = null;
 
 /** 页面级离开守卫（当前挂载的页面注册，卸载时清空） */
 export function registerPageLeaveGuard(guard: LeaveGuard | null): void {
   leaveGuard = guard;
+}
+
+/** 第 3 层：电子教练窗口返回调度（主屏退小窗 / 小窗最小化），返回注销函数 */
+export function registerCoachBackHandler(handler: CoachBackHandler | null): () => void {
+  coachBackHandler = handler;
+  return () => {
+    if (coachBackHandler === handler) {
+      coachBackHandler = null;
+    }
+  };
 }
 
 /** 当前是否有页面守卫（诊断/测试） */
@@ -85,6 +97,7 @@ function replaceToHomeOnce(): void {
 export type BackOutcome =
   | { action: 'layer' }
   | { action: 'keyboard' }
+  | { action: 'coach' }
   | { action: 'blocked' }
   | { action: 'page' }
   | { action: 'exit' };
@@ -93,13 +106,26 @@ export type BackOutcome =
  * 处理一次返回意图（原生返回键与页面内「返回」按钮共用同一条路径）。
  *
  * @param opts.handleLayer 是否允许本次返回关闭最上层弹层（默认允许）
+ * @param opts.handleCoach 是否允许本次返回调度第 3 层教练窗口（默认允许；页面内「返回」按钮传 false）
  */
-export async function handleBackIntent(opts?: { handleLayer?: boolean }): Promise<BackOutcome> {
-  // ① 层 / 键盘：只做这两件事，绝不导航
+export async function handleBackIntent(opts?: {
+  handleLayer?: boolean;
+  handleCoach?: boolean;
+}): Promise<BackOutcome> {
+  // ① 层 / ② 键盘：只做这两件事，绝不导航
   if (opts?.handleLayer !== false) {
     const consumed = backStack.consumeLayerOnly();
     if (consumed === 'layer') return { action: 'layer' };
     if (consumed === 'keyboard') return { action: 'keyboard' };
+  }
+
+  // ③ 教练窗口层（教练为主屏 → 退回角落小窗；教练已在角落 → 最小化）
+  if (opts?.handleLayer !== false && opts?.handleCoach !== false && coachBackHandler) {
+    try {
+      if (coachBackHandler()) return { action: 'coach' };
+    } catch {
+      /* 教练层异常不阻断业务返回 */
+    }
   }
 
   // ② 页面离开守卫：必须先 await，且 false/异常一律不放行

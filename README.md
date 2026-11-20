@@ -4,6 +4,7 @@
 
 ## 当前状态
 
+- **0.2.1 / versionCode 22** 为试测源码（2026-11-20），包含电子教练双窗、会话管理、按模型选择思考档位、识图计划草稿和训练配片沿用修复。电脑端全量回归和本机签名包校验通过，荣耀真机和真实模型接口待验。已验收版本见下。
 - 当前已验收的签名版为 **0.2.0 / versionCode 21**（2026-11-18）。[MOTION-0.2.0-release.apk](apk/MOTION-0.2.0-release.apk)（4,238,877 字节，SHA-256 `aff30ea4960f302a824332c2fdaa5695ee695d95915c39d8027b471f20a5f058`）。Wave 4 新增跨计划器械档位备忘、动感单车／椭圆机／划船机／自由有氧四种预设，以及可取消选中的训练日分部标签。全量备份导出为 v4，可恢复合法的 v1–v3 备份。共享计划模板可导入 v1 或 v2，新字段要求 v2。电脑端全量回归、Wave 4 浏览器验证 9 项和正式 APK 验包 25 项通过。用户已确认本版通过。
 - 常用回滚版为 **0.1.19 / versionCode 20**（2026-11-18）。[MOTION-0.1.19-release.apk](apk/MOTION-0.1.19-release.apk)（4,235,678 字节，SHA-256 `cffb2df612c83f3c9d9448f907b1367e93a5f7d617ebe7d01211a48397bcb4db`）。本版合并趋势图实心红点和 Wave 3，包含完训时可选同步回原计划、历史纠错、渐进提示与配片速算，以及 PR 印章、小票 PNG 导出和历史月历。继续使用 `BackupPayload v3`。电脑端全量回归、Wave 3 Chrome 端到端 12 项及正式 APK 24 项检查通过。用户已试用并放行 Wave 4，具体真机细项未逐条确认。
 - 更早的本机安装包已在 `_archive/maintenance-20261118-020/apk/` 归档。原发布记录见[整理前的版本说明](https://github.com/bluebirdflew4288-ui/motion-personal-training/blob/2809b5cdc61f5e8eea430c9fe32b83f135a1ad2f/README.md)。

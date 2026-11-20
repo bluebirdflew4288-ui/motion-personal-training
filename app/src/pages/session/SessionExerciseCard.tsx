@@ -11,6 +11,7 @@ import { resolveGroupConfig } from '../../domain/exerciseConfig';
 import {
   addSetBlocker,
   addSetTo,
+  collectPrefillWeightFieldIds,
   describeTarget,
   dropRoundComplete,
   dropRoundSets,
@@ -18,6 +19,7 @@ import {
   hasReps,
   inheritPreviousCompleteRound,
   inheritPreviousCompleteRoundForExercise,
+  inheritStraightSetValues,
   isSetIncomplete,
   isSetLogged,
   lastRoundHasRecords,
@@ -171,6 +173,9 @@ function SetRow({
             onRawRisk={onRawRisk ? (risky) => onRawRisk(`${set.id}:reps`, risky) : undefined}
             rawDraft={rawDraftFor?.(`${set.id}:reps`)}
             onRawDraftChange={onRawDraft ? (raw) => onRawDraft(`${set.id}:reps`, raw) : undefined}
+            coachExId={source.sessionExerciseId}
+            coachSetId={set.id}
+            coachField="reps"
           />
         </div>
       </div>
@@ -194,6 +199,9 @@ function SetRow({
                 onRawRisk={onRawRisk ? (risky) => onRawRisk(`${set.id}:weight`, risky) : undefined}
                 rawDraft={rawDraftFor?.(`${set.id}:weight`)}
                 onRawDraftChange={onRawDraft ? (raw) => onRawDraft(`${set.id}:weight`, raw) : undefined}
+                coachExId={source.sessionExerciseId}
+                coachSetId={set.id}
+                coachField="weight"
               />
             </div>
             {onOpenPlateCalc ? (
@@ -227,6 +235,7 @@ export function areSessionExercisesEqual(a: SessionExercise, b: SessionExercise)
     a.planExerciseId !== b.planExerciseId ||
     a.replacedFrom !== b.replacedFrom ||
     a.added !== b.added ||
+    a.pairId !== b.pairId ||
     a.restSec !== b.restSec ||
     a.status !== b.status ||
     a.note !== b.note
@@ -253,7 +262,8 @@ export function areSessionExercisesEqual(a: SessionExercise, b: SessionExercise)
   for (let i = 0; i < a.groups.length; i++) {
     if (
       a.groups[i].index !== b.groups[i].index ||
-      a.groups[i].stageCount !== b.groups[i].stageCount
+      a.groups[i].stageCount !== b.groups[i].stageCount ||
+      Boolean(a.groups[i].skipped) !== Boolean(b.groups[i].skipped)
     ) {
       return false;
     }
@@ -288,8 +298,11 @@ export interface SessionExerciseCardProps {
   onRawRisk?: (exId: string, fieldId: string, risky: boolean) => void;
   onRawDraft?: (exId: string, fieldId: string, raw: string | null) => void;
   rawDraftFor?: (exId: string, fieldId: string) => string | undefined;
+  rawDraftVersion?: number;
   rawResetToken?: number;
   hasRawRisk?: boolean;
+  hasBlockingRawRisk?: boolean;
+  onClearRawFields?: (exId: string, fieldIds: readonly string[]) => void;
   onDiscardRawDraft?: (exId: string) => void;
   reorderIds?: string[];
   drag?: CardDragSnapshot | null;
@@ -320,8 +333,11 @@ function areExerciseCardPropsEqual(
     prev.setupNote !== next.setupNote ||
     prev.onEditSetupNote !== next.onEditSetupNote ||
     prev.recordingPaused !== next.recordingPaused ||
+    (prev.rawDraftVersion ?? 0) !== (next.rawDraftVersion ?? 0) ||
     (prev.rawResetToken ?? 0) !== (next.rawResetToken ?? 0) ||
     Boolean(prev.hasRawRisk) !== Boolean(next.hasRawRisk) ||
+    Boolean(prev.hasBlockingRawRisk) !== Boolean(next.hasBlockingRawRisk) ||
+    prev.onClearRawFields !== next.onClearRawFields ||
     prev.timer !== next.timer ||
     prev.drag !== next.drag ||
     prev.reorderIds !== next.reorderIds ||
@@ -372,6 +388,8 @@ export const SessionExerciseCard = memo(function SessionExerciseCard({
   rawDraftFor,
   rawResetToken,
   hasRawRisk,
+  hasBlockingRawRisk,
+  onClearRawFields,
   onDiscardRawDraft,
   reorderIds,
   drag,
@@ -392,16 +410,38 @@ export const SessionExerciseCard = memo(function SessionExerciseCard({
   const validSets = ex.sets.filter(isSetLogged).length;
   const incompleteSets = ex.sets.filter(isSetIncomplete).length;
 
-  const patchSet = (setId: string, patch: Partial<SessionSet>) =>
-    apply((prev) =>
+  const hasNonEmptyWeightDraft = useCallback(
+    (otherId: string) => {
+      const raw = rawDraftFor?.(ex.id, `${otherId}:weight`);
+      return raw !== undefined && raw !== '';
+    },
+    [ex.id, rawDraftFor],
+  );
+
+  const patchSet = (setId: string, patch: Partial<SessionSet>) => {
+    if (patch.status === 'blank' && patch.reps === null && patch.weightKg === null) {
+      onClearRawFields?.(ex.id, [`${setId}:reps`, `${setId}:weight`]);
+    } else if (typeof patch.weightKg === 'number' && Number.isFinite(patch.weightKg) && patch.weightKg > 0) {
+      const curEx = latestRef.current?.exercises.find((e) => e.id === ex.id) ?? ex;
+      const followFields = collectPrefillWeightFieldIds(
+        curEx,
+        setId,
+        patch.weightKg,
+        false,
+        hasNonEmptyWeightDraft,
+      );
+      if (followFields.length) onClearRawFields?.(ex.id, followFields);
+    }
+    return apply((prev) =>
       withSetAndPrefillFollowingWeight(
         prev,
         ex.id,
         setId,
         patch,
-        rawDraftFor ? (otherId) => rawDraftFor(ex.id, `${otherId}:weight`) !== undefined : undefined,
+        rawDraftFor ? hasNonEmptyWeightDraft : undefined,
       ),
     );
+  };
 
   const handleEdit = useCallback(() => onEditExercise(ex.id), [onEditExercise, ex.id]);
   const handleDelete = useCallback(() => onDeleteExercise(ex.id), [onDeleteExercise, ex.id]);
@@ -592,6 +632,11 @@ export const SessionExerciseCard = memo(function SessionExerciseCard({
                 {partial ? <span className="tag tag-warn">部分完成</span> : null}
                 {skipped ? <span className="tag tag-quiet">已跳过</span> : null}
                 {ex.added ? <span className="tag tag-quiet">临时添加</span> : null}
+                {ex.pairId ? (
+                  <span className="tag tag-quiet" data-testid={`superset-pair-tag-${ex.id}`}>
+                    超级组配对
+                  </span>
+                ) : null}
                 {ex.replacedFrom ? (
                   <span className="tag tag-quiet" style={{ whiteSpace: 'normal' }}>
                     替换自 {ex.replacedFrom}
@@ -676,7 +721,7 @@ export const SessionExerciseCard = memo(function SessionExerciseCard({
 
         {expanded ? (
           <div style={{ padding: '0 14px 12px' }}>
-            {hasRawRisk ? (
+            {(hasBlockingRawRisk ?? hasRawRisk) ? (
               <div
                 style={{
                   display: 'flex',
@@ -823,10 +868,10 @@ export const SessionExerciseCard = memo(function SessionExerciseCard({
                   </button>
                   <button
                     className="btn btn-sm btn-ghost"
-                    disabled={recordingPaused || Boolean(hasRawRisk)}
+                    disabled={recordingPaused || Boolean(hasBlockingRawRisk)}
                     onClick={() => {
                       if (recordingPaused) return;
-                      if (hasRawRisk) {
+                      if (hasBlockingRawRisk) {
                         pushToast('有未提交输入，请先确认或放弃后再沿用上一轮。', 'error');
                         return;
                       }
@@ -854,6 +899,15 @@ export const SessionExerciseCard = memo(function SessionExerciseCard({
                         }
                         return;
                       }
+                      const curById = new Map(cur.sets.map((s) => [s.id, s]));
+                      const touchedFields: string[] = [];
+                      for (const nextSet of preview.exercise.sets) {
+                        const prevSet = curById.get(nextSet.id);
+                        if (!prevSet) continue;
+                        if (prevSet.reps !== nextSet.reps) touchedFields.push(`${nextSet.id}:reps`);
+                        if (prevSet.weightKg !== nextSet.weightKg) touchedFields.push(`${nextSet.id}:weight`);
+                      }
+                      if (touchedFields.length) onClearRawFields?.(ex.id, touchedFields);
                       apply((prev) => inheritPreviousCompleteRound(prev, ex.id).session);
                       pushToast(
                         `已按阶段沿用上一完整轮：补 ${preview.filledFields} 个空白字段，保留已填内容。` +
@@ -924,29 +978,32 @@ export const SessionExerciseCard = memo(function SessionExerciseCard({
                   </button>
                   <button
                     className="btn btn-sm btn-ghost"
-                    disabled={recordingPaused}
+                    disabled={recordingPaused || Boolean(hasBlockingRawRisk)}
                     onClick={() => {
-                      const cur = latestRef.current?.exercises.find((e) => e.id === ex.id);
-                      const source = cur
-                        ? [...cur.sets].reverse().find((st) => hasReps(st) || st.weightKg !== null)
-                        : undefined;
-                      if (!source) {
+                      if (recordingPaused) return;
+                      if (hasBlockingRawRisk) {
+                        pushToast('有未提交输入，请先确认或放弃后再沿用已填数值。', 'error');
+                        return;
+                      }
+                      const latestSession = latestRef.current;
+                      if (!latestSession) return;
+                      const outcome = inheritStraightSetValues(latestSession, ex.id);
+                      if (!outcome.hasAnySource) {
                         pushToast('这一动作还没有填写过数值，无法沿用。');
                         return;
                       }
-                      apply((prev) => {
-                        const c = prev.exercises.find((e) => e.id === ex.id);
-                        if (!c) return prev;
-                        let next = prev;
-                        for (const st of c.sets) {
-                          if (st.status === 'done') continue;
-                          next = withSet(next, ex.id, st.id, {
-                            reps: source.reps,
-                            weightKg: source.weightKg,
-                          });
-                        }
-                        return next;
-                      });
+                      if (outcome.filledFields === 0) {
+                        pushToast('未完成的组里没有空白字段需要沿用（已填内容已保留）。', 'info');
+                        return;
+                      }
+                      if (outcome.touchedFieldIds.length) {
+                        onClearRawFields?.(ex.id, outcome.touchedFieldIds);
+                      }
+                      apply((prev) => inheritStraightSetValues(prev, ex.id).session);
+                      pushToast(
+                        `已为 ${outcome.filledSets} 个未完成组补全 ${outcome.filledFields} 项空白数值，已填内容已保留。`,
+                        'ok',
+                      );
                     }}
                   >
                     未完成的组沿用已填数值

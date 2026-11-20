@@ -26,6 +26,8 @@ import {
   type TargetApplyImpact,
 } from './exerciseConfig';
 import { MAX_CARDIO_ENTRIES, MAX_ROUNDS, MAX_SET_ROWS } from './limits';
+import { registerSessionPlanBaseline } from './sessionToPlanSync';
+import { isValidUuidV4 } from './supersetPair';
 import type {
   ExerciseCompletion,
   ExerciseTarget,
@@ -146,6 +148,7 @@ export function sessionExerciseFromPlan(ex: PlanExercise): SessionExercise {
     name: ex.name,
     en: ex.en,
     ...(ex.setupNote ? { setupNote: ex.setupNote } : {}),
+    ...(isValidUuidV4(ex.pairId) ? { pairId: ex.pairId.trim().toLowerCase() } : {}),
     restSec: ex.restSec,
     target,
     status: 'pending',
@@ -173,9 +176,13 @@ export function createSession(plan: Plan, day: PlanDay, now = Date.now()): Sessi
   const isStrength = kind === 'strength';
   const exercises = isStrength ? day.exercises.map(sessionExerciseFromPlan) : [];
   const cardio = isStrength ? [] : (day.cardio ?? []).map(cardioEntryFromPlanCardio);
+  const sessionId = newId('sess');
+  if (isStrength) {
+    registerSessionPlanBaseline(sessionId, day.exercises);
+  }
 
   return {
-    id: newId('sess'),
+    id: sessionId,
     planId: plan.id,
     planName: plan.name,
     day: {
@@ -671,6 +678,125 @@ export function inheritPreviousCompleteRound(
   };
 }
 
+export interface InheritStraightValuesOutcome {
+  session: Session;
+  hasAnySource: boolean;
+  filledFields: number;
+  filledSets: number;
+  changedSetIds: string[];
+  touchedFieldIds: string[];
+}
+
+const hasWeightKg = (s: SessionSet): boolean =>
+  typeof s.weightKg === 'number' && Number.isFinite(s.weightKg);
+
+/**
+ * 常规组「未完成的组沿用已填数值」纯函数。
+ * 优先级（跳过组一律不作来源也不被改写）：
+ * · 次数来源：最近一个已完成且已填次数的组 → 最近一个已填次数的组；
+ * · 重量来源：最近一个已完成且已填重量的组 → 最近一个已填次数且已填重量的组 → 最近一个已填重量的组。
+ * · 仅补齐未完成组（status !== 'done'）中仍为 null 的字段，保留已有非空输入与先填数值，绝不改写组状态。
+ */
+export function inheritStraightSetValues(
+  session: Session,
+  exId: string,
+): InheritStraightValuesOutcome {
+  const ex = session.exercises.find((e) => e.id === exId);
+  if (!ex) {
+    return {
+      session,
+      hasAnySource: false,
+      filledFields: 0,
+      filledSets: 0,
+      changedSetIds: [],
+      touchedFieldIds: [],
+    };
+  }
+  const skippedRounds = new Set(ex.groups.filter((g) => g.skipped).map((g) => g.index));
+  const activeSets = ex.sets
+    .filter((s) => !skippedRounds.has(s.roundIndex))
+    .sort((a, b) => a.roundIndex - b.roundIndex || a.stageIndex - b.stageIndex);
+
+  const reverseSets = [...activeSets].reverse();
+  const repsSource =
+    reverseSets.find((s) => s.status === 'done' && hasReps(s)) ??
+    reverseSets.find((s) => hasReps(s));
+
+  const withWeight = needsWeight(ex);
+  const weightSource = withWeight
+    ? reverseSets.find((s) => s.status === 'done' && hasWeightKg(s)) ??
+      reverseSets.find((s) => hasReps(s) && hasWeightKg(s)) ??
+      reverseSets.find((s) => hasWeightKg(s))
+    : undefined;
+
+  const sourceReps = repsSource?.reps ?? null;
+  const sourceWeight = withWeight ? (weightSource?.weightKg ?? null) : null;
+  const hasAnySource = sourceReps !== null || sourceWeight !== null;
+  if (!hasAnySource) {
+    return {
+      session,
+      hasAnySource: false,
+      filledFields: 0,
+      filledSets: 0,
+      changedSetIds: [],
+      touchedFieldIds: [],
+    };
+  }
+
+  const updatedById = new Map<string, SessionSet>();
+  const changedSetIds: string[] = [];
+  const touchedFieldIds: string[] = [];
+  let filledFields = 0;
+
+  for (const tgt of activeSets) {
+    if (tgt.status === 'done') continue;
+    let reps = tgt.reps;
+    let weightKg = tgt.weightKg;
+    let changed = false;
+
+    if (reps === null && sourceReps !== null) {
+      reps = sourceReps;
+      changed = true;
+      filledFields += 1;
+      touchedFieldIds.push(`${tgt.id}:reps`);
+    }
+    if (withWeight && weightKg === null && sourceWeight !== null) {
+      weightKg = sourceWeight;
+      changed = true;
+      filledFields += 1;
+      touchedFieldIds.push(`${tgt.id}:weight`);
+    }
+    if (changed) {
+      updatedById.set(tgt.id, { ...tgt, reps, weightKg });
+      changedSetIds.push(tgt.id);
+    }
+  }
+
+  if (!updatedById.size) {
+    return {
+      session,
+      hasAnySource: true,
+      filledFields: 0,
+      filledSets: 0,
+      changedSetIds: [],
+      touchedFieldIds: [],
+    };
+  }
+
+  const sets = ex.sets.map((s) => updatedById.get(s.id) ?? s);
+  return {
+    session: {
+      ...session,
+      exercises: session.exercises.map((e) => (e.id === exId ? { ...e, sets } : e)),
+    },
+    hasAnySource: true,
+    filledFields,
+    filledSets: updatedById.size,
+    changedSetIds,
+    touchedFieldIds,
+  };
+}
+
 /**
  * 从本次训练快照读取休息配置（R09）。
  * · 递减组：阶段之间用 target.restInSec，完成整轮用 target.restAfterSec
@@ -881,6 +1007,51 @@ export function withSet(session: Session, exId: string, setId: string, patch: Pa
   };
 }
 
+function findPrefillFollowingSetIds(
+  ex: SessionExercise,
+  setId: string,
+  nextWeight: number | null | undefined,
+  hasLocalWeightDraft?: (otherSetId: string) => boolean,
+): Set<string> {
+  const ids = new Set<string>();
+  if (typeof nextWeight !== 'number' || !Number.isFinite(nextWeight) || nextWeight <= 0) {
+    return ids;
+  }
+  const targetBefore = ex.sets.find((s) => s.id === setId);
+  if (!targetBefore || targetBefore.roundIndex !== 1) {
+    return ids;
+  }
+  const skippedRounds = new Set(ex.groups.filter((g) => g.skipped).map((g) => g.index));
+  const prevFirstWeight = targetBefore.weightKg;
+  const stageIdx = targetBefore.stageIndex;
+  for (const s of ex.sets) {
+    if (s.id === setId) continue;
+    if (s.roundIndex <= 1 || s.stageIndex !== stageIdx) continue;
+    if (skippedRounds.has(s.roundIndex)) continue;
+    if (s.status !== 'blank' || hasReps(s)) continue;
+    if (hasLocalWeightDraft?.(s.id)) continue;
+    if (s.weightKg !== null && s.weightKg !== prevFirstWeight) continue;
+    ids.add(s.id);
+  }
+  return ids;
+}
+
+/** 收集首组写入正重量后将被自动预填的后续组重量字段 ID（用于清理陈旧空白草稿）。 */
+export function collectPrefillWeightFieldIds(
+  ex: SessionExercise | undefined,
+  setId: string,
+  nextWeight: number | null | undefined,
+  includeSelf: boolean,
+  hasLocalWeightDraft?: (otherSetId: string) => boolean,
+): string[] {
+  const out = includeSelf ? [`${setId}:weight`] : [];
+  if (!ex) return out;
+  for (const id of findPrefillFollowingSetIds(ex, setId, nextWeight, hasLocalWeightDraft)) {
+    out.push(`${id}:weight`);
+  }
+  return out;
+}
+
 /**
  * 训练中首组 / 第 1 轮填写正重量时自动预填后续同阶段空白组（0.1.18）。
  * · 仅当修改对象位于 `roundIndex === 1` 且 `patch.weightKg > 0` 时触发（0 kg 显式自重绝不污染后续空白组）；
@@ -896,34 +1067,17 @@ export function withSetAndPrefillFollowingWeight(
   hasLocalWeightDraft?: (otherSetId: string) => boolean,
 ): Session {
   const updated = withSet(session, exId, setId, patch);
-  const nextWeight = patch.weightKg;
-  if (typeof nextWeight !== 'number' || !Number.isFinite(nextWeight) || nextWeight <= 0) {
-    return updated;
-  }
   const prevEx = session.exercises.find((e) => e.id === exId);
-  const targetBefore = prevEx?.sets.find((s) => s.id === setId);
-  if (!prevEx || !targetBefore || targetBefore.roundIndex !== 1) {
-    return updated;
-  }
-  const skippedRounds = new Set(
-    prevEx.groups.filter((g) => g.skipped).map((g) => g.index),
-  );
-  const prevFirstWeight = targetBefore.weightKg;
-  const stageIdx = targetBefore.stageIndex;
+  if (!prevEx) return updated;
+  const followIds = findPrefillFollowingSetIds(prevEx, setId, patch.weightKg, hasLocalWeightDraft);
+  if (!followIds.size) return updated;
+  const nextWeight = patch.weightKg as number;
 
   return {
     ...updated,
     exercises: updated.exercises.map((ex) => {
       if (ex.id !== exId) return ex;
-      const sets = ex.sets.map((s) => {
-        if (s.id === setId) return s;
-        if (s.roundIndex <= 1 || s.stageIndex !== stageIdx) return s;
-        if (skippedRounds.has(s.roundIndex)) return s;
-        if (s.status !== 'blank' || hasReps(s)) return s;
-        if (hasLocalWeightDraft?.(s.id)) return s;
-        if (s.weightKg !== null && s.weightKg !== prevFirstWeight) return s;
-        return { ...s, weightKg: nextWeight };
-      });
+      const sets = ex.sets.map((s) => (followIds.has(s.id) ? { ...s, weightKg: nextWeight } : s));
       return { ...ex, sets };
     }),
   };

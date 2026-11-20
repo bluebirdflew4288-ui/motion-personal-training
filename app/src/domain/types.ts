@@ -161,6 +161,8 @@ export interface PlanExercise {
   setupNote?: string;
   /** V3.2 中被标记为可替代的动作 */
   substitutes?: string[];
+  /** 多动作超级组配对标识（合法 UUID v4，仅在 >=2 个动作配对时有效） */
+  pairId?: string;
 }
 
 export const LEGACY_TRAINING_FOCUSES = ['chest', 'back', 'legs'] as const;
@@ -375,6 +377,8 @@ export interface SessionExercise {
   replacedFrom?: string;
   /** 是否本次临时新增 */
   added?: boolean;
+  /** 多动作超级组配对标识（合法 UUID v4，仅在 >=2 个动作配对时有效） */
+  pairId?: string;
 }
 
 export interface SessionWarmup {

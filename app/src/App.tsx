@@ -8,6 +8,9 @@ import { SessionPage } from './pages/Session';
 import { installViewportGuard } from './lib/storage';
 import { navigate } from './lib/router';
 import { installSelectionGuard } from './ui/selectionGuard';
+import { DualWindowProvider, useDualWindow } from './coach/windowState';
+import { CoachMinimizedEdgePill, PaneHost } from './coach/FloatingWindowFrame';
+import { CoachPane } from './coach/CoachPane';
 
 type HistoryMod = typeof import('./pages/History');
 type StatsMod = typeof import('./pages/Stats');
@@ -191,10 +194,17 @@ function Boot() {
 function Routes() {
   const route = useRoute();
   const { path, parts, query } = route;
+  const dual = useDualWindow();
+  const primaryPaneRef = useRef(dual.primaryPane);
+  primaryPaneRef.current = dual.primaryPane;
 
   useEffect(() => {
-    window.scrollTo({ top: 0, behavior: 'auto' });
-  }, [path]);
+    if (primaryPaneRef.current === 'business') {
+      window.scrollTo({ top: 0, behavior: 'auto' });
+    } else if (dual.businessScrollRef.current) {
+      dual.businessScrollRef.current.scrollTo({ top: 0, behavior: 'auto' });
+    }
+  }, [path, dual.businessScrollRef]);
 
   useEffect(() => {
     // 冷启动首帧上屏后立即空闲预热底部 4 个懒加载路由模块：
@@ -316,12 +326,46 @@ function Routes() {
     );
   }
 
+  const businessMode =
+    dual.primaryPane === 'business'
+      ? 'primary'
+      : dual.miniVisibility === 'mini'
+        ? 'mini'
+        : 'hidden';
+  const coachMode =
+    dual.primaryPane === 'coach'
+      ? 'primary'
+      : dual.miniVisibility === 'mini'
+        ? 'mini'
+        : 'hidden';
+
   return (
     <>
-      <div className="app-shell">
-        <Suspense fallback={<RouteSkeleton />}>{body}</Suspense>
-        <TabBar path={path} onPreload={preloadRouteForPath} />
-      </div>
+      <PaneHost
+        paneId="business"
+        mode={businessMode}
+        title="MOTION 训练"
+        testIdPrefix="business"
+        scrollRef={dual.businessScrollRef}
+        overlays={<TabBar path={path} onPreload={preloadRouteForPath} />}
+      >
+        <div className="app-shell">
+          <Suspense fallback={<RouteSkeleton />}>{body}</Suspense>
+        </div>
+      </PaneHost>
+
+      {dual.hasOpenedCoach ? (
+        <PaneHost
+          paneId="coach"
+          mode={coachMode}
+          title="MOTION 教练"
+          testIdPrefix="coach"
+        >
+          <CoachPane />
+        </PaneHost>
+      ) : null}
+
+      <CoachMinimizedEdgePill />
       <Toasts />
     </>
   );
@@ -336,5 +380,9 @@ export function App() {
       cleanViewport?.();
     };
   }, []);
-  return <Boot />;
+  return (
+    <DualWindowProvider>
+      <Boot />
+    </DualWindowProvider>
+  );
 }

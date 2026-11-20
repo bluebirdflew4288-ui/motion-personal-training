@@ -6,6 +6,7 @@
 
 import { ensureStageIds, validateExerciseTarget } from './exerciseConfig';
 import { resolveExerciseId } from './identity';
+import { cleanOrphanPairIds, isValidUuidV4 } from './supersetPair';
 import {
   MAX_EXERCISE_ID,
   MAX_EXERCISES,
@@ -24,6 +25,28 @@ import type {
   SessionExercise,
   StraightTarget,
 } from './types';
+
+const BASELINE_MEM_LIMIT = 200;
+const sessionPlanBaselineMap = new Map<string, PlanExercise[]>();
+
+export function registerSessionPlanBaseline(sessionId: string, exercises: readonly PlanExercise[]): void {
+  if (!sessionId) return;
+  const snap = structuredClone(exercises) as PlanExercise[];
+  if (sessionPlanBaselineMap.size >= BASELINE_MEM_LIMIT && !sessionPlanBaselineMap.has(sessionId)) {
+    const firstKey = sessionPlanBaselineMap.keys().next().value;
+    if (firstKey !== undefined) sessionPlanBaselineMap.delete(firstKey);
+  }
+  sessionPlanBaselineMap.set(sessionId, snap);
+}
+
+export function getSessionPlanBaseline(sessionId: string): PlanExercise[] | undefined {
+  const mem = sessionPlanBaselineMap.get(sessionId);
+  return mem ? (structuredClone(mem) as PlanExercise[]) : undefined;
+}
+
+export function clearSessionPlanBaseline(sessionId: string): void {
+  sessionPlanBaselineMap.delete(sessionId);
+}
 
 export interface PlanSyncDiff {
   /** 是否满足同步资格（计划来源 + 力量训练 + 原计划与力量训练日仍存在 + 目标合法） */
@@ -44,6 +67,8 @@ export interface PlanSyncDiff {
   summaryText: string;
   nextExercises: PlanExercise[];
   blockerMessage?: string;
+  preservedPlanAddedCount?: number;
+  planUpdatedDuringSession?: boolean;
 }
 
 function cleanTargetFromSessionExercise(ex: SessionExercise): ExerciseTarget {
@@ -152,7 +177,7 @@ export function extractCleanPlanExercises(
   }
   const usedIds = new Set<string>();
 
-  return exercises.map((ex, idx) => {
+  const extracted = exercises.map((ex, idx) => {
     const target = cleanTargetFromSessionExercise(ex);
     let id: string;
     if (
@@ -191,6 +216,7 @@ export function extractCleanPlanExercises(
       restSec: ex.restSec,
       target,
       ...(ex.setupNote ? { setupNote: ex.setupNote } : {}),
+      ...(isValidUuidV4(ex.pairId) ? { pairId: ex.pairId.trim().toLowerCase() } : {}),
       ...(sameIdentityAsOrig && orig?.note !== undefined ? { note: orig.note } : {}),
       ...(sameIdentityAsOrig && orig?.substitutes !== undefined
         ? { substitutes: [...orig.substitutes] }
@@ -198,6 +224,7 @@ export function extractCleanPlanExercises(
     };
     return clean;
   });
+  return cleanOrphanPairIds(extracted);
 }
 
 function canonicalTargetKey(target: ExerciseTarget): string {
@@ -265,8 +292,106 @@ function canonicalPlanExerciseSignature(pe: PlanExercise): string {
     name: pe.name.trim(),
     en: (pe.en ?? '').trim(),
     restSec: pe.restSec,
+    pairId: isValidUuidV4(pe.pairId) ? pe.pairId.trim().toLowerCase() : null,
     target: canonicalTargetKey(pe.target),
   });
+}
+
+function mergeSessionExercisesWithPlanDay(args: {
+  sessionClean: PlanExercise[];
+  currentDayExercises: readonly PlanExercise[];
+  baseline?: readonly PlanExercise[];
+}):
+  | { ok: true; exercises: PlanExercise[]; preservedAddedCount: number; planUpdatedDuringSession: boolean }
+  | { ok: false; message: string } {
+  const { sessionClean, currentDayExercises, baseline } = args;
+  if (!baseline) {
+    return {
+      ok: true,
+      exercises: cleanOrphanPairIds(sessionClean),
+      preservedAddedCount: 0,
+      planUpdatedDuringSession: false,
+    };
+  }
+
+  const baseById = new Map(baseline.map((e) => [e.id, e]));
+  const curById = new Map(currentDayExercises.map((e) => [e.id, e]));
+  const sessById = new Map(sessionClean.map((e) => [e.id, e]));
+
+  const planUpdatedDuringSession =
+    baseline.length !== currentDayExercises.length ||
+    baseline.some(
+      (b, idx) =>
+        b.id !== currentDayExercises[idx]?.id ||
+        canonicalPlanExerciseSignature(b) !== canonicalPlanExerciseSignature(currentDayExercises[idx]!),
+    );
+
+  // 检查同条目双边冲突（训练与长期计划都在开练后改过同一项且结果不同）
+  const resolvedList: PlanExercise[] = [];
+  for (const sessPe of sessionClean) {
+    const basePe = baseById.get(sessPe.id);
+    const curPe = curById.get(sessPe.id);
+    if (basePe && curPe) {
+      const baseSig = canonicalPlanExerciseSignature(basePe);
+      const curSig = canonicalPlanExerciseSignature(curPe);
+      const sessSig = canonicalPlanExerciseSignature(sessPe);
+      const planEdited = curSig !== baseSig;
+      const sessEdited = sessSig !== baseSig;
+      if (planEdited && sessEdited && curSig !== sessSig) {
+        return {
+          ok: false,
+          message: `原计划中的「${curPe.name}」在训练期间也被修改，存在双方改动冲突；取消同步仍可正常结束训练`,
+        };
+      }
+      resolvedList.push(planEdited && !sessEdited ? structuredClone(curPe) : sessPe);
+    } else {
+      resolvedList.push(sessPe);
+    }
+  }
+
+  // 检查训练期间长期计划修改过、但本场训练删掉了的条目
+  for (const basePe of baseline) {
+    const curPe = curById.get(basePe.id);
+    if (curPe && !sessById.has(basePe.id)) {
+      if (canonicalPlanExerciseSignature(curPe) !== canonicalPlanExerciseSignature(basePe)) {
+        return {
+          ok: false,
+          message: `原计划中的「${curPe.name}」在训练期间已被修改，但本场训练移除了它；取消同步仍可正常结束训练`,
+        };
+      }
+    }
+  }
+
+  // 保留训练开始后长期计划日新增的无关动作（如开练后在计划日添加了「侧平举」）
+  const resolvedIds = new Set(resolvedList.map((e) => e.id));
+  const addedInPlan = currentDayExercises.filter(
+    (curPe) => !baseById.has(curPe.id) && !resolvedIds.has(curPe.id),
+  );
+  const finalList = [...resolvedList];
+  for (const extra of addedInPlan) {
+    const curIdx = currentDayExercises.findIndex((e) => e.id === extra.id);
+    let inserted = false;
+    // 尝试插回与它紧邻前驱的后面
+    for (let j = curIdx - 1; j >= 0; j -= 1) {
+      const prevId = currentDayExercises[j].id;
+      const posInFinal = finalList.findIndex((e) => e.id === prevId);
+      if (posInFinal >= 0) {
+        finalList.splice(posInFinal + 1, 0, structuredClone(extra));
+        inserted = true;
+        break;
+      }
+    }
+    if (!inserted) {
+      finalList.push(structuredClone(extra));
+    }
+  }
+
+  return {
+    ok: true,
+    exercises: cleanOrphanPairIds(finalList),
+    preservedAddedCount: addedInPlan.length,
+    planUpdatedDuringSession,
+  };
 }
 
 function validateExtractedPlanExercises(list: readonly PlanExercise[]): string | null {
@@ -304,7 +429,11 @@ function validateExtractedPlanExercises(list: readonly PlanExercise[]): string |
 /**
  * 对比当前训练实例与目标计划训练日的编排差异。
  */
-export function diffSessionVsPlanDay(session: Session, plan: Plan | undefined): PlanSyncDiff {
+export function diffSessionVsPlanDay(
+  session: Session,
+  plan: Plan | undefined,
+  baselineExercises?: readonly PlanExercise[],
+): PlanSyncDiff {
   const emptyBase = {
     canSync: false,
     hasDiff: false,
@@ -336,7 +465,23 @@ export function diffSessionVsPlanDay(session: Session, plan: Plan | undefined): 
     return { ...emptyBase, blockerMessage: '原训练日已不存在或不再是力量训练日' };
   }
 
-  const nextExercises = extractCleanPlanExercises(session.exercises, day.exercises);
+  const rawExtracted = extractCleanPlanExercises(session.exercises, day.exercises);
+  const baseline = baselineExercises ?? getSessionPlanBaseline(session.id);
+  const merged = mergeSessionExercisesWithPlanDay({
+    sessionClean: rawExtracted,
+    currentDayExercises: day.exercises,
+    baseline,
+  });
+  if (!merged.ok) {
+    return {
+      ...emptyBase,
+      dayName: day.name,
+      nextExercises: rawExtracted,
+      blockerMessage: merged.message,
+      planUpdatedDuringSession: true,
+    };
+  }
+  const nextExercises = merged.exercises;
   const validationError = validateExtractedPlanExercises(nextExercises);
   if (validationError) {
     return {
@@ -401,6 +546,9 @@ export function diffSessionVsPlanDay(session: Session, plan: Plan | undefined): 
   if (addedCount > 0) parts.push(`新增 ${addedCount} 个动作`);
   if (removedCount > 0) parts.push(`移除 ${removedCount} 个动作`);
   if (configChangedCount > 0) parts.push(`修改了 ${configChangedCount} 处组/目标配置`);
+  if (hasDiff && merged.preservedAddedCount > 0) {
+    parts.push(`保留训练期间计划新增 ${merged.preservedAddedCount} 项`);
+  }
   const summaryText = hasDiff ? (parts.join(' · ') || '调整了动作编排') : '';
 
   return {
@@ -418,6 +566,8 @@ export function diffSessionVsPlanDay(session: Session, plan: Plan | undefined): 
     configChangedCount,
     summaryText,
     nextExercises,
+    preservedPlanAddedCount: merged.preservedAddedCount,
+    planUpdatedDuringSession: merged.planUpdatedDuringSession,
   };
 }
 
@@ -429,7 +579,8 @@ export function applySessionArrangementToPlan(
   dayId: string,
   session: Session,
   now = Date.now(),
-): { ok: true; plan: Plan } | { ok: false; message: string } {
+  baselineExercises?: readonly PlanExercise[],
+): { ok: true; plan: Plan; preservedPlanAddedCount?: number } | { ok: false; message: string } {
   if ((session.origin ?? 'plan') !== 'plan') {
     return { ok: false, message: '临时训练不属于固定计划日，不能同步回原计划' };
   }
@@ -444,7 +595,17 @@ export function applySessionArrangementToPlan(
     return { ok: false, message: '原计划中的该训练日已不再是力量日，无法同步动作编排（取消勾选后可正常结束训练）' };
   }
 
-  const nextExercises = extractCleanPlanExercises(session.exercises, day.exercises);
+  const rawExtracted = extractCleanPlanExercises(session.exercises, day.exercises);
+  const baseline = baselineExercises ?? getSessionPlanBaseline(session.id);
+  const merged = mergeSessionExercisesWithPlanDay({
+    sessionClean: rawExtracted,
+    currentDayExercises: day.exercises,
+    baseline,
+  });
+  if (!merged.ok) {
+    return { ok: false, message: merged.message };
+  }
+  const nextExercises = merged.exercises;
   const validationError = validateExtractedPlanExercises(nextExercises);
   if (validationError) {
     return { ok: false, message: validationError };
@@ -455,5 +616,5 @@ export function applySessionArrangementToPlan(
     updatedAt: now,
     days: plan.days.map((d) => (d.id === dayId ? { ...d, exercises: nextExercises } : d)),
   };
-  return { ok: true, plan: updatedPlan };
+  return { ok: true, plan: updatedPlan, preservedPlanAddedCount: merged.preservedAddedCount };
 }

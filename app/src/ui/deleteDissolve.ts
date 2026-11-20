@@ -16,6 +16,24 @@
      **已提交 Session 里这个对象真的消失了**的证据（见 dissolveAttribution），
      否则慢提交期间其它合法布局变化会被误当成删除成功。 */
 
+function paneScaleAndScroll(el: Element | null): { scale: number; stageTop: number; scrollTop: number } {
+  if (typeof window === 'undefined') return { scale: 1, stageTop: 0, scrollTop: 0 };
+  const stage = el?.closest?.('[data-pane-stage="true"]') as HTMLElement | null;
+  if (stage) {
+    const rawScale = Number(stage.getAttribute('data-pane-scale') ?? '1');
+    const scale = Number.isFinite(rawScale) && rawScale > 0 ? rawScale : 1;
+    const scrollEl =
+      (el?.closest?.('[data-pane-scroll="true"]') as HTMLElement | null) ??
+      stage.querySelector<HTMLElement>('[data-pane-scroll="true"]');
+    return {
+      scale,
+      stageTop: stage.getBoundingClientRect().top,
+      scrollTop: scrollEl ? scrollEl.scrollTop : 0,
+    };
+  }
+  return { scale: 1, stageTop: 0, scrollTop: window.scrollY };
+}
+
 /** 消散时长（方案要求 200–300ms） */
 export const DISSOLVE_MS = 260;
 /** 列表补位时长，与消散同时开始，略短于消散结束 */
@@ -144,12 +162,13 @@ export function captureCardTops(root?: ParentNode | null): Map<string, number> {
   const out = new Map<string, number>();
   if (typeof document === 'undefined') return out;
   const scope = root ?? document;
-  const scrollY = typeof window === 'undefined' ? 0 : window.scrollY;
   const els = Array.from(scope.querySelectorAll<HTMLElement>('[data-reorder-id]'));
+  if (!els.length) return out;
+  const ctx = paneScaleAndScroll(els[0]);
   for (const el of els) {
     const id = el.getAttribute('data-reorder-id');
     if (!id) continue;
-    out.set(id, el.getBoundingClientRect().top + scrollY);
+    out.set(id, (el.getBoundingClientRect().top - ctx.stageTop) / ctx.scale + ctx.scrollTop);
   }
   return out;
 }
@@ -167,16 +186,17 @@ export function captureDeleteRect(itemId: string, kind: DissolveKind): ZoneRect 
   if (typeof document === 'undefined') return null;
   const card = document.querySelector<HTMLElement>(`[data-reorder-id="${cssEscape(itemId)}"]`);
   if (!card) return null;
+  const ctx = paneScaleAndScroll(card);
   const zone =
     card.closest<HTMLElement>('[data-reorder-zone]') ??
     document.querySelector<HTMLElement>(`[data-reorder-zone="${kind === 'cardio' ? 'cardio' : 'strength'}"]`);
   const cardRect = card.getBoundingClientRect();
   const zoneRect = zone ? zone.getBoundingClientRect() : { top: 0, left: 0 };
   return {
-    top: cardRect.top - zoneRect.top,
-    left: cardRect.left - zoneRect.left,
-    width: cardRect.width,
-    height: cardRect.height,
+    top: (cardRect.top - zoneRect.top) / ctx.scale,
+    left: (cardRect.left - zoneRect.left) / ctx.scale,
+    width: cardRect.width / ctx.scale,
+    height: cardRect.height / ctx.scale,
   };
 }
 
@@ -196,14 +216,15 @@ export function applyReflowAnimation(prevTops: Map<string, number>): (() => void
     return null;
   }
   const touched: HTMLElement[] = [];
-  const scrollY = window.scrollY;
   const els = Array.from(document.querySelectorAll<HTMLElement>('[data-reorder-id]'));
+  if (!els.length) return null;
+  const ctx = paneScaleAndScroll(els[0]);
   for (const el of els) {
     const id = el.getAttribute('data-reorder-id');
     if (!id) continue;
     const prev = prevTops.get(id);
     if (prev === undefined) continue;
-    const shift = reflowShift(prev, el.getBoundingClientRect().top + scrollY);
+    const shift = reflowShift(prev, (el.getBoundingClientRect().top - ctx.stageTop) / ctx.scale + ctx.scrollTop);
     if (!shift) continue;
     el.style.setProperty('translate', `0 ${shift}px`);
     el.style.setProperty('transition', 'none');

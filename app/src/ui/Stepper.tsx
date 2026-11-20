@@ -21,6 +21,12 @@
    不改变任何既有的步进/解析/提交语义。 */
 
 import { useEffect, useRef, useState } from 'react';
+import {
+  registerFocusedField,
+  setDirtyField,
+  unregisterFocusedField,
+  type CoachEditableField,
+} from '../coach/focusGuard';
 
 interface NumberFieldProps {
   value: number | null;
@@ -47,6 +53,9 @@ interface NumberFieldProps {
   onRawRisk?: (risky: boolean) => void;
   rawDraft?: string;
   onRawDraftChange?: (raw: string | null) => void;
+  coachExId?: string;
+  coachSetId?: string;
+  coachField?: CoachEditableField;
 }
 
 /** `7.` 尚可继续输入小数，不能把它当作已结束的 raw 字段。 */
@@ -69,6 +78,9 @@ export function NumberStepper({
   onRawRisk,
   rawDraft,
   onRawDraftChange,
+  coachExId,
+  coachSetId,
+  coachField,
 }: NumberFieldProps) {
   const [draft, setDraft] = useState<string>(rawDraft ?? (value === null ? '' : String(value)));
   const [focused, setFocused] = useState(false);
@@ -102,6 +114,12 @@ export function NumberStepper({
    */
   const rawRiskRef = useRef(false);
   const reportRawRisk = (risky: boolean) => {
+    if (coachExId) {
+      setDirtyField(
+        { exId: coachExId, setId: coachSetId, field: coachField ?? 'unknown' },
+        risky,
+      );
+    }
     if (rawRiskRef.current === risky) return;
     rawRiskRef.current = risky;
     onRawRisk?.(risky);
@@ -113,13 +131,26 @@ export function NumberStepper({
 
   useEffect(
     () => () => {
+      if (coachExId) {
+        unregisterFocusedField({
+          exId: coachExId,
+          setId: coachSetId,
+          field: coachField ?? 'unknown',
+        });
+        if (!onRawDraftChange) {
+          setDirtyField(
+            { exId: coachExId, setId: coachSetId, field: coachField ?? 'unknown' },
+            false,
+          );
+        }
+      }
       if (onRawDraftChange || !rawRiskRef.current) return;
       rawRiskRef.current = false;
       onRawRisk?.(false);
     },
     // 未接 rawDraftChange 的普通 Stepper 保留旧清理；训练页由父层按字段 ID 管理。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [],
+    [coachExId, coachSetId, coachField],
   );
 
   const commit = (raw: string) => {
@@ -207,15 +238,33 @@ export function NumberStepper({
           aria-label={ariaLabel}
           disabled={disabled}
           readOnly={disabled}
+          data-coach-ex-id={coachExId}
+          data-coach-set-id={coachSetId}
+          data-coach-field={coachField}
+          data-dirty-raw={rawDraft !== undefined ? 'true' : undefined}
           onFocus={(e) => {
             if (disabled) return;
             setFocused(true);
+            if (coachExId) {
+              registerFocusedField({
+                exId: coachExId,
+                setId: coachSetId,
+                field: coachField ?? 'unknown',
+              });
+            }
             // 同步全选：rAF 延迟会在用户已开始输入后再选中全部，
             // 导致第二位输入替换第一位（7.5 → .5）。这里用同步 select。
             e.currentTarget.select();
           }}
           onBlur={() => {
             setFocused(false);
+            if (coachExId) {
+              unregisterFocusedField({
+                exId: coachExId,
+                setId: coachSetId,
+                field: coachField ?? 'unknown',
+              });
+            }
             setDraft(rawDraft ?? (value === null ? '' : String(value)));
           }}
           onChange={(e) => {

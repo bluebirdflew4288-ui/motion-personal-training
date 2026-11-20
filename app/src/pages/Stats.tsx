@@ -15,6 +15,7 @@ import {
 } from '../domain/stats';
 import { listComparabilityModes, describeGroupCounts } from '../domain/comparability';
 import type { DumbbellBasis, WeightMode } from '../domain/types';
+import { CoachHeaderButton } from '../coach/CoachHeaderButton';
 
 type TrendMetric = 'weight' | 'totalReps' | 'bestReps';
 
@@ -104,11 +105,14 @@ export function StatsPage({ focusExercise }: { focusExercise?: string }) {
 
   return (
     <main className="page page-top page-bottom-space">
-      <header style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between' }}>
+      <header style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
         <h1 className="h-serif" style={{ fontSize: 26 }}>
           统计
         </h1>
-        <span className="mono-label">仅统计已完成记录</span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span className="mono-label">仅统计已完成记录</span>
+          <CoachHeaderButton compact />
+        </div>
       </header>
       <hr className="rule-line" style={{ marginTop: 8 }} />
 

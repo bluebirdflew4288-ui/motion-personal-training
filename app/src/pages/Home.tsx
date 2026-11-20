@@ -30,6 +30,7 @@ import type { CardioPreset, Plan, PlanDay, Session } from '../domain/types';
 import { Sheet } from '../ui/Sheet';
 import { pushCycle, skipCycle } from '../domain/cycle';
 import { currentLockState } from '../lib/lock';
+import { CoachHeaderButton } from '../coach/CoachHeaderButton';
 
 function currentDay(plan: Plan): PlanDay | undefined {
   return plan.days[plan.cursor];
@@ -355,11 +356,14 @@ export function Home() {
           <h1 className="h-display" style={{ transform: 'rotate(-1deg)' }}>
             MOTION
           </h1>
-          <div style={{ textAlign: 'right', paddingBottom: 4 }}>
-            <div className="mono-label" style={{ color: 'var(--brick)', fontWeight: 500 }}>
-              {fmtWeekday(today)} · {fmtDate(today)}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <div style={{ textAlign: 'right', paddingBottom: 2 }}>
+              <div className="mono-label" style={{ color: 'var(--brick)', fontWeight: 500 }}>
+                {fmtWeekday(today)} · {fmtDate(today)}
+              </div>
+              <div style={{ fontSize: 12, color: 'var(--ink-3)', marginTop: 2 }}>今日训练</div>
             </div>
-            <div style={{ fontSize: 12, color: 'var(--ink-3)', marginTop: 2 }}>今日训练</div>
+            <CoachHeaderButton />
           </div>
         </div>
         <hr className="rule-line" style={{ marginTop: 10 }} />

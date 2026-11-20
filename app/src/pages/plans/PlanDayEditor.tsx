@@ -94,6 +94,7 @@ import type {
   PlanExercise,
   StraightTarget,
 } from '../../domain/types';
+import { CoachHeaderButton } from '../../coach/CoachHeaderButton';
 
 
 const UNDO_TTL_MS = 8_000;
@@ -1079,13 +1080,14 @@ export function PlanDayEditor({ planId, dayId }: { planId: string; dayId: string
 
   return (
     <main className="page page-top page-bottom-space">
-      <header style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+      <header style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
         <button
           className="btn btn-ghost btn-sm"
           onClick={() => navigate(`/plans?plan=${encodeURIComponent(planId)}`)}
         >
           ‹ 计划
         </button>
+        <CoachHeaderButton compact />
       </header>
 
       <h1 className="h-serif" style={{ fontSize: 26, marginTop: 8, overflowWrap: 'anywhere' }}>

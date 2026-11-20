@@ -27,6 +27,7 @@ import {
   type TemplateRepositorySnapshot,
 } from './templates';
 import type { ExerciseTemplate, GroupPlan, Plan, Session, SessionExercise } from '../domain/types';
+import { bumpCoachRestoreEpoch } from '../coach/coachStorage';
 
 export interface AppSettings {
   key: 'app';
@@ -768,7 +769,7 @@ export type ValidateResult =
  * 旧备份里的 1.0.0 元数据仍按现有规则**只提示不拒绝**（validateBackup 的
  * warnings：srcVersion !== currentAppVersion），冻结/历史文件不改。
  */
-export const CURRENT_APP_VERSION = '0.2.0';
+export const CURRENT_APP_VERSION = '0.2.1';
 
 export function validateBackup(raw: unknown, currentAppVersion = CURRENT_APP_VERSION): ValidateResult {
   if (typeof raw !== 'object' || raw === null) return { ok: false, error: '文件不是有效的 JSON 对象' };
@@ -1042,6 +1043,7 @@ export async function restoreBackup(payload: BackupPayload): Promise<void> {
     // G1：原子替换 plans / sessions / settings / 模板前缀；
     // 只定向删除 exercise-template: 前缀，锁/seed/恢复前快照等 meta 保留。
     await idbRestoreAll({ plans, sessions, settings, exerciseTemplates });
+    await bumpCoachRestoreEpoch();
   } catch (err) {
     throw err instanceof StorageError ? err : new StorageError('恢复失败', err);
   }

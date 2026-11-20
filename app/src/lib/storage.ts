@@ -17,6 +17,7 @@ export function installViewportGuard(): () => void {
       if (inset < 80) inset = 0; // 浏览器工具栏滚动也会产生小差值，忽略
     }
     root.style.setProperty('--kb-inset', `${inset}px`);
+    root.style.setProperty('--app-vh', `${vv ? Math.min(window.innerHeight, Math.round(vv.height)) : window.innerHeight}px`);
   };
 
   update();
@@ -31,6 +32,7 @@ export function installViewportGuard(): () => void {
     window.removeEventListener('orientationchange', update);
     window.removeEventListener('resize', update);
     root.style.removeProperty('--kb-inset');
+    root.style.removeProperty('--app-vh');
     cleanup = null;
   };
   return cleanup;

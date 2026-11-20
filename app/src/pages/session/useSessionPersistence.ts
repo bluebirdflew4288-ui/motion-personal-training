@@ -994,10 +994,21 @@ export function useSessionPersistence({
   // 保留导出引用（避免未使用告警）
   void settleOrdinarySlot;
 
+  const applyExternalSessionCommit = useCallback(
+    (committed: Session) => {
+      confirmedRevision.current = revisionOf(committed);
+      baseSessionRef.current = committed;
+      latestRef.current = committed;
+      syncSessionLocal(committed);
+    },
+    [syncSessionLocal],
+  );
+
   return {
     editorId,
     confirmedRevision,
     latestRef,
+    unsavedDraftRef: unsavedDraft,
     saveQueue,
     intentionallyClosed,
     lockBlocked,
@@ -1016,6 +1027,7 @@ export function useSessionPersistence({
     applyChange,
     commitPaired,
     sealPendingWrites,
+    applyExternalSessionCommit,
     tryTakeOver,
     retryUnsaved,
     discardPendingDraft,

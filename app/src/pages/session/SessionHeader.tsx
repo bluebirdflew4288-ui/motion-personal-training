@@ -4,6 +4,7 @@ import type { summarizeSession } from '../../domain/session';
 import type { Session } from '../../domain/types';
 import { fmtTime } from '../../lib/format';
 import { ElapsedClock } from '../../ui/RestTimer';
+import { CoachHeaderButton } from '../../coach/CoachHeaderButton';
 
 export interface SessionHeaderProps {
   session: Session;
@@ -64,20 +65,23 @@ export function SessionHeader({
             />
           </div>
         </div>
-        <button
-          className="btn btn-sm btn-primary"
-          onClick={onRequestOpenSummary}
-          disabled={lockBlocked}
-          title={
-            lockBlocked
-              ? '正在另一个标签页中编辑'
-              : inputPaused
-                ? '请先处理未保存的改动或取得编辑控制'
-                : undefined
-          }
-        >
-          结束
-        </button>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, flex: 'none' }}>
+          <CoachHeaderButton compact />
+          <button
+            className="btn btn-sm btn-primary"
+            onClick={onRequestOpenSummary}
+            disabled={lockBlocked}
+            title={
+              lockBlocked
+                ? '正在另一个标签页中编辑'
+                : inputPaused
+                  ? '请先处理未保存的改动或取得编辑控制'
+                  : undefined
+            }
+          >
+            结束
+          </button>
+        </div>
       </header>
 
       {saveState === 'error' ? (

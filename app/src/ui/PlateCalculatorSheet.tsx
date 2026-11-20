@@ -88,18 +88,23 @@ export function PlateCalculatorSheet({
       footer={
         <div style={{ display: 'flex', gap: 8 }}>
           {onApplyWeight && Number.isFinite(parsedWeight) && parsedWeight >= 0 && parsedWeight <= 999 ? (
-            <button
-              type="button"
-              className="btn btn-primary"
-              data-testid="plate-calc-apply"
-              style={{ flex: 1 }}
-              onClick={() => {
-                onApplyWeight(calc.exact ? calc.achievedTotalKg : parsedWeight);
-                onClose();
-              }}
-            >
-              填入 {fmtWeight(calc.exact ? calc.achievedTotalKg : parsedWeight)} kg
-            </button>
+            (() => {
+              const applyKg = Math.round((calc.exact ? calc.achievedTotalKg : parsedWeight) * 100) / 100;
+              return (
+                <button
+                  type="button"
+                  className="btn btn-primary"
+                  data-testid="plate-calc-apply"
+                  style={{ flex: 1 }}
+                  onClick={() => {
+                    onApplyWeight(applyKg);
+                    onClose();
+                  }}
+                >
+                  填入 {fmtWeight(applyKg)} kg
+                </button>
+              );
+            })()
           ) : null}
           <button
             type="button"

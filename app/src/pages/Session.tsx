@@ -7,53 +7,27 @@
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { CARDIO_PRESET_CHOICES, createCardioEntry, validateCardioParams } from '../domain/cardio';
-import {
-  collectMovementFragments,
-  comparabilityOf,
-  describeMode,
-  describeMovementPerformance,
-  modeOf,
-} from '../domain/comparability';
-import {
-  assessExerciseIdentityChange,
-  exerciseTemplateFromConfig,
-  planTargetApply,
-  sessionExerciseFromTemplate,
-} from '../domain/exerciseConfig';
+import { collectMovementFragments, comparabilityOf, describeMode, describeMovementPerformance, modeOf } from '../domain/comparability';
+import { assessExerciseIdentityChange, exerciseTemplateFromConfig, planTargetApply, sessionExerciseFromTemplate } from '../domain/exerciseConfig';
 import { MAX_CARDIO_ENTRIES } from '../domain/limits';
 import { evaluateProgressionHint } from '../domain/progressionHint';
 import { reorderSessionItems } from '../domain/reorder';
 import {
-  addCardioToSession,
-  applyTargetToSessionExercise,
-  exerciseCompletion,
-  hasAnyData,
-  hasReps,
-  hasSkippedGroupsToUnskip,
-  removeLastRound,
-  skipRemaining,
-  summarizeSession,
-  unskipExercise,
-  withExercise,
-  withSetAndPrefillFollowingWeight,
+  addCardioToSession, applyTargetToSessionExercise, collectPrefillWeightFieldIds,
+  exerciseCompletion, hasAnyData, hasReps,
+  hasSkippedGroupsToUnskip, removeLastRound, skipRemaining, summarizeSession, unskipExercise,
+  withExercise, withSetAndPrefillFollowingWeight,
 } from '../domain/session';
+import { collectSingleMovementIds, filterComparableSetsForExercise } from '../domain/supersetPair';
 import { setupNoteFor, withSetupNote } from '../domain/setupNote';
 import { diffSessionVsPlanDay } from '../domain/sessionToPlanSync';
 import {
-  applyDeleteItem,
-  previewDeleteItem,
-  undoDeleteItem,
-  type DeleteItemKind,
-  type DeleteItemPreview,
-  type DeleteUndoRecord,
+  applyDeleteItem, previewDeleteItem, undoDeleteItem,
+  type DeleteItemKind, type DeleteItemPreview, type DeleteUndoRecord,
 } from '../domain/sessionItemIntent';
-import type {
-  DumbbellBasis,
-  ExerciseTarget,
-  Session,
-  SessionExercise,
-  WeightMode,
-} from '../domain/types';
+import type { DumbbellBasis, ExerciseTarget, Session, SessionExercise, WeightMode } from '../domain/types';
+import { parseRawRiskField, useSessionRuntimeRegistration } from '../coach/sessionRuntimeBridge';
+import { clearRawFieldsInMaps, hasNonEmptyRawDraftInMaps } from './session/rawDraftHelpers';
 import {
   bindDeleteFeedback,
   captureDeleteFeedbackIntent,
@@ -179,30 +153,10 @@ export function SessionPage({
   const editorDirtyRef = useRef(false);
 
   const {
-    editorId,
-    confirmedRevision,
-    latestRef,
-    saveQueue,
-    intentionallyClosed,
-    lockBlocked,
-    setLockBlocked,
-    lockLostReason,
-    setLockLostReason,
-    conflictMessage,
-    setConflictMessage,
-    saveState,
-    hasPendingDraft,
-    draftConflicts,
-    busyOwner,
-    isCommittedBusy,
-    inputPaused,
-    pausedNotice,
-    applyChange,
-    commitPaired,
-    sealPendingWrites,
-    tryTakeOver,
-    retryUnsaved,
-    discardPendingDraft,
+    editorId, confirmedRevision, latestRef, unsavedDraftRef, saveQueue, intentionallyClosed,
+    lockBlocked, setLockBlocked, lockLostReason, setLockLostReason, conflictMessage, setConflictMessage,
+    saveState, hasPendingDraft, draftConflicts, busyOwner, isCommittedBusy, inputPaused, pausedNotice,
+    applyChange, commitPaired, sealPendingWrites, applyExternalSessionCommit, tryTakeOver, retryUnsaved, discardPendingDraft,
   } = useSessionPersistence({
     sessionId,
     session,
@@ -217,7 +171,11 @@ export function SessionPage({
   const rawRiskRef = useRef<Map<string, Set<string>>>(new Map());
   const rawDraftRef = useRef<Map<string, Map<string, string>>>(new Map());
   const [, setRawRiskVersion] = useState(0);
+  const [rawDraftVersions, setRawDraftVersions] = useState<Record<string, number>>({});
   const [rawResetEpochs, setRawResetEpochs] = useState<Record<string, number>>({});
+  const bumpRawDraftVersion = useCallback((exId: string) => {
+    setRawDraftVersions((prev) => ({ ...prev, [exId]: (prev[exId] ?? 0) + 1 }));
+  }, []);
   const registerRawRisk = useCallback((exId: string, fieldId: string, risky: boolean) => {
     const fields = rawRiskRef.current.get(exId) ?? new Set<string>();
     const had = fields.has(fieldId);
@@ -229,6 +187,10 @@ export function SessionPage({
     setRawRiskVersion((v) => v + 1);
   }, []);
   const hasRawRisk = useCallback((exId: string) => (rawRiskRef.current.get(exId)?.size ?? 0) > 0, []);
+  const hasNonEmptyRawDraft = useCallback(
+    (exId?: string) => hasNonEmptyRawDraftInMaps(rawRiskRef.current, rawDraftRef.current, exId),
+    [],
+  );
   const registerRawDraft = useCallback((exId: string, fieldId: string, raw: string | null) => {
     const fields = rawDraftRef.current.get(exId) ?? new Map<string, string>();
     const previous = fields.get(fieldId);
@@ -236,12 +198,18 @@ export function SessionPage({
     else fields.set(fieldId, raw);
     if (fields.size) rawDraftRef.current.set(exId, fields);
     else rawDraftRef.current.delete(exId);
-    if (previous !== raw) setRawRiskVersion((v) => v + 1);
-  }, []);
+    if (previous !== raw) { setRawRiskVersion((v) => v + 1); bumpRawDraftVersion(exId); }
+  }, [bumpRawDraftVersion]);
   const getRawDraft = useCallback(
     (exId: string, fieldId: string) => rawDraftRef.current.get(exId)?.get(fieldId),
     [],
   );
+  const clearRawFields = useCallback((exId: string, fieldIds: readonly string[]) => {
+    if (clearRawFieldsInMaps(rawRiskRef.current, rawDraftRef.current, exId, fieldIds)) {
+      setRawRiskVersion((v) => v + 1);
+      bumpRawDraftVersion(exId);
+    }
+  }, [bumpRawDraftVersion]);
 
   const cardioRawSignatureGettersRef = useRef<Map<string, () => string | undefined>>(new Map());
   const rawSignatureFor = useCallback((exId: string): string | undefined => {
@@ -259,8 +227,9 @@ export function SessionPage({
     rawDraftRef.current.delete(exId);
     rawRiskRef.current.delete(exId);
     setRawRiskVersion((v) => v + 1);
+    bumpRawDraftVersion(exId);
     setRawResetEpochs((prev) => ({ ...prev, [exId]: (prev[exId] ?? 0) + 1 }));
-  }, []);
+  }, [bumpRawDraftVersion]);
 
   const addInFlightRef = useRef<string | null>(null);
   useEffect(() => {
@@ -498,6 +467,23 @@ export function SessionPage({
   );
   const timerLiveRef = useRef(timer);
   timerLiveRef.current = timer;
+
+  useSessionRuntimeRegistration(
+    session && session.status === 'active'
+      ? {
+          sessionId: session.id,
+          editorId: editorId.current,
+          awaitPendingWrites: async () => { sealPendingWrites(); await saveQueue.current; },
+          applyCommittedSession: applyExternalSessionCommit,
+          hasBlockingDrafts: () => hasPendingDraft || unsavedDraftRef.current !== null || rawRiskRef.current.size > 0,
+          startRestTimer: (sec, src) => timerLiveRef.current.start(sec, src),
+          listRawRiskEntries: (exId) =>
+            [...(rawRiskRef.current.get(exId) ?? [])]
+              .map((fid) => parseRawRiskField(exId, fid, session.id))
+              .filter((e): e is NonNullable<typeof e> => e !== null),
+        }
+      : null,
+  );
 
   /* ── 第2阶段 G7：有氧草稿登记钩子（必须在所有提前 return 之前无条件调用）── */
   const cardioFlushers = useRef(new Map<string, () => boolean>());
@@ -788,7 +774,7 @@ export function SessionPage({
         pushToast('这个动作已经不在本次训练里了', 'error');
         return;
       }
-      if (hasRawRisk(exId)) {
+      if (hasNonEmptyRawDraft(exId)) {
         pushToast('这个动作还有未完成输入；请先提交或放弃那些输入，再编辑结构。', 'error');
         return;
       }
@@ -809,7 +795,7 @@ export function SessionPage({
         },
       });
     },
-    [hasRawRisk, latestRef, memoryFor, pushToast],
+    [hasNonEmptyRawDraft, latestRef, memoryFor, pushToast],
   );
 
   const handleToggleExercise = useCallback((exId: string) => {
@@ -1059,22 +1045,22 @@ export function SessionPage({
       return prev;
     }
     const sorted = [...finished].sort((a, b) => (b.endedAt ?? 0) - (a.endedAt ?? 0));
+    const singleMovementIds = collectSingleMovementIds(finished);
     const byKey = new Map<string, LastPerformanceSummary>();
     const byExerciseId = new Map<string, LastPerformanceSummary>();
     const latestExByKey = new Map<string, SessionExercise>();
     for (const s of sorted) {
       const groups = new Map<
         string,
-        {
-          exerciseId: string;
-          mode: { weightMode: WeightMode; dumbbellBasis: DumbbellBasis };
-          ex: SessionExercise;
-        }
+        { exerciseId: string; mode: { weightMode: WeightMode; dumbbellBasis: DumbbellBasis }; ex: SessionExercise }
       >();
       for (const ex of s.exercises) {
         const key = comparabilityOf(ex);
         if (byKey.has(key) || groups.has(key)) continue;
-        const doneSets = ex.sets.filter((st) => st.status === 'done' && hasReps(st));
+        const { eligibleSets } = filterComparableSetsForExercise(ex, {
+          hasSingleStraightHistory: singleMovementIds.has(ex.exerciseId ?? ex.name),
+        });
+        const doneSets = eligibleSets.filter((st) => st.status === 'done' && hasReps(st));
         if (!doneSets.length) continue;
         groups.set(key, { exerciseId: ex.exerciseId ?? ex.name, mode: modeOf(ex), ex });
         if (!latestExByKey.has(key)) {
@@ -1082,7 +1068,9 @@ export function SessionPage({
         }
       }
       for (const [key, g] of groups) {
-        const perf = collectMovementFragments(s, g.exerciseId, g.mode);
+        const perf = collectMovementFragments(s, g.exerciseId, g.mode, {
+          hasSingleStraightHistory: singleMovementIds.has(g.exerciseId),
+        });
         if (!perf) continue;
         const entry: LastPerformanceSummary = {
           date: s.endedAt ?? s.startedAt,
@@ -1221,13 +1209,18 @@ export function SessionPage({
     if (finishGuard.current) return;
     finishGuard.current = true;
     setFinishing(true);
-    timer.stop();
     try {
       sealPendingWrites();
       await saveQueue.current;
+      if (hasPendingDraft || unsavedDraftRef.current !== null || hasNonEmptyRawDraft()) {
+        finishGuard.current = false;
+        pushToast('仍有未确认或未落盘的输入草稿，请先完成确认或恢复后再结束训练', 'error');
+        return;
+      }
 
+      const activeSnapshot = latestRef.current ?? session;
       const ended: Session = {
-        ...session,
+        ...activeSnapshot,
         revision: confirmedRevision.current,
         status: 'completed',
         endedAt: Date.now(),
@@ -1257,6 +1250,7 @@ export function SessionPage({
         return;
       }
 
+      timer.stop();
       intentionallyClosed.current = true;
       confirmedRevision.current = result.revision;
       await refreshSessions();
@@ -1265,8 +1259,8 @@ export function SessionPage({
         pushToast(`训练已结束，并已将动作编排更新回「${planSyncDiff.dayName}」`, 'ok');
       }
       setSummaryOpen(false);
-      markPendingFinishReceipt(session.id);
-      navigate(`/history/${session.id}`, true);
+      markPendingFinishReceipt(activeSnapshot.id);
+      navigate(`/history/${activeSnapshot.id}`, true);
     } catch (err) {
       finishGuard.current = false;
       pushToast(err instanceof Error ? `结束失败：${err.message}，可重试` : '结束失败，可重试', 'error');
@@ -1276,7 +1270,7 @@ export function SessionPage({
   }
 
   async function requestLeave(_source: string) {
-    const outcome = await handleBackIntent();
+    const outcome = await handleBackIntent({ handleCoach: false });
     if (outcome.action === 'exit') {
       navigate('/', true);
     }
@@ -1284,11 +1278,11 @@ export function SessionPage({
 
   async function discard() {
     if (!session) return;
-    timer.stop();
     sealPendingWrites();
     await saveQueue.current.catch(() => undefined);
+    const activeSnapshot = latestRef.current ?? session;
     const ended: Session = {
-      ...session,
+      ...activeSnapshot,
       revision: confirmedRevision.current,
       status: 'discarded',
       endedAt: Date.now(),
@@ -1306,6 +1300,7 @@ export function SessionPage({
         pushToast(r.message, 'error');
         return;
       }
+      timer.stop();
       intentionallyClosed.current = true;
       confirmedRevision.current = r.revision;
       await refreshSessions();
@@ -1388,8 +1383,11 @@ export function SessionPage({
               onRawRisk={registerRawRisk}
               onRawDraft={registerRawDraft}
               rawDraftFor={getRawDraft}
+              rawDraftVersion={rawDraftVersions[ex.id] ?? 0}
               rawResetToken={rawResetEpochs[ex.id] ?? 0}
               hasRawRisk={hasRawRisk(ex.id)}
+              hasBlockingRawRisk={hasNonEmptyRawDraft(ex.id)}
+              onClearRawFields={clearRawFields}
               onDiscardRawDraft={discardRawDrafts}
               reorderIds={strengthIds}
               drag={dragSnapshot && dragSnapshot.kind === 'strength' ? dragSnapshot : null}
@@ -1675,9 +1673,10 @@ export function SessionPage({
             ? (w) => {
                 const { exId, setId } = plateCalcState;
                 if (!setId) return;
-                applyChange((prev) =>
-                  withSetAndPrefillFollowingWeight(prev, exId, setId, { weightKg: w }),
-                );
+                const hasNonEmptyDraft = (otherId: string) => { const r = getRawDraft(exId, `${otherId}:weight`); return r !== undefined && r !== ''; };
+                const curEx = latestRef.current?.exercises.find((e) => e.id === exId);
+                clearRawFields(exId, collectPrefillWeightFieldIds(curEx, setId, w, true, hasNonEmptyDraft));
+                applyChange((prev) => withSetAndPrefillFollowingWeight(prev, exId, setId, { weightKg: w }, hasNonEmptyDraft));
               }
             : undefined
         }

@@ -3,6 +3,7 @@ import { createRoot } from 'react-dom/client';
 import './styles/tokens.css';
 import './styles/base.css';
 import './styles/zine.css';
+import './coach/coach.css';
 import { App } from './App';
 import { StoreProvider } from './store';
 import { registerSW } from './swRegister';

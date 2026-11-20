@@ -21,6 +21,7 @@ import { createV32Plan } from '../../domain/presets/v32';
 import { TemplateImportSheet } from '../../ui/TemplateImportSheet';
 import { atomicDeletePlanWithCurrent } from '../../db/repo';
 import type { Plan, PlanDay } from '../../domain/types';
+import { CoachHeaderButton } from '../../coach/CoachHeaderButton';
 
 /**
  * B4-R2：**字段 owner 的完整生命周期**（注册 → 上报 → 注销）。
@@ -247,17 +248,18 @@ export function PlansPage() {
 
   return (
     <main className="page page-top page-bottom-space">
-      <header style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 10 }}>
+      <header style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
         <h1 className="h-serif" style={{ fontSize: 26 }}>
           训练计划
         </h1>
-        <div style={{ display: 'flex', gap: 6, flex: 'none' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, flex: 'none' }}>
           <button className="btn btn-sm btn-primary" onClick={() => setNewOpen(true)}>
             + 新建
           </button>
           <button className="btn btn-sm btn-ghost" onClick={() => setTplOpen(true)}>
             导入
           </button>
+          <CoachHeaderButton compact />
         </div>
       </header>
       <hr className="rule-line" style={{ marginTop: 8 }} />

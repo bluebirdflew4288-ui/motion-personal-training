@@ -17,6 +17,7 @@ import { comparabilityLabel, exerciseIdFromName, normalizeExerciseName } from '.
 import { collectMovementFragments, type MovementFragment } from './comparability';
 import { EXERCISE_LIBRARY, type LibraryEntry } from './presets/library';
 import { matchesPinyinInitials } from './pinyinInitials';
+import { collectSingleMovementIds, filterComparableSetsForExercise } from './supersetPair';
 
 export const OVERVIEW_WEEK_SPAN = 8;
 
@@ -223,8 +224,12 @@ export function buildExerciseHistory(
   const done = sessions
     .filter((s) => s.status === 'completed' && s.endedAt)
     .sort((a, b) => a.startedAt - b.startedAt);
+  const singleIds = collectSingleMovementIds(done);
   const entries: ExerciseHistoryEntry[] = [];
   let name = '';
+
+  const identity = resolveHistoryKey(done, key);
+  const hasSingleStraightHistory = singleIds.has(identity);
 
   // 未指定口径：取最近一次有实际记录的口径
   let chosen = mode;
@@ -233,7 +238,9 @@ export function buildExerciseHistory(
       for (const ex of done[i].exercises) {
         const exKey = ex.exerciseId ?? ex.name;
         if (exKey !== key && ex.name !== key) continue;
-        if (!ex.sets.some((st) => st.status === 'done')) continue;
+        if (!filterComparableSetsForExercise(ex, { hasSingleStraightHistory }).eligibleSets.some((st) => st.status === 'done')) {
+          continue;
+        }
         chosen = {
           weightMode: ex.target.weightMode,
           dumbbellBasis: ex.target.dumbbellBasis ?? 'total',
@@ -244,11 +251,10 @@ export function buildExerciseHistory(
   }
   if (!chosen) return null;
 
-  const identity = resolveHistoryKey(done, key);
   const isAssisted = chosen.weightMode === 'assisted';
 
   for (const s of done) {
-    const perf = collectMovementFragments(s, identity, chosen);
+    const perf = collectMovementFragments(s, identity, chosen, { hasSingleStraightHistory });
     if (!perf) continue;
     name = name || perf.name;
     const dropFragments = perf.fragments.filter((f) => f.kind === 'dropSet');
@@ -322,13 +328,16 @@ const LIBRARY_BY_ID = new Map<string, LibraryEntry>(
 );
 
 export function listTrainedExercises(sessions: Session[]): TrainedExerciseItem[] {
+  const singleIds = collectSingleMovementIds(sessions);
   const map = new Map<string, { name: string; count: number }>();
   for (const s of sessions) {
     if (s.status !== 'completed') continue;
     const seen = new Set<string>();
     for (const ex of s.exercises) {
-      if (!ex.sets.some((st) => st.status === 'done')) continue;
       const key = ex.exerciseId ?? ex.name;
+      if (!filterComparableSetsForExercise(ex, { hasSingleStraightHistory: singleIds.has(key) }).eligibleSets.some((st) => st.status === 'done')) {
+        continue;
+      }
       if (seen.has(key)) continue;
       seen.add(key);
       const cur = map.get(key) ?? { name: ex.name, count: 0 };

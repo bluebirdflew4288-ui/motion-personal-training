@@ -6,6 +6,7 @@ import { newId } from './session';
 import { MAX_DAYS, MAX_EXERCISES, MAX_PLAN_NAME, MAX_STAGES_ACCEPTED } from './limits';
 import { ensureStageIds, validateExerciseTarget } from './exerciseConfig';
 import { resolveExerciseId } from './identity';
+import { cleanOrphanPairIds } from './supersetPair';
 
 /** 计划名称是否在备份/恢复可接受的范围内（与 validate.ts 的 200 上限一致） */
 export function isPlanNameWithinLimit(name: string): boolean {
@@ -234,7 +235,11 @@ export function updateTarget(plan: Plan, dayId: string, exId: string, patch: Par
 export function removeExercise(plan: Plan, dayId: string, exId: string): Plan {
   return {
     ...plan,
-    days: plan.days.map((d) => (d.id === dayId ? { ...d, exercises: d.exercises.filter((e) => e.id !== exId) } : d)),
+    days: plan.days.map((d) =>
+      d.id === dayId
+        ? { ...d, exercises: cleanOrphanPairIds(d.exercises.filter((e) => e.id !== exId)) }
+        : d,
+    ),
   };
 }
 

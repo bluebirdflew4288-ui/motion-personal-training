@@ -10,6 +10,7 @@
 import { comparabilityOf } from './comparability';
 import { resolveGroupConfig, targetGroupCount, targetStageCountForGroup } from './exerciseConfig';
 import { hasReps, isSetLogged } from './session';
+import { collectSingleMovementIds, filterComparableSetsForExercise } from './supersetPair';
 import type { Session, SessionExercise } from './types';
 
 export const PROGRESSION_HINT_TEXT = '↑ 上次已满上限';
@@ -39,6 +40,13 @@ export function evaluateProgressionHint(
 ): string | null {
   if (!lastSameModeEx) return null;
   if (comparabilityOf(currentEx) !== comparabilityOf(lastSameModeEx)) return null;
+  if (
+    lastSameModeEx.target.kind === 'dropSet' &&
+    lastSameModeEx.target.form === 'superset' &&
+    filterComparableSetsForExercise(lastSameModeEx, { hasSingleStraightHistory: true }).excludedAmbiguous
+  ) {
+    return null;
+  }
 
   const target = currentEx.target;
   const requiredGroups = targetGroupCount(target);
@@ -93,12 +101,17 @@ export function findLatestComparableExerciseMap(
     .slice()
     .sort((a, b) => (b.endedAt ?? b.startedAt) - (a.endedAt ?? a.startedAt));
 
+  const singleIds = collectSingleMovementIds(sorted);
   const latestByKey = new Map<string, SessionExercise>();
   for (const s of sorted) {
     for (const ex of s.exercises) {
       const key = comparabilityOf(ex);
       if (latestByKey.has(key)) continue;
-      if (!ex.sets.some(isSetLogged)) continue;
+      const filtered = filterComparableSetsForExercise(ex, {
+        hasSingleStraightHistory: singleIds.has(ex.exerciseId ?? ex.name),
+      });
+      if (filtered.excludedAmbiguous) continue;
+      if (!filtered.eligibleSets.some(isSetLogged)) continue;
       latestByKey.set(key, ex);
     }
   }

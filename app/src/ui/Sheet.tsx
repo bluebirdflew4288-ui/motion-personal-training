@@ -17,7 +17,10 @@
    5. 禁止 body 滚动，避免 iOS 键盘弹出时页面跳动。 */
 
 import { useEffect, useId, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import { backStack } from '../lib/backIntent';
+import { getPaneScrollContext } from './paneCoords';
+import { usePaneRole } from '../coach/FloatingWindowFrame';
 
 interface Props {
   open: boolean;
@@ -30,6 +33,7 @@ interface Props {
 }
 
 export function Sheet({ open, title, onClose, children, footer, autoFocusPanel = true }: Props) {
+  const paneRole = usePaneRole();
   const panelRef = useRef<HTMLDivElement>(null);
   const wasOpen = useRef(false);
   /** 稳定的层标识：同一弹层重渲染不会在返回栈里堆同名项 */
@@ -46,15 +50,17 @@ export function Sheet({ open, title, onClose, children, footer, autoFocusPanel =
       const active = document.activeElement;
       returnFocusRef.current = active instanceof HTMLElement ? active : null;
 
-      const prevOverflow = document.body.style.overflow;
-      document.body.style.overflow = 'hidden';
+      const scrollEl = getPaneScrollContext(panelRef.current).scrollEl;
+      const scrollHost = scrollEl ?? document.body;
+      const prevOverflow = scrollHost.style.overflow;
+      scrollHost.style.overflow = 'hidden';
 
       if (autoFocusPanel) {
         // 面板用 programmatic focus，不加 tabindex 到可聚焦输入
         requestAnimationFrame(() => panelRef.current?.focus({ preventScroll: true }));
       }
       return () => {
-        document.body.style.overflow = prevOverflow;
+        scrollHost.style.overflow = prevOverflow;
         wasOpen.current = false;
         // 关闭后把焦点还给触发元素；若该元素已不在文档中（列表重渲染），
         // 退回到弹层容器前的可聚焦元素，避免焦点掉回 body。
@@ -108,7 +114,7 @@ export function Sheet({ open, title, onClose, children, footer, autoFocusPanel =
 
   if (!open) return null;
 
-  return (
+  const node = (
     <div className="sheet-backdrop" onClick={() => closeRef.current()} role="presentation">
       <div
         className="sheet-panel"
@@ -135,4 +141,11 @@ export function Sheet({ open, title, onClose, children, footer, autoFocusPanel =
       </div>
     </div>
   );
+
+  // 主屏态挂到 body 根层叠上下文，防止被 .app-shell(z-index:1) 压在悬浮小窗(z-index:55)下方；
+  // 小窗态留在所属 .pane-scaled-stage 内，保持弹层归属隔离。
+  if (paneRole === 'primary' && typeof document !== 'undefined') {
+    return createPortal(node, document.body);
+  }
+  return node;
 }
