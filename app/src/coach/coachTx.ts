@@ -6,22 +6,42 @@
    4. 诚实倒计时：只有当组状态从「非 done -> done」时才触发 RestTimer；
    5. 字段级独立撤销：核验 restoreEpoch 与目标字段未被后续冲突覆写后精准回滚，保留用户对其他组（如第 3 组）的后续手动修改。 */
 
-import { openDb } from '../db/idb';
+import { openDb, REST_TIMER_STATE_META_PREFIX, idbGet } from '../db/idb';
 import {
   atomicDeletePlanWithCurrent,
-  getPlan,
   getSession,
   savePlan,
 } from '../db/repo';
 import {
-  atomicFinishSession,
-  atomicInsertPlan,
-  atomicSaveHistoryEdit,
-  atomicWriteSession,
+  getExerciseTemplate,
+} from '../db/templates';
+import {
   revisionOf,
   type WriteFailureReason,
 } from '../db/tx';
 import { validateDataDeep } from '../db/validate';
+import {
+  CARDIO_PRESET_CHOICES,
+  CARDIO_PRESET_LABEL,
+  commitCardioParams,
+  completeCardio,
+  createCardioEntry,
+  finalizeCardioForFinish,
+  normalizeCardioParams,
+  pauseCardio,
+  resumeCardio,
+  startCardio,
+  validateCardioParams,
+} from '../domain/cardio';
+import { pushCycle } from '../domain/cycle';
+import {
+  ensureStageIds,
+  exerciseTemplateFromConfig,
+  planTargetApply,
+  trainingFormLabel,
+  trainingFormOf,
+  validateExerciseTarget,
+} from '../domain/exerciseConfig';
 import {
   appendBlankGroupToHistoryExercise,
   correctHistoryCardioEntry,
@@ -31,30 +51,47 @@ import {
 } from '../domain/historyEdit';
 import { exerciseIdFromName } from '../domain/identity';
 import {
+  MAX_CARDIO_ENTRIES,
+  MAX_EXERCISES,
   MAX_LOGGED_REPS,
   MAX_PLANS,
   MAX_REST,
-  MAX_ROUNDS,
-  MAX_STRAIGHT_SETS,
+  MAX_REST_IN_SEC,
+  MAX_STAGES_ACCEPTED,
+  MAX_TEXT,
   MAX_WEIGHT,
+  MIN_ROUNDS,
 } from '../domain/limits';
 import {
   addExercise,
+  addWarmup,
   removeExercise,
+  removeWarmup,
   renameDay,
+  renameExercise,
   renamePlan,
   updateExercise,
   updateTarget,
+  updateWarmup,
 } from '../domain/planEdit';
 import {
+  addCardioToSession,
   applyTargetToSessionExercise,
-  hasReps,
+  exerciseRemovalProtection,
+  groupsFromTarget,
   newId,
+  removeCardioFromSession,
+  removeExerciseFromSession,
   restAfterSet,
+  skipRemaining,
+  summarizeSession,
+  unskipExercise,
+  withCardioEntry,
   withExercise,
   withSetAndPrefillFollowingWeight,
 } from '../domain/session';
 import { applySessionArrangementToPlan, diffSessionVsPlanDay } from '../domain/sessionToPlanSync';
+import { parseSetupNote, setupNoteFor, withSetupNote } from '../domain/setupNote';
 import {
   cleanOrphanPairIds,
   convertExerciseToMultiStageSuperset,
@@ -64,27 +101,61 @@ import {
 } from '../domain/supersetPair';
 import type {
   CardioParams,
+  CardioPreset,
   DropSetTarget,
+  DropStageTarget,
+  DumbbellBasis,
   ExerciseTarget,
+  ExerciseTemplate,
   Plan,
+  PlanCardio,
   PlanDay,
   PlanExercise,
   Session,
   SessionExercise,
   SessionSet,
   StraightTarget,
+  TrainingForm,
+  WeightMode,
 } from '../domain/types';
+import {
+  COACH_MEMORY_META_KEY,
+  loadCoachMemory,
+  removeCoachMemoryItem,
+  upsertCoachMemoryItem,
+  type CoachMemoryCategory,
+  type CoachMemoryItem,
+  type CoachMemoryStore,
+} from './coachMemory';
 import {
   getCoachReceipt,
   getCoachReceiptByOperationId,
   getCoachRestoreEpoch,
+  getCoachVaultRestoreEpoch,
+  runCoachMemoryVaultTx,
   saveCoachReceipt,
+  saveCoachReceiptStrict,
+  type CoachFrozenTargetPrecondition,
   type CoachOperationReceipt,
   type CoachPlanDraft,
   type CoachReceiptExerciseTargetTouched,
   type CoachReceiptSetTouched,
   type CoachReceiptTouchedTarget,
 } from './coachStorage';
+import {
+  computeCoachOpArgsDigest,
+  executeCoachMainTx,
+  executeCoachMainUndoTx,
+  MainTxError,
+  type CoachMainOpLogRecord,
+} from './coachMainTx';
+import {
+  buildDurableRecordFromCoachDirective,
+  shouldDispatchCoachOpTimer,
+  type CoachRestTimerDirective,
+  type DurableRestTimerRecord,
+} from '../lib/restTimerDurable';
+import { newRestToken } from '../lib/restReminder';
 import { checkFocusConflict, type CoachEditableField } from './focusGuard';
 import { getActiveSessionRuntime } from './sessionRuntimeBridge';
 
@@ -95,7 +166,8 @@ export type CoachTxConflictReason =
   | 'epoch-mismatch'
   | 'field-conflict'
   | 'not-found'
-  | 'invalid-input';
+  | 'invalid-input'
+  | 'ambiguous-target';
 
 export class TxConflictError extends Error {
   constructor(
@@ -108,17 +180,32 @@ export class TxConflictError extends Error {
   }
 }
 
+async function wrapMainTx<R>(fn: () => Promise<R>): Promise<R> {
+  try {
+    return await fn();
+  } catch (err) {
+    if (err instanceof MainTxError) {
+      throw new TxConflictError(err.reason, err.message, err.currentRevision);
+    }
+    throw err;
+  }
+}
+
 export interface CoachTxHooks {
   onSessionCommitted?: (session: Session) => void;
   onPlanCommitted?: (plan: Plan) => void;
   onPlanDeleted?: (planId: string) => void;
   onReceiptSaved?: (receipt: CoachOperationReceipt) => void;
+  onTemplatesChanged?: () => void;
+  onMemoryChanged?: (memory: CoachMemoryStore) => void;
 }
 
 export interface CoachCommitResult<T = Record<string, unknown>> {
   receipt: CoachOperationReceipt;
   session?: Session;
   plan?: Plan;
+  replayed?: boolean;
+  timerDirective?: CoachRestTimerDirective;
   meta?: T;
 }
 
@@ -147,17 +234,25 @@ function resolveSessionExercise(
   }
   const exact = session.exercises.filter((e) => e.name.trim().toLowerCase() === needle);
   if (exact.length === 1) return exact[0];
+  if (exact.length > 1) {
+    throw new TxConflictError('ambiguous-target', `找到多个同名动作「${selector.exerciseName}」，请指定具体卡片`);
+  }
   const fuzzy = session.exercises.filter((e) => e.name.trim().toLowerCase().includes(needle));
   if (fuzzy.length === 1) return fuzzy[0];
-  if (fuzzy.length > 1 || exact.length > 1) {
-    throw new TxConflictError('invalid-input', `找到多个匹配「${selector.exerciseName}」的动作，请指定具体卡片`);
+  if (fuzzy.length > 1) {
+    throw new TxConflictError('ambiguous-target', `找到多个匹配「${selector.exerciseName}」的动作，请指定具体卡片`);
   }
   throw new TxConflictError('not-found', `本次训练中没有找到动作「${selector.exerciseName}」`);
 }
 
 function resolveTargetSet(
   ex: SessionExercise,
-  selector: { setId?: string; roundIndex?: number; stageIndex?: number },
+  selector: {
+    setId?: string;
+    roundIndex?: number;
+    stageIndex?: number;
+    targetMode?: 'next_pending' | 'last_completed';
+  },
 ): SessionSet {
   if (selector.setId) {
     const found = ex.sets.find((s) => s.id === selector.setId);
@@ -174,9 +269,21 @@ function resolveTargetSet(
     }
     return found;
   }
+  if (selector.targetMode === 'last_completed') {
+    for (let i = ex.sets.length - 1; i >= 0; i -= 1) {
+      if (ex.sets[i].status === 'done') return ex.sets[i];
+    }
+    throw new TxConflictError('not-found', `动作「${ex.name}」还没有已完成组可纠正`);
+  }
   const skipped = new Set(ex.groups.filter((g) => g.skipped).map((g) => g.index));
   const nextPending = ex.sets.find((s) => !skipped.has(s.roundIndex) && s.status !== 'done');
-  return nextPending ?? ex.sets[ex.sets.length - 1];
+  if (!nextPending) {
+    throw new TxConflictError(
+      'ambiguous-target',
+      `动作「${ex.name}」的未跳过组已全部完成，请明确指定 roundIndex / setId，或以 targetMode: "last_completed" 纠正上一组`,
+    );
+  }
+  return nextPending;
 }
 
 function assertCleanSetValues(
@@ -223,12 +330,288 @@ function assertCleanSetValues(
   }
 }
 
+export interface CoachTxPreconditionArgs {
+  frozenPrecondition?: CoachFrozenTargetPrecondition;
+  priorBatchOpIds?: string[];
+  strictSessionRevision?: boolean;
+  modelExpectedRevision?: number;
+}
+
+function advanceRevisionFromPriorOps(
+  baseRev: number,
+  entityType: CoachOperationReceipt['entityType'],
+  entityId: string,
+  currentEpoch: number,
+  priorOpLogs: CoachMainOpLogRecord[],
+): number {
+  let cursor = baseRev;
+  for (const op of priorOpLogs) {
+    if (
+      op.entityType === entityType &&
+      op.entityId === entityId &&
+      op.restoreEpoch === currentEpoch &&
+      !op.undone &&
+      op.beforeRevision === cursor
+    ) {
+      cursor = op.afterRevision;
+    }
+  }
+  return cursor;
+}
+
+function resolveBatchAdjustedSetExpectation(
+  pre: Extract<CoachFrozenTargetPrecondition, { kind: 'set' }>,
+  priorOpLogs: CoachMainOpLogRecord[],
+  currentEpoch: number,
+): {
+  status: SessionSet['status'];
+  reps: number | null;
+  weightKg: number | null;
+  toFailure: boolean;
+  note: string;
+} {
+  let status = pre.beforeStatus;
+  let reps = pre.beforeReps;
+  let weightKg = pre.beforeWeightKg;
+  let toFailure = Boolean(pre.beforeToFailure);
+  let note = pre.beforeNote;
+  for (const op of priorOpLogs) {
+    if (op.restoreEpoch !== currentEpoch || op.undone) continue;
+    for (const t of op.touchedTargets) {
+      if (t.kind === 'session-set' && t.sessionId === pre.sessionId && t.setId === pre.setId) {
+        status = t.afterSet.status;
+        reps = t.afterSet.reps;
+        weightKg = t.afterSet.weightKg;
+        toFailure = Boolean(t.afterSet.toFailure);
+        note = t.afterSet.note ?? '';
+      } else if (t.kind === 'session-snapshot' && t.sessionId === pre.sessionId) {
+        const sAfter = t.afterSession.exercises
+          .find((e) => e.id === pre.exId)
+          ?.sets.find((s) => s.id === pre.setId);
+        if (sAfter) {
+          status = sAfter.status;
+          reps = sAfter.reps;
+          weightKg = sAfter.weightKg;
+          toFailure = Boolean(sAfter.toFailure);
+          note = sAfter.note ?? '';
+        }
+      }
+    }
+  }
+  return { status, reps, weightKg, toFailure, note };
+}
+
+function isFrozenSessionPreconditionIntact(
+  currentSession: Session,
+  pre: CoachFrozenTargetPrecondition,
+  priorOpLogs: CoachMainOpLogRecord[],
+  currentEpoch: number,
+): boolean {
+  if (pre.kind === 'plan') return false;
+  if (pre.sessionId && pre.sessionId !== currentSession.id) return false;
+  switch (pre.kind) {
+    case 'session-strict':
+      return false;
+    case 'set': {
+      const ex = currentSession.exercises.find((e) => e.id === pre.exId);
+      if (!ex) return false;
+      if (ex.name !== pre.beforeExName || JSON.stringify(ex.target) !== pre.beforeTargetJson) {
+        return false;
+      }
+      const liveSet = ex.sets.find((s) => s.id === pre.setId);
+      if (!liveSet) return false;
+      const expected = resolveBatchAdjustedSetExpectation(pre, priorOpLogs, currentEpoch);
+      if (liveSet.status !== expected.status) return false;
+      if (
+        (pre.touchedFields.includes('reps') || pre.touchedFields.includes('status')) &&
+        liveSet.reps !== expected.reps
+      ) {
+        return false;
+      }
+      if (
+        (pre.touchedFields.includes('weightKg') || pre.touchedFields.includes('status')) &&
+        liveSet.weightKg !== expected.weightKg
+      ) {
+        return false;
+      }
+      if (
+        pre.touchedFields.includes('toFailure') &&
+        Boolean(liveSet.toFailure) !== expected.toFailure
+      ) {
+        return false;
+      }
+      if (pre.touchedFields.includes('note') && (liveSet.note ?? '') !== expected.note) {
+        return false;
+      }
+      return true;
+    }
+    case 'session-note': {
+      let expectedNote = pre.beforeNote;
+      for (const op of priorOpLogs) {
+        if (op.restoreEpoch !== currentEpoch || op.undone) continue;
+        for (const t of op.touchedTargets) {
+          if (t.kind === 'session-snapshot' && t.sessionId === pre.sessionId) {
+            expectedNote = t.afterSession.note ?? '';
+          }
+        }
+      }
+      return (currentSession.note ?? '') === expectedNote;
+    }
+    case 'exercise-note': {
+      const ex = currentSession.exercises.find((e) => e.id === pre.exId);
+      if (!ex) return false;
+      return (ex.note ?? '') === pre.beforeNote;
+    }
+    case 'exercise-target': {
+      const ex = currentSession.exercises.find((e) => e.id === pre.exId);
+      if (!ex) return false;
+      return (
+        ex.name === pre.beforeExName &&
+        ex.restSec === pre.beforeRestSec &&
+        JSON.stringify(ex.target) === pre.beforeTargetJson
+      );
+    }
+    case 'exercise-structure': {
+      const ex = currentSession.exercises.find((e) => e.id === pre.exId);
+      if (!ex) return false;
+      const curShape = JSON.stringify({
+        name: ex.name,
+        form: trainingFormOf(ex.target),
+        target: ex.target,
+        sets: ex.sets.map((s) => ({ id: s.id, status: s.status, reps: s.reps, weightKg: s.weightKg })),
+      });
+      return curShape === pre.beforeExerciseJson;
+    }
+    case 'exercise-list': {
+      return JSON.stringify(currentSession.exercises.map((e) => e.id)) === JSON.stringify(pre.beforeExIds);
+    }
+    case 'superset': {
+      const curShape = JSON.stringify(
+        currentSession.exercises.map((e) => ({
+          id: e.id,
+          pairId: e.pairId ?? null,
+          target: e.target,
+        })),
+      );
+      return curShape === pre.beforeExercisesJson;
+    }
+    case 'warmup': {
+      const w = pre.warmupId ? currentSession.warmups.find((x) => x.id === pre.warmupId) : undefined;
+      return JSON.stringify(w ?? null) === pre.beforeWarmupJson;
+    }
+    case 'warmup-list':
+      return JSON.stringify(currentSession.warmups) === pre.beforeWarmupsJson;
+    case 'cardio': {
+      const list = currentSession.cardio ?? [];
+      const c = pre.cardioId ? list.find((x) => x.id === pre.cardioId) : undefined;
+      return JSON.stringify(c ?? null) === pre.beforeCardioJson;
+    }
+    case 'cardio-list':
+      return JSON.stringify(currentSession.cardio ?? []) === pre.beforeCardioJson;
+    case 'setup-note': {
+      if (!pre.exId) return true;
+      const ex = currentSession.exercises.find((e) => e.id === pre.exId);
+      if (!ex) return false;
+      return (ex.setupNote ?? '') === (pre.beforeSessionSetupNote ?? '');
+    }
+    default:
+      return false;
+  }
+}
+
+function assertSessionVersionOrPrecondition(params: {
+  currentSession: Session;
+  expectedRevision?: number;
+  modelExpectedRevision?: number;
+  currentEpoch: number;
+  priorOpLogs: CoachMainOpLogRecord[];
+  frozenPrecondition?: CoachFrozenTargetPrecondition;
+  strictSessionRevision?: boolean;
+  entityLabel?: string;
+}): void {
+  const {
+    currentSession,
+    expectedRevision,
+    modelExpectedRevision,
+    currentEpoch,
+    priorOpLogs,
+    frozenPrecondition,
+    strictSessionRevision,
+    entityLabel = '训练记录',
+  } = params;
+  const curRev = revisionOf(currentSession);
+  if (expectedRevision !== undefined) {
+    const selfExpectedRev = advanceRevisionFromPriorOps(
+      expectedRevision,
+      'session',
+      currentSession.id,
+      currentEpoch,
+      priorOpLogs,
+    );
+    const frozenSatisfied =
+      curRev === selfExpectedRev ||
+      (!strictSessionRevision &&
+        frozenPrecondition &&
+        isFrozenSessionPreconditionIntact(currentSession, frozenPrecondition, priorOpLogs, currentEpoch));
+
+    if (!frozenSatisfied) {
+      throw new TxConflictError(
+        'version-conflict',
+        `${entityLabel}已更新到版本 r${curRev}（请求基准 r${expectedRevision}），目标内容存在并发修改，已拒绝覆盖`,
+        curRev,
+      );
+    }
+    if (
+      modelExpectedRevision !== undefined &&
+      (modelExpectedRevision < expectedRevision || modelExpectedRevision > selfExpectedRev)
+    ) {
+      throw new TxConflictError(
+        'version-conflict',
+        `${entityLabel}已更新到版本 r${curRev}（请求基准 r${modelExpectedRevision}），与冻结视图基准不一致，已拒绝覆盖`,
+        curRev,
+      );
+    }
+    return;
+  }
+
+  if (modelExpectedRevision !== undefined) {
+    const selfModelRev = advanceRevisionFromPriorOps(
+      modelExpectedRevision,
+      'session',
+      currentSession.id,
+      currentEpoch,
+      priorOpLogs,
+    );
+    if (
+      curRev !== selfModelRev &&
+      !(
+        !strictSessionRevision &&
+        frozenPrecondition &&
+        isFrozenSessionPreconditionIntact(currentSession, frozenPrecondition, priorOpLogs, currentEpoch)
+      )
+    ) {
+      throw new TxConflictError(
+        'version-conflict',
+        `${entityLabel}已更新到版本 r${curRev}（请求基准 r${modelExpectedRevision}），目标内容存在并发修改，已拒绝覆盖`,
+        curRev,
+      );
+    }
+  }
+}
+
 async function runActiveSessionMutation<T>(
   args: {
     operationId: string;
     toolName: CoachOperationReceipt['toolName'];
     sessionId: string;
     expectedRevision?: number;
+    modelExpectedRevision?: number;
+    expectedEpoch?: number;
+    frozenPrecondition?: CoachFrozenTargetPrecondition;
+    priorBatchOpIds?: string[];
+    strictSessionRevision?: boolean;
+    deferTimerDispatch?: boolean;
+    argsForDigest?: unknown;
     compute: (current: Session) => {
       nextSession: Session;
       summary: string;
@@ -239,96 +622,411 @@ async function runActiveSessionMutation<T>(
   },
   hooks?: CoachTxHooks,
 ): Promise<CoachCommitResult<T>> {
-  const existingReceipt = await getCoachReceiptByOperationId(args.operationId);
-  if (existingReceipt) {
-    const latestSession = await getSession(args.sessionId);
-    return { receipt: existingReceipt, session: latestSession };
-  }
-
   const runtime = getActiveSessionRuntime(args.sessionId);
   if (runtime) {
     await runtime.awaitPendingWrites();
   }
+  const fallbackVaultEpoch = await getCoachVaultRestoreEpoch().catch(() => 0);
 
-  const current = await getSession(args.sessionId);
-  if (!current) {
-    throw new TxConflictError('not-found', '找不到目标训练记录');
+  const txResult = await wrapMainTx(() =>
+    executeCoachMainTx<T>({
+      operationId: args.operationId,
+      toolName: args.toolName,
+      argsForDigest: args.argsForDigest ?? {
+        toolName: args.toolName,
+        sessionId: args.sessionId,
+      },
+      expectedEpoch: args.expectedEpoch,
+      priorBatchOpIds: args.priorBatchOpIds,
+      stores: ['sessions'],
+      sessionId: args.sessionId,
+      lockCheck: {
+        sessionId: args.sessionId,
+        editorId: runtime?.editorId,
+        lockPolicy: runtime ? 'required' : 'optional',
+      },
+      fallbackVaultEpoch,
+      prepare: ({ now, currentEpoch, currentSession, priorOpLogs }) => {
+        if (!currentSession) {
+          throw new TxConflictError('not-found', '找不到目标训练记录');
+        }
+        if (currentSession.status !== 'active') {
+          throw new TxConflictError('state-conflict', '训练已结束或已放弃，无法再以进行中训练写入');
+        }
+        const curRev = revisionOf(currentSession);
+        assertSessionVersionOrPrecondition({
+          currentSession,
+          expectedRevision: args.expectedRevision,
+          modelExpectedRevision: args.modelExpectedRevision,
+          currentEpoch,
+          priorOpLogs,
+          frozenPrecondition: args.frozenPrecondition,
+          strictSessionRevision: args.strictSessionRevision,
+          entityLabel: '训练记录',
+        });
+
+        const computed = args.compute(currentSession);
+        const cardioList = computed.nextSession.cardio ?? [];
+        if (cardioList.length > MAX_CARDIO_ENTRIES) {
+          throw new TxConflictError('dirty-state', `一次训练最多 ${MAX_CARDIO_ENTRIES} 个有氧项目`);
+        }
+        if (cardioList.filter((c) => c.status === 'running').length > 1) {
+          throw new TxConflictError(
+            'state-conflict',
+            '一次训练只能有一个正在计时的有氧项目，请先暂停或完成当前项目',
+          );
+        }
+
+        const nextSession: Session = {
+          ...computed.nextSession,
+          revision: curRev + 1,
+        };
+        const timerDirective: CoachRestTimerDirective | undefined = computed.timerTrigger
+          ? {
+              operationId: args.operationId,
+              restSec: computed.timerTrigger.sec,
+              source: computed.timerTrigger.source,
+              token: newRestToken(),
+              deadlineAtMs: now + computed.timerTrigger.sec * 1000,
+              createdAt: now,
+              restoreEpoch: currentEpoch,
+            }
+          : undefined;
+        const durableRestTimer: DurableRestTimerRecord | undefined = timerDirective
+          ? buildDurableRecordFromCoachDirective(currentSession.id, timerDirective)
+          : undefined;
+
+        const opLog: CoachMainOpLogRecord = {
+          schemaVersion: 2,
+          operationId: args.operationId,
+          receiptId: makeReceiptId(),
+          toolName: args.toolName,
+          argsDigest: '',
+          createdAt: now,
+          restoreEpoch: currentEpoch,
+          scope: 'session',
+          summary: computed.summary,
+          entityType: 'session',
+          entityId: currentSession.id,
+          beforeRevision: curRev,
+          afterRevision: curRev + 1,
+          undoable: true,
+          undone: false,
+          timerStarted: Boolean(timerDirective),
+          ...(timerDirective ? { timerDirective } : {}),
+          touchedTargets: computed.touchedTargets,
+        };
+
+        return {
+          nextSession,
+          durableRestTimer,
+          opLog,
+          meta: computed.meta,
+        };
+      },
+    }),
+  );
+
+  // Best-effort mirror to motion-coach-vault; main DB already holds authoritative coach-op:*!
+  await saveCoachReceipt(txResult.receipt);
+
+  if (txResult.session && !txResult.replayed) {
+    runtime?.applyCommittedSession(txResult.session);
+    hooks?.onSessionCommitted?.(txResult.session);
   }
-  if (current.status !== 'active') {
-    throw new TxConflictError('state-conflict', '训练已结束或已放弃，无法再以进行中训练写入');
-  }
-  const curRev = revisionOf(current);
-  if (args.expectedRevision !== undefined && curRev !== args.expectedRevision) {
-    throw new TxConflictError(
-      'version-conflict',
-      `训练记录已更新到版本 r${curRev}（请求基准 r${args.expectedRevision}），请基于最新数据重审`,
-      curRev,
-    );
-  }
+  hooks?.onReceiptSaved?.(txResult.receipt);
 
-  const computed = args.compute(current);
-  const res = await atomicWriteSession({
-    intent: { kind: 'active-save' },
-    session: computed.nextSession,
-    editorId: runtime?.editorId,
-    expectedRevision: curRev,
-    lockPolicy: runtime ? 'required' : 'optional',
-  });
-
-  if (!res.ok) {
-    throw new TxConflictError(
-      res.reason,
-      res.message,
-      res.current ? revisionOf(res.current) : undefined,
-    );
+  const timerDirective = txResult.opLog.timerDirective;
+  if (timerDirective && !args.deferTimerDispatch && runtime) {
+    let nativeAlreadyScheduled: boolean | undefined;
+    if (txResult.replayed && typeof indexedDB !== 'undefined') {
+      const durableRow = await idbGet<{ key: string; value?: DurableRestTimerRecord }>(
+        'meta',
+        `${REST_TIMER_STATE_META_PREFIX}${args.sessionId}`,
+      ).catch(() => undefined);
+      nativeAlreadyScheduled = durableRow?.value?.nativeScheduled ?? true;
+    }
+    if (
+      shouldDispatchCoachOpTimer({
+        replayed: txResult.replayed,
+        nativeScheduled: nativeAlreadyScheduled,
+        isFinalTimerInBatch: true,
+      })
+    ) {
+      if (runtime.startRestTimerWithDirective) {
+        runtime.startRestTimerWithDirective(timerDirective);
+      } else {
+        runtime.startRestTimer(timerDirective.restSec, timerDirective.source);
+      }
+    }
   }
 
-  runtime?.applyCommittedSession(res.session);
-  hooks?.onSessionCommitted?.(res.session);
-
-  if (computed.timerTrigger) {
-    runtime?.startRestTimer(computed.timerTrigger.sec, computed.timerTrigger.source);
-  }
-
-  const epoch = await getCoachRestoreEpoch();
-  const receipt: CoachOperationReceipt = {
-    id: makeReceiptId(),
-    operationId: args.operationId,
-    toolName: args.toolName,
-    createdAt: Date.now(),
-    scope: 'session',
-    summary: computed.summary,
-    entityType: 'session',
-    entityId: res.session.id,
-    beforeRevision: curRev,
-    afterRevision: res.revision,
-    restoreEpoch: epoch,
-    undone: false,
-    timerStarted: Boolean(computed.timerTrigger),
-    touchedTargets: computed.touchedTargets,
+  return {
+    receipt: txResult.receipt,
+    session: txResult.session,
+    replayed: txResult.replayed,
+    timerDirective,
+    meta: txResult.meta,
   };
-  await saveCoachReceipt(receipt);
-  hooks?.onReceiptSaved?.(receipt);
-
-  return { receipt, session: res.session, meta: computed.meta };
 }
 
-/* ── 工具 1：调整本次训练目标（严格只改目标，绝不标 done、不误触计时器） ── */
+/* ── 工具 1：调整本次训练目标（支持切换普通组/超级组/递减组与休息时长，严格不标 done） ── */
 
-export interface AdjustActiveTargetInput {
-  operationId?: string;
-  sessionId: string;
-  exId?: string;
-  exerciseName?: string;
-  expectedRevision?: number;
+export interface CoachTargetStageInput {
+  id?: string;
+  label: string;
+  repsMin?: number | null;
+  repsMax?: number | null;
+  weightKg?: number | null;
+  toFailure?: boolean;
+  restAfterSec?: number;
+}
+
+export interface CoachTargetSpecInput {
+  form?: TrainingForm;
   sets?: number;
   setsMax?: number;
   repsMin?: number;
   repsMax?: number;
   suggestedWeightKg?: number | null;
+  weightMode?: WeightMode;
+  dumbbellBasis?: DumbbellBasis;
+  toFailure?: boolean;
   restSec?: number;
-  stageTargets?: Array<{ stageIndex: number; repsMin?: number | null; repsMax?: number | null; weightKg?: number | null }>;
+  restInSec?: number;
+  restAfterSec?: number;
+  stages?: CoachTargetStageInput[];
+  stageTargets?: Array<{ stageIndex: number; repsMin?: number | null; repsMax?: number | null; weightKg?: number | null; label?: string; toFailure?: boolean; restAfterSec?: number }>;
 }
+
+const TWENTY_ONES_NAME_RE = /(21\s*响|21s|21\s*次)/i;
+
+function defaultStagesForExercise(
+  name: string,
+  spec: CoachTargetSpecInput,
+  fallbackTarget?: ExerciseTarget,
+): DropStageTarget[] {
+  if (fallbackTarget?.kind === 'dropSet' && fallbackTarget.stages.length >= 2) {
+    return fallbackTarget.stages.map((st) => ({
+      ...st,
+      ...(spec.repsMin !== undefined ? { repsMin: spec.repsMin } : {}),
+      ...(spec.repsMax !== undefined ? { repsMax: spec.repsMax } : {}),
+      ...(spec.suggestedWeightKg !== undefined ? { weightKg: spec.suggestedWeightKg } : {}),
+    }));
+  }
+  const baseWeight =
+    spec.suggestedWeightKg !== undefined
+      ? spec.suggestedWeightKg
+      : fallbackTarget?.kind === 'straight'
+        ? fallbackTarget.suggestedWeightKg
+        : null;
+  if (TWENTY_ONES_NAME_RE.test(name)) {
+    return [
+      { id: newId('st'), label: '下半程', weightKg: baseWeight, repsMin: 7, repsMax: 7, toFailure: false, targetText: `7次${baseWeight !== null ? ` · ${baseWeight}kg` : ''}` },
+      { id: newId('st'), label: '上半程', weightKg: baseWeight, repsMin: 7, repsMax: 7, toFailure: false, targetText: `7次${baseWeight !== null ? ` · ${baseWeight}kg` : ''}` },
+      { id: newId('st'), label: '全程', weightKg: baseWeight, repsMin: 7, repsMax: 7, toFailure: false, targetText: `7次${baseWeight !== null ? ` · ${baseWeight}kg` : ''}` },
+    ];
+  }
+  const baseRepsMin =
+    spec.repsMin ?? (fallbackTarget?.kind === 'straight' ? fallbackTarget.repsMin : 8);
+  const baseRepsMax =
+    spec.repsMax ?? (fallbackTarget?.kind === 'straight' ? fallbackTarget.repsMax : Math.max(baseRepsMin, 12));
+  return [
+    { id: newId('st'), label: '第 1 阶段', weightKg: baseWeight, repsMin: baseRepsMin, repsMax: baseRepsMax, toFailure: false, targetText: `${baseRepsMin}-${baseRepsMax}次` },
+    { id: newId('st'), label: '第 2 阶段', weightKg: baseWeight !== null ? Math.max(0, Math.round(baseWeight * 0.75 * 2) / 2) : null, repsMin: baseRepsMin, repsMax: baseRepsMax, toFailure: false, targetText: `${baseRepsMin}-${baseRepsMax}次` },
+  ];
+}
+
+export function buildExerciseTargetFromInput(
+  name: string,
+  input: CoachTargetSpecInput,
+  fallbackTarget?: ExerciseTarget,
+  fallbackRestSec = 120,
+): { target: ExerciseTarget; restSec: number } {
+  const inferredDrop =
+    !input.form &&
+    !input.stages?.length &&
+    !fallbackTarget &&
+    TWENTY_ONES_NAME_RE.test(name);
+  const targetForm: TrainingForm =
+    input.form ??
+    (input.stages?.length ? (fallbackTarget?.kind === 'dropSet' && fallbackTarget.form === 'superset' ? 'superset' : 'dropSet') : inferredDrop ? 'dropSet' : fallbackTarget ? trainingFormOf(fallbackTarget) : 'straight');
+
+  const weightMode: WeightMode = input.weightMode ?? fallbackTarget?.weightMode ?? 'external';
+  const dumbbellBasis: DumbbellBasis | undefined = input.dumbbellBasis ?? fallbackTarget?.dumbbellBasis;
+  const resolvedRestSec =
+    input.restSec !== undefined
+      ? Math.round(input.restSec)
+      : input.restAfterSec !== undefined
+        ? Math.round(input.restAfterSec)
+        : fallbackTarget?.kind === 'dropSet'
+          ? fallbackTarget.restAfterSec
+          : fallbackRestSec;
+
+  if (!Number.isInteger(resolvedRestSec) || resolvedRestSec < 0 || resolvedRestSec > MAX_REST) {
+    throw new TxConflictError('invalid-input', `组间休息需在 0–${MAX_REST} 秒的整数之间`);
+  }
+
+  if (targetForm === 'straight') {
+    const prevStraight: StraightTarget | undefined =
+      fallbackTarget?.kind === 'straight' ? fallbackTarget : undefined;
+    const prevFirstStage = fallbackTarget?.kind === 'dropSet' ? fallbackTarget.stages[0] : undefined;
+    const sets = input.sets ?? prevStraight?.sets ?? (fallbackTarget?.kind === 'dropSet' ? fallbackTarget.rounds : 3);
+    const setsMax = Math.max(sets, input.setsMax ?? prevStraight?.setsMax ?? sets);
+    const repsMin = input.repsMin ?? prevStraight?.repsMin ?? prevFirstStage?.repsMin ?? 8;
+    const repsMax = Math.max(repsMin, input.repsMax ?? prevStraight?.repsMax ?? prevFirstStage?.repsMax ?? Math.max(repsMin, 12));
+    const suggestedWeightKg =
+      input.suggestedWeightKg !== undefined
+        ? input.suggestedWeightKg
+        : prevStraight
+          ? prevStraight.suggestedWeightKg
+          : (prevFirstStage?.weightKg ?? null);
+    const target: StraightTarget = {
+      kind: 'straight',
+      sets,
+      setsMax,
+      repsMin,
+      repsMax,
+      weightMode,
+      suggestedWeightKg: weightMode === 'bodyweight' && input.suggestedWeightKg === undefined ? null : suggestedWeightKg,
+      ...(dumbbellBasis ? { dumbbellBasis } : {}),
+      ...(input.toFailure !== undefined
+        ? { toFailure: input.toFailure }
+        : prevStraight?.toFailure !== undefined
+          ? { toFailure: prevStraight.toFailure }
+          : {}),
+      ...(prevStraight?.perSetConfigs ? { perSetConfigs: structuredClone(prevStraight.perSetConfigs) } : {}),
+    };
+    const issues = validateExerciseTarget(target);
+    if (issues.length) {
+      throw new TxConflictError('invalid-input', issues[0].message);
+    }
+    return { target, restSec: resolvedRestSec };
+  }
+
+  // 多阶段：dropSet 或 superset
+  const prevDrop: DropSetTarget | undefined =
+    fallbackTarget?.kind === 'dropSet' ? fallbackTarget : undefined;
+  const rounds = Math.max(
+    MIN_ROUNDS,
+    input.sets ?? prevDrop?.rounds ?? (fallbackTarget?.kind === 'straight' ? Math.max(1, fallbackTarget.sets) : 3),
+  );
+  const restInSec =
+    input.restInSec !== undefined
+      ? Math.round(input.restInSec)
+      : prevDrop?.restInSec ?? (targetForm === 'superset' ? 15 : 10);
+  const restAfterSec =
+    input.restAfterSec !== undefined
+      ? Math.round(input.restAfterSec)
+      : input.restSec !== undefined
+        ? Math.round(input.restSec)
+        : prevDrop?.restAfterSec ?? resolvedRestSec;
+
+  if (!Number.isInteger(restInSec) || restInSec < 0 || restInSec > MAX_REST_IN_SEC) {
+    throw new TxConflictError('invalid-input', `阶段间短歇需在 0–${MAX_REST_IN_SEC} 秒之间`);
+  }
+
+  let stages: DropStageTarget[];
+  if (input.stages?.length) {
+    stages = input.stages.map((st, idx) => {
+      const rMin = st.repsMin === undefined ? 8 : st.repsMin;
+      const rMax = st.repsMax === undefined ? (rMin !== null ? rMin : null) : st.repsMax;
+      const wt = st.weightKg === undefined ? (input.suggestedWeightKg ?? null) : st.weightKg;
+      return {
+        id: st.id?.trim() || newId('st'),
+        label: (st.label || `第 ${idx + 1} 阶段`).trim(),
+        weightKg: wt,
+        repsMin: rMin,
+        repsMax: rMax,
+        toFailure: Boolean(st.toFailure),
+        ...(st.restAfterSec !== undefined ? { restAfterSec: Math.round(st.restAfterSec) } : {}),
+        targetText:
+          rMin !== null && rMax !== null
+            ? `${rMin === rMax ? rMin : `${rMin}-${rMax}`}次${wt !== null ? ` · ${wt}kg` : ''}`
+            : wt !== null
+              ? `${wt}kg`
+              : '',
+      };
+    });
+  } else {
+    stages = defaultStagesForExercise(name, input, fallbackTarget);
+  }
+
+  if (input.stageTargets?.length) {
+    stages = stages.map((stage, i) => {
+      const patch = input.stageTargets?.find((p) => p.stageIndex === i + 1);
+      if (!patch) return stage;
+      return {
+        ...stage,
+        ...(patch.label !== undefined ? { label: patch.label.trim() || stage.label } : {}),
+        ...(patch.repsMin !== undefined ? { repsMin: patch.repsMin } : {}),
+        ...(patch.repsMax !== undefined ? { repsMax: patch.repsMax } : {}),
+        ...(patch.weightKg !== undefined ? { weightKg: patch.weightKg } : {}),
+        ...(patch.toFailure !== undefined ? { toFailure: patch.toFailure } : {}),
+        ...(patch.restAfterSec !== undefined ? { restAfterSec: Math.round(patch.restAfterSec) } : {}),
+      };
+    });
+  }
+
+  const rawDrop: DropSetTarget = {
+    kind: 'dropSet',
+    form: targetForm,
+    rounds,
+    stages,
+    ...(prevDrop?.roundConfigs && !input.stages?.length ? { roundConfigs: structuredClone(prevDrop.roundConfigs) } : {}),
+    restInSec,
+    restAfterSec,
+    weightMode,
+    ...(dumbbellBasis ? { dumbbellBasis } : {}),
+  };
+  const target = ensureStageIds(rawDrop) as DropSetTarget;
+  const issues = validateExerciseTarget(target, { minStages: 1, maxStages: MAX_STAGES_ACCEPTED });
+  if (issues.length) {
+    throw new TxConflictError('invalid-input', issues[0].message);
+  }
+  return { target, restSec: restAfterSec };
+}
+
+function summarizeTargetLabel(target: ExerciseTarget, restSec: number): string {
+  if (target.kind === 'straight') {
+    const parts = [
+      `普通组 ${target.sets} 组 × ${target.repsMin}-${target.repsMax} 次`,
+      ...(target.suggestedWeightKg !== null ? [`${target.suggestedWeightKg}kg`] : []),
+      `休息 ${restSec}s`,
+    ];
+    return parts.join(' · ');
+  }
+  const formText = trainingFormLabel(trainingFormOf(target));
+  const stageDesc = target.stages
+    .map((s) => `${s.label}${s.repsMin !== null ? ` ${s.repsMin}${s.repsMax && s.repsMax !== s.repsMin ? `-${s.repsMax}` : ''}次` : ''}${s.weightKg !== null ? `·${s.weightKg}kg` : ''}`)
+    .join('/');
+  return `${formText} ${target.rounds} 轮 × ${target.stages.length} 阶段（${stageDesc}）· 轮间休息 ${target.restAfterSec}s`;
+}
+
+export type AdjustActiveTargetInput = {
+  operationId?: string;
+  sessionId: string;
+  exId?: string;
+  exerciseName?: string;
+  expectedRevision?: number;
+  expectedEpoch?: number;
+  deferTimerDispatch?: boolean;
+  form?: TrainingForm;
+  sets?: number;
+  setsMax?: number;
+  repsMin?: number;
+  repsMax?: number;
+  suggestedWeightKg?: number | null;
+  weightMode?: WeightMode;
+  dumbbellBasis?: DumbbellBasis;
+  toFailure?: boolean;
+  restSec?: number;
+  restInSec?: number;
+  restAfterSec?: number;
+  stages?: CoachTargetStageInput[];
+  stageTargets?: Array<{ stageIndex: number; repsMin?: number | null; repsMax?: number | null; weightKg?: number | null; label?: string; toFailure?: boolean; restAfterSec?: number }>;
+  allowDiscardLoggedData?: boolean;
+} & CoachTxPreconditionArgs;
 
 export async function coachAdjustActiveTarget(
   input: AdjustActiveTargetInput,
@@ -341,6 +1039,13 @@ export async function coachAdjustActiveTarget(
       toolName: 'adjust_active_target',
       sessionId: input.sessionId,
       expectedRevision: input.expectedRevision,
+      modelExpectedRevision: input.modelExpectedRevision,
+      expectedEpoch: input.expectedEpoch,
+      frozenPrecondition: input.frozenPrecondition,
+      priorBatchOpIds: input.priorBatchOpIds,
+      strictSessionRevision: input.strictSessionRevision,
+      deferTimerDispatch: input.deferTimerDispatch,
+      argsForDigest: input,
       compute: (current) => {
         const ex = resolveSessionExercise(current, input);
         const focus = checkFocusConflict({
@@ -352,72 +1057,27 @@ export async function coachAdjustActiveTarget(
           throw new TxConflictError('focus-conflict', focus.message ?? '目标字段正在编辑中');
         }
 
-        let nextTarget: ExerciseTarget = structuredClone(ex.target);
-        if (nextTarget.kind === 'straight') {
-          const st: StraightTarget = { ...nextTarget };
-          if (input.sets !== undefined) {
-            if (!Number.isInteger(input.sets) || input.sets < 1 || input.sets > MAX_STRAIGHT_SETS) {
-              throw new TxConflictError('invalid-input', `目标组数需在 1–${MAX_STRAIGHT_SETS} 之间`);
-            }
-            st.sets = input.sets;
-            st.setsMax = Math.max(input.setsMax ?? input.sets, input.sets);
-          } else if (input.setsMax !== undefined) {
-            st.setsMax = Math.max(st.sets, input.setsMax);
-          }
-          if (input.repsMin !== undefined) {
-            if (!Number.isInteger(input.repsMin) || input.repsMin < 1 || input.repsMin > 100) {
-              throw new TxConflictError('invalid-input', '目标次数下限需在 1–100 之间');
-            }
-            st.repsMin = input.repsMin;
-            st.repsMax = Math.max(input.repsMax ?? Math.max(st.repsMax, input.repsMin), input.repsMin);
-          }
-          if (input.repsMax !== undefined) {
-            if (!Number.isInteger(input.repsMax) || input.repsMax < st.repsMin || input.repsMax > 100) {
-              throw new TxConflictError('invalid-input', '目标次数上限不能低于下限且需 <= 100');
-            }
-            st.repsMax = input.repsMax;
-          }
-          if (input.suggestedWeightKg !== undefined) {
-            if (
-              input.suggestedWeightKg !== null &&
-              (!Number.isFinite(input.suggestedWeightKg) || input.suggestedWeightKg < 0 || input.suggestedWeightKg > MAX_WEIGHT)
-            ) {
-              throw new TxConflictError('invalid-input', `参考重量需在 0–${MAX_WEIGHT} kg 之间`);
-            }
-            st.suggestedWeightKg = input.suggestedWeightKg;
-          }
-          nextTarget = st;
-        } else {
-          const dt: DropSetTarget = { ...nextTarget };
-          if (input.sets !== undefined) {
-            if (!Number.isInteger(input.sets) || input.sets < 1 || input.sets > MAX_ROUNDS) {
-              throw new TxConflictError('invalid-input', `目标轮数需在 1–${MAX_ROUNDS} 之间`);
-            }
-            dt.rounds = input.sets;
-          }
-          if (input.stageTargets?.length) {
-            dt.stages = dt.stages.map((stage, i) => {
-              const patch = input.stageTargets?.find((p) => p.stageIndex === i + 1);
-              if (!patch) return stage;
-              return {
-                ...stage,
-                ...(patch.repsMin !== undefined ? { repsMin: patch.repsMin } : {}),
-                ...(patch.repsMax !== undefined ? { repsMax: patch.repsMax } : {}),
-                ...(patch.weightKg !== undefined ? { weightKg: patch.weightKg } : {}),
-              };
-            });
-          } else if (input.repsMin !== undefined || input.repsMax !== undefined || input.suggestedWeightKg !== undefined) {
-            dt.stages = dt.stages.map((stage) => ({
-              ...stage,
-              ...(input.repsMin !== undefined ? { repsMin: input.repsMin } : {}),
-              ...(input.repsMax !== undefined ? { repsMax: input.repsMax } : {}),
-              ...(input.suggestedWeightKg !== undefined ? { weightKg: input.suggestedWeightKg } : {}),
-            }));
-          }
-          nextTarget = dt;
+        const beforeForm = trainingFormOf(ex.target);
+        const beforeRestSec = ex.target.kind === 'dropSet' ? ex.target.restAfterSec : ex.restSec;
+        const { target: nextTarget, restSec: nextRestSec } = buildExerciseTargetFromInput(
+          ex.name,
+          input,
+          ex.target,
+          ex.restSec,
+        );
+
+        const impact = planTargetApply(ex, nextTarget);
+        if (impact.validationIssues.length) {
+          throw new TxConflictError('invalid-input', impact.validationIssues[0].message);
+        }
+        if (impact.removedWithData.length > 0 && !input.allowDiscardLoggedData) {
+          throw new TxConflictError(
+            'dirty-state',
+            `目标调整会移除 ${impact.removedWithData.length} 条已输入实绩，已拒绝对实绩的静默修改`,
+          );
         }
 
-        const applied = applyTargetToSessionExercise(current, ex.id, nextTarget, { confirmImpact: false });
+        const applied = applyTargetToSessionExercise(current, ex.id, nextTarget, { confirmImpact: true });
         if (!applied.applied) {
           throw new TxConflictError(
             'dirty-state',
@@ -425,23 +1085,27 @@ export async function coachAdjustActiveTarget(
           );
         }
 
-        let nextSession = applied.session;
-        if (input.restSec !== undefined) {
-          if (!Number.isFinite(input.restSec) || input.restSec < 0 || input.restSec > MAX_REST) {
-            throw new TxConflictError('invalid-input', `组间休息需在 0–${MAX_REST} 秒之间`);
-          }
-          nextSession = withExercise(nextSession, ex.id, { restSec: Math.round(input.restSec) });
-        }
-
+        const nextSession = withExercise(applied.session, ex.id, { restSec: nextRestSec });
         const nextEx = nextSession.exercises.find((e) => e.id === ex.id)!;
+        const afterForm = trainingFormOf(nextEx.target);
+
         const parts: string[] = [];
+        if (beforeForm !== afterForm) {
+          parts.push(`形式 ${trainingFormLabel(beforeForm)} → ${trainingFormLabel(afterForm)}`);
+        }
         if (nextEx.target.kind === 'straight') {
           parts.push(`${nextEx.target.sets} 组 × ${nextEx.target.repsMin}-${nextEx.target.repsMax} 次`);
           if (nextEx.target.suggestedWeightKg !== null) parts.push(`${nextEx.target.suggestedWeightKg}kg`);
         } else {
-          parts.push(`${nextEx.target.rounds} 轮多阶段目标已更新`);
+          parts.push(`${nextEx.target.rounds} 轮 × ${nextEx.target.stages.length} 阶段`);
         }
-        const summary = `调整「${ex.name}」训练目标为 ${parts.join(' · ')}（未计入已完成组，未触及休息计时）`;
+        if (beforeRestSec !== nextRestSec || input.restSec !== undefined || input.restAfterSec !== undefined) {
+          parts.push(`休息 ${beforeRestSec}s → ${nextRestSec}s`);
+        }
+        if (nextEx.target.kind === 'dropSet' && input.restInSec !== undefined) {
+          parts.push(`阶段短歇 ${nextEx.target.restInSec}s`);
+        }
+        const summary = `调整「${ex.name}」目标：${parts.join(' · ')}`;
 
         const touched: CoachReceiptExerciseTargetTouched = {
           kind: 'exercise-target',
@@ -451,6 +1115,8 @@ export async function coachAdjustActiveTarget(
           afterTarget: structuredClone(nextEx.target),
           beforeSets: structuredClone(ex.sets),
           afterSets: structuredClone(nextEx.sets),
+          beforeRestSec: ex.restSec,
+          afterRestSec: nextEx.restSec,
         };
 
         return {
@@ -467,7 +1133,7 @@ export async function coachAdjustActiveTarget(
 
 /* ── 工具 2：记录/纠正进行中逐组实绩（原子 + 防脏值 + 诚实计时器） ── */
 
-export interface RecordActiveSetInput {
+export type RecordActiveSetInput = {
   operationId?: string;
   sessionId: string;
   exId?: string;
@@ -475,12 +1141,16 @@ export interface RecordActiveSetInput {
   setId?: string;
   roundIndex?: number;
   stageIndex?: number;
+  targetMode?: 'next_pending' | 'last_completed';
   expectedRevision?: number;
+  expectedEpoch?: number;
+  deferTimerDispatch?: boolean;
   reps?: number | null;
   weightKg?: number | null;
   status?: 'done' | 'blank' | 'partial';
   toFailure?: boolean;
-}
+  note?: string;
+} & CoachTxPreconditionArgs;
 
 export async function coachRecordActiveSet(
   input: RecordActiveSetInput,
@@ -493,9 +1163,20 @@ export async function coachRecordActiveSet(
       toolName: 'record_active_set',
       sessionId: input.sessionId,
       expectedRevision: input.expectedRevision,
+      modelExpectedRevision: input.modelExpectedRevision,
+      expectedEpoch: input.expectedEpoch,
+      frozenPrecondition: input.frozenPrecondition,
+      priorBatchOpIds: input.priorBatchOpIds,
+      strictSessionRevision: input.strictSessionRevision,
+      deferTimerDispatch: input.deferTimerDispatch,
+      argsForDigest: input,
       compute: (current) => {
         const ex = resolveSessionExercise(current, input);
         const prevSet = resolveTargetSet(ex, input);
+
+        if (input.note !== undefined && input.note.length > 500) {
+          throw new TxConflictError('invalid-input', '单组备注最多 500 个字符');
+        }
 
         const nextReps = input.reps !== undefined ? input.reps : prevSet.reps;
         const nextWeight = input.weightKg !== undefined ? input.weightKg : prevSet.weightKg;
@@ -507,6 +1188,7 @@ export async function coachRecordActiveSet(
         const fieldsToGuard: CoachEditableField[] = [];
         if (input.reps !== undefined) fieldsToGuard.push('reps');
         if (input.weightKg !== undefined) fieldsToGuard.push('weight');
+        if (input.note !== undefined) fieldsToGuard.push('note');
         if (!fieldsToGuard.length) fieldsToGuard.push('reps', 'weight');
 
         const focus = checkFocusConflict({
@@ -528,10 +1210,12 @@ export async function coachRecordActiveSet(
             fields: ['weight'],
           }).conflict;
 
+        const cleanNote = input.note !== undefined ? input.note.trim() : undefined;
         const patch: Partial<SessionSet> = {
           ...(input.reps !== undefined ? { reps: input.reps } : {}),
           ...(input.weightKg !== undefined ? { weightKg: input.weightKg } : {}),
           ...(input.toFailure !== undefined ? { toFailure: input.toFailure } : {}),
+          ...(cleanNote !== undefined ? { note: cleanNote || undefined } : {}),
           status: nextStatus,
         };
 
@@ -568,7 +1252,8 @@ export async function coachRecordActiveSet(
 
         const weightLabel =
           afterSet.weightKg !== null ? `${afterSet.weightKg}kg` : ex.target.weightMode === 'bodyweight' ? '自重' : '未填重量';
-        const summary = `记录「${ex.name}」第 ${afterSet.roundIndex} 组${ex.sets.some((s) => s.stageIndex > 1) ? `·阶段${afterSet.stageIndex}` : ''}：${afterSet.reps ?? '—'} 次 × ${weightLabel}`;
+        const noteTag = cleanNote ? ' · 已记备注' : '';
+        const summary = `记录「${ex.name}」第 ${afterSet.roundIndex} 组${ex.sets.some((s) => s.stageIndex > 1) ? `·阶段${afterSet.stageIndex}` : ''}：${afterSet.reps ?? '—'} 次 × ${weightLabel}${noteTag}`;
 
         const touched: CoachReceiptSetTouched = {
           kind: 'session-set',
@@ -596,7 +1281,7 @@ export async function coachRecordActiveSet(
 
 /* ── 工具 3：超级组配对 / 拆散 / 多阶段安全转换 ── */
 
-export type ConfigureSupersetInput =
+export type ConfigureSupersetInput = (
   | {
       operationId?: string;
       sessionId: string;
@@ -604,6 +1289,8 @@ export type ConfigureSupersetInput =
       exIds: string[];
       pairId?: string;
       expectedRevision?: number;
+      expectedEpoch?: number;
+      deferTimerDispatch?: boolean;
     }
   | {
       operationId?: string;
@@ -611,6 +1298,8 @@ export type ConfigureSupersetInput =
       mode: 'unpair';
       exIds: string[];
       expectedRevision?: number;
+      expectedEpoch?: number;
+      deferTimerDispatch?: boolean;
     }
   | {
       operationId?: string;
@@ -620,7 +1309,10 @@ export type ConfigureSupersetInput =
       partnerName: string;
       rounds?: number;
       expectedRevision?: number;
-    };
+      expectedEpoch?: number;
+      deferTimerDispatch?: boolean;
+    }
+) & CoachTxPreconditionArgs;
 
 export async function coachConfigureSuperset(
   input: ConfigureSupersetInput,
@@ -633,6 +1325,13 @@ export async function coachConfigureSuperset(
       toolName: 'configure_superset',
       sessionId: input.sessionId,
       expectedRevision: input.expectedRevision,
+      modelExpectedRevision: input.modelExpectedRevision,
+      expectedEpoch: input.expectedEpoch,
+      frozenPrecondition: input.frozenPrecondition,
+      priorBatchOpIds: input.priorBatchOpIds,
+      strictSessionRevision: input.strictSessionRevision,
+      deferTimerDispatch: input.deferTimerDispatch,
+      argsForDigest: input,
       compute: (current) => {
         const beforeSnapshot = structuredClone(current);
         if (input.mode === 'pair') {
@@ -724,11 +1423,12 @@ export async function coachConfigureSuperset(
 
 /* ── 工具 4：已完成历史训练纠错 ── */
 
-export type CorrectHistoryInput =
+export type CorrectHistoryInput = (
   | {
       operationId?: string;
       sessionId: string;
       expectedRevision?: number;
+      expectedEpoch?: number;
       action: 'update_session_note';
       note: string;
     }
@@ -736,154 +1436,262 @@ export type CorrectHistoryInput =
       operationId?: string;
       sessionId: string;
       expectedRevision?: number;
+      expectedEpoch?: number;
       action: 'update_exercise_note';
-      exId: string;
+      exId?: string;
+      exerciseName?: string;
       note: string;
     }
   | {
       operationId?: string;
       sessionId: string;
       expectedRevision?: number;
+      expectedEpoch?: number;
       action: 'append_group';
-      exId: string;
+      exId?: string;
+      exerciseName?: string;
+      reps?: number | null;
+      weightKg?: number | null;
+      status?: 'done' | 'blank' | 'partial';
+      note?: string;
     }
   | {
       operationId?: string;
       sessionId: string;
       expectedRevision?: number;
+      expectedEpoch?: number;
       action: 'remove_blank_group';
-      exId: string;
+      exId?: string;
+      exerciseName?: string;
       roundIndex: number;
     }
   | {
       operationId?: string;
       sessionId: string;
       expectedRevision?: number;
+      expectedEpoch?: number;
       action: 'correct_set';
       exId?: string;
       exerciseName?: string;
       setId?: string;
       roundIndex?: number;
       stageIndex?: number;
+      targetMode?: 'next_pending' | 'last_completed';
       reps?: number | null;
       weightKg?: number | null;
       status?: 'done' | 'blank' | 'partial';
+      note?: string;
     }
   | {
       operationId?: string;
       sessionId: string;
       expectedRevision?: number;
+      expectedEpoch?: number;
       action: 'correct_cardio';
-      cardioId: string;
-      elapsedMs: number;
+      cardioId?: string;
+      cardioName?: string;
+      elapsedMs?: number;
+      durationSec?: number;
       params?: CardioParams;
-    };
+      note?: string;
+    }
+) & CoachTxPreconditionArgs;
 
 export async function coachCorrectHistory(
   input: CorrectHistoryInput,
   hooks?: CoachTxHooks,
 ): Promise<CoachCommitResult> {
   const operationId = input.operationId ?? makeOpId('hist-edit');
-  const existingReceipt = await getCoachReceiptByOperationId(operationId);
-  if (existingReceipt) {
-    return { receipt: existingReceipt, session: await getSession(input.sessionId) };
-  }
+  const fallbackVaultEpoch = await getCoachVaultRestoreEpoch().catch(() => 0);
 
-  const current = await getSession(input.sessionId);
-  if (!current) {
-    throw new TxConflictError('not-found', '找不到要纠错的历史训练记录');
-  }
-  if (current.status !== 'completed') {
-    throw new TxConflictError('state-conflict', '仅已完成的历史训练支持历史纠错');
-  }
-  const curRev = revisionOf(current);
-  if (input.expectedRevision !== undefined && curRev !== input.expectedRevision) {
-    throw new TxConflictError('version-conflict', `历史记录版本已变更为 r${curRev}`, curRev);
-  }
+  const txResult = await wrapMainTx(() =>
+    executeCoachMainTx({
+      operationId,
+      toolName: 'correct_history_session',
+      argsForDigest: input,
+      expectedEpoch: input.expectedEpoch,
+      priorBatchOpIds: input.priorBatchOpIds,
+      stores: ['sessions'],
+      sessionId: input.sessionId,
+      lockCheck: { sessionId: input.sessionId, lockPolicy: 'optional' },
+      fallbackVaultEpoch,
+      prepare: ({ now, currentEpoch, currentSession, priorOpLogs }) => {
+        if (!currentSession) {
+          throw new TxConflictError('not-found', '找不到要纠错的历史训练记录');
+        }
+        if (currentSession.status !== 'completed') {
+          throw new TxConflictError('state-conflict', '仅已完成的历史训练支持历史纠错');
+        }
+        const curRev = revisionOf(currentSession);
+        assertSessionVersionOrPrecondition({
+          currentSession,
+          expectedRevision: input.expectedRevision,
+          modelExpectedRevision: input.modelExpectedRevision,
+          currentEpoch,
+          priorOpLogs,
+          frozenPrecondition: input.frozenPrecondition,
+          strictSessionRevision: input.strictSessionRevision,
+          entityLabel: '历史训练记录',
+        });
 
-  let nextSession = current;
-  let summary = '';
+        let nextSession = currentSession;
+        let summary = '';
 
-  if (input.action === 'update_session_note') {
-    const r = updateHistorySessionNote(current, input.note);
-    if (!r.ok) throw new TxConflictError('invalid-input', r.message);
-    nextSession = r.session;
-    summary = '更新历史训练总备注';
-  } else if (input.action === 'update_exercise_note') {
-    const r = updateHistoryExerciseNote(current, input.exId, input.note);
-    if (!r.ok) throw new TxConflictError('invalid-input', r.message);
-    nextSession = r.session;
-    summary = '更新历史动作备注';
-  } else if (input.action === 'append_group') {
-    const r = appendBlankGroupToHistoryExercise(current, input.exId);
-    if (!r.ok) throw new TxConflictError('invalid-input', r.message);
-    nextSession = r.session;
-    summary = '为历史动作补录 1 个空白组';
-  } else if (input.action === 'remove_blank_group') {
-    const r = removeBlankGroupFromHistoryExercise(current, input.exId, input.roundIndex);
-    if (!r.ok) throw new TxConflictError('invalid-input', r.message);
-    nextSession = r.session;
-    summary = `移除历史动作第 ${input.roundIndex} 个空白组`;
-  } else if (input.action === 'correct_cardio') {
-    const r = correctHistoryCardioEntry(current, input.cardioId, {
-      durationSec: Math.round(input.elapsedMs / 1000),
-      params: input.params,
-    });
-    if (!r.ok) throw new TxConflictError('invalid-input', r.message);
-    nextSession = r.session;
-    summary = '修正历史有氧项目时长/参数';
-  } else {
-    const ex = resolveSessionExercise(current, input);
-    const prevSet = resolveTargetSet(ex, input);
-    const nextReps = input.reps !== undefined ? input.reps : prevSet.reps;
-    const nextWeight = input.weightKg !== undefined ? input.weightKg : prevSet.weightKg;
-    const nextStatus = input.status ?? (prevSet.status === 'blank' ? 'done' : prevSet.status);
-    assertCleanSetValues(ex, prevSet, nextReps, nextWeight, nextStatus, input.weightKg === null);
+        if (input.action === 'update_session_note') {
+          const r = updateHistorySessionNote(currentSession, input.note);
+          if (!r.ok) throw new TxConflictError('invalid-input', r.message);
+          nextSession = r.session;
+          summary = '更新历史训练总备注';
+        } else if (input.action === 'update_exercise_note') {
+          const ex = resolveSessionExercise(currentSession, input);
+          const r = updateHistoryExerciseNote(currentSession, ex.id, input.note);
+          if (!r.ok) throw new TxConflictError('invalid-input', r.message);
+          nextSession = r.session;
+          summary = `更新历史「${ex.name}」备注`;
+        } else if (input.action === 'append_group') {
+          const ex = resolveSessionExercise(currentSession, input);
+          const r = appendBlankGroupToHistoryExercise(currentSession, ex.id);
+          if (!r.ok) throw new TxConflictError('invalid-input', r.message);
+          nextSession = r.session;
+          const appendedEx = nextSession.exercises.find((e) => e.id === ex.id)!;
+          const newRound =
+            appendedEx.groups[appendedEx.groups.length - 1]?.index ?? appendedEx.groups.length;
+          const newSet =
+            appendedEx.sets.find((s) => s.roundIndex === newRound && s.stageIndex === 1) ??
+            appendedEx.sets[appendedEx.sets.length - 1];
+          if (input.note !== undefined && input.note.length > 500) {
+            throw new TxConflictError('invalid-input', '单组备注最多 500 个字符');
+          }
+          const wantsSetValues =
+            input.reps !== undefined ||
+            input.weightKg !== undefined ||
+            input.status !== undefined ||
+            input.note !== undefined;
+          if (wantsSetValues && newSet) {
+            const nextReps = input.reps !== undefined ? input.reps : null;
+            const nextWeight = input.weightKg !== undefined ? input.weightKg : null;
+            const nextStatus: SessionSet['status'] =
+              input.status ?? (nextReps !== null ? 'done' : 'blank');
+            assertCleanSetValues(appendedEx, newSet, nextReps, nextWeight, nextStatus, false);
+            const cleanNote = input.note !== undefined ? input.note.trim() : undefined;
+            nextSession = withSetAndPrefillFollowingWeight(nextSession, ex.id, newSet.id, {
+              ...(input.reps !== undefined ? { reps: input.reps } : {}),
+              ...(input.weightKg !== undefined ? { weightKg: input.weightKg } : {}),
+              ...(cleanNote ? { note: cleanNote } : {}),
+              status: nextStatus,
+            });
+            const afterNew = nextSession.exercises
+              .find((e) => e.id === ex.id)
+              ?.sets.find((s) => s.id === newSet.id);
+            if (nextStatus === 'done' && afterNew?.status !== 'done') {
+              throw new TxConflictError('dirty-state', '历史已完成组必须保留有效次数');
+            }
+            summary = `为历史「${ex.name}」补录第 ${newRound} 组（${afterNew?.reps ?? '—'} 次${
+              afterNew?.weightKg !== null && afterNew?.weightKg !== undefined
+                ? ` × ${afterNew.weightKg}kg`
+                : ''
+            }）`;
+          } else {
+            summary = `为历史「${ex.name}」补录第 ${newRound} 空白组`;
+          }
+        } else if (input.action === 'remove_blank_group') {
+          const ex = resolveSessionExercise(currentSession, input);
+          const r = removeBlankGroupFromHistoryExercise(currentSession, ex.id, input.roundIndex);
+          if (!r.ok) throw new TxConflictError('invalid-input', r.message);
+          nextSession = r.session;
+          summary = `移除历史「${ex.name}」第 ${input.roundIndex} 个空白组`;
+        } else if (input.action === 'correct_cardio') {
+          const cardioList = currentSession.cardio ?? [];
+          const targetCardio =
+            (input.cardioId ? cardioList.find((c) => c.id === input.cardioId) : undefined) ??
+            (input.cardioName
+              ? cardioList.find((c) =>
+                  c.name.trim().toLowerCase().includes(input.cardioName!.trim().toLowerCase()),
+                )
+              : cardioList.length === 1
+                ? cardioList[0]
+                : undefined);
+          if (!targetCardio) {
+            throw new TxConflictError('not-found', '找不到要修正的历史有氧项目');
+          }
+          const durationSec =
+            input.durationSec !== undefined
+              ? Math.round(input.durationSec)
+              : input.elapsedMs !== undefined
+                ? Math.round(input.elapsedMs / 1000)
+                : Math.round(targetCardio.elapsedMs / 1000);
+          const r = correctHistoryCardioEntry(currentSession, targetCardio.id, {
+            durationSec,
+            ...(input.params !== undefined ? { params: input.params } : {}),
+            ...(input.note !== undefined ? { note: input.note } : {}),
+          });
+          if (!r.ok) throw new TxConflictError('invalid-input', r.message);
+          nextSession = r.session;
+          summary = `修正历史有氧「${targetCardio.name}」为 ${Math.round(durationSec / 60)} 分钟`;
+        } else {
+          const ex = resolveSessionExercise(currentSession, input);
+          const prevSet = resolveTargetSet(ex, input);
+          if (input.note !== undefined && input.note.length > 500) {
+            throw new TxConflictError('invalid-input', '单组备注最多 500 个字符');
+          }
+          const nextReps = input.reps !== undefined ? input.reps : prevSet.reps;
+          const nextWeight = input.weightKg !== undefined ? input.weightKg : prevSet.weightKg;
+          const nextStatus = input.status ?? (prevSet.status === 'blank' ? 'done' : prevSet.status);
+          assertCleanSetValues(ex, prevSet, nextReps, nextWeight, nextStatus, input.weightKg === null);
 
-    nextSession = withSetAndPrefillFollowingWeight(current, ex.id, prevSet.id, {
-      ...(input.reps !== undefined ? { reps: input.reps } : {}),
-      ...(input.weightKg !== undefined ? { weightKg: input.weightKg } : {}),
-      status: nextStatus,
-    });
-    const afterSet = nextSession.exercises.find((e) => e.id === ex.id)?.sets.find((s) => s.id === prevSet.id);
-    if (nextStatus === 'done' && afterSet?.status !== 'done') {
-      throw new TxConflictError('dirty-state', '历史已完成组必须保留有效次数');
-    }
-    summary = `纠正历史「${ex.name}」第 ${prevSet.roundIndex} 组为 ${afterSet?.reps ?? '—'} 次 × ${afterSet?.weightKg ?? '自重'}${afterSet?.weightKg !== null ? 'kg' : ''}`;
-  }
+          const cleanNote = input.note !== undefined ? input.note.trim() : undefined;
+          nextSession = withSetAndPrefillFollowingWeight(currentSession, ex.id, prevSet.id, {
+            ...(input.reps !== undefined ? { reps: input.reps } : {}),
+            ...(input.weightKg !== undefined ? { weightKg: input.weightKg } : {}),
+            ...(cleanNote !== undefined ? { note: cleanNote || undefined } : {}),
+            status: nextStatus,
+          });
+          const afterSet = nextSession.exercises
+            .find((e) => e.id === ex.id)
+            ?.sets.find((s) => s.id === prevSet.id);
+          if (nextStatus === 'done' && afterSet?.status !== 'done') {
+            throw new TxConflictError('dirty-state', '历史已完成组必须保留有效次数');
+          }
+          summary = `纠正历史「${ex.name}」第 ${prevSet.roundIndex} 组为 ${afterSet?.reps ?? '—'} 次 × ${
+            afterSet?.weightKg ?? '自重'
+          }${afterSet?.weightKg !== null ? 'kg' : ''}${cleanNote ? ' · 已记备注' : ''}`;
+        }
 
-  const res = await atomicSaveHistoryEdit({ session: nextSession, expectedRevision: curRev });
-  if (!res.ok) {
-    throw new TxConflictError(res.reason, res.message, res.current ? revisionOf(res.current) : undefined);
-  }
-  hooks?.onSessionCommitted?.(res.session);
-
-  const epoch = await getCoachRestoreEpoch();
-  const receipt: CoachOperationReceipt = {
-    id: makeReceiptId(),
-    operationId,
-    toolName: 'correct_history_session',
-    createdAt: Date.now(),
-    scope: 'history',
-    summary,
-    entityType: 'session',
-    entityId: res.session.id,
-    beforeRevision: curRev,
-    afterRevision: res.revision,
-    restoreEpoch: epoch,
-    undone: false,
-    touchedTargets: [
-      {
-        kind: 'history-edit',
-        sessionId: current.id,
-        beforeSession: structuredClone(current),
-        afterSession: structuredClone(res.session),
+        const committed: Session = { ...nextSession, revision: curRev + 1 };
+        const opLog: CoachMainOpLogRecord = {
+          schemaVersion: 2,
+          operationId,
+          receiptId: makeReceiptId(),
+          toolName: 'correct_history_session',
+          argsDigest: '',
+          createdAt: now,
+          restoreEpoch: currentEpoch,
+          scope: 'history',
+          summary,
+          entityType: 'session',
+          entityId: committed.id,
+          beforeRevision: curRev,
+          afterRevision: curRev + 1,
+          undoable: true,
+          undone: false,
+          touchedTargets: [
+            {
+              kind: 'history-edit',
+              sessionId: currentSession.id,
+              beforeSession: structuredClone(currentSession),
+              afterSession: structuredClone(committed),
+            },
+          ],
+        };
+        return { nextSession: committed, opLog };
       },
-    ],
-  };
-  await saveCoachReceipt(receipt);
-  hooks?.onReceiptSaved?.(receipt);
-  return { receipt, session: res.session };
+    }),
+  );
+
+  await saveCoachReceipt(txResult.receipt);
+  if (txResult.session && !txResult.replayed) hooks?.onSessionCommitted?.(txResult.session);
+  hooks?.onReceiptSaved?.(txResult.receipt);
+  return { receipt: txResult.receipt, session: txResult.session, replayed: txResult.replayed };
 }
 
 /* ── 工具 5：识图 / 结构化草稿新建计划 ── */
@@ -961,26 +1769,28 @@ function buildPlanFromDraft(draft: CoachPlanDraft): Plan {
 export async function coachCreatePlanFromDraft(
   args: {
     operationId?: string;
+    expectedEpoch?: number;
     draft: CoachPlanDraft;
     allowDuplicateName?: boolean;
   },
   hooks?: CoachTxHooks,
 ): Promise<CoachCommitResult> {
   const operationId = args.operationId ?? 'coach-plan:' + args.draft.id;
-  const existing = await getCoachReceiptByOperationId(operationId);
-  if (existing) {
-    return { receipt: existing, plan: existing.planId ? await getPlan(existing.planId) : undefined };
-  }
-
   if (!args.draft.days.length || args.draft.days.every((d) => d.exercises.length === 0)) {
     throw new TxConflictError('invalid-input', '计划草稿至少需要 1 个动作才能创建');
   }
 
-  const invalid = args.draft.days.some((day) => day.exercises.some((ex) =>
-    !ex.name.trim() || !Number.isInteger(ex.sets) || ex.sets < 1 ||
-    (ex.kind === 'straight' && (ex.repsMin < 1 || ex.repsMax < ex.repsMin)) ||
-    (ex.kind === 'dropSet' && ex.stages?.some((stage) =>
-      !stage.label.trim() || stage.repsMin < 1 || stage.repsMax < stage.repsMin))));
+  const invalid = args.draft.days.some((day) =>
+    day.exercises.some(
+      (ex) =>
+        !ex.name.trim() ||
+        !Number.isInteger(ex.sets) ||
+        ex.sets < 1 ||
+        (ex.kind === 'straight' && (ex.repsMin < 1 || ex.repsMax < ex.repsMin)) ||
+        (ex.kind === 'dropSet' &&
+          ex.stages?.some((stage) => !stage.label.trim() || stage.repsMin < 1 || stage.repsMax < stage.repsMin)),
+    ),
+  );
   if (invalid || !args.draft.planName.trim()) {
     throw new TxConflictError('invalid-input', '请补齐计划名称、动作和有效组次');
   }
@@ -989,52 +1799,71 @@ export async function coachCreatePlanFromDraft(
   if (!check.ok) {
     throw new TxConflictError('invalid-input', `计划结构不合法：${check.issues[0]?.message ?? '请检查输入'}`);
   }
+  const validatedCandidate = check.value.plans[0];
+  const fallbackVaultEpoch = await getCoachVaultRestoreEpoch().catch(() => 0);
 
-  const priorPlan = await getPlan(candidate.id);
-  let res = priorPlan
-    ? { ok: true as const, plan: priorPlan }
-    : await atomicInsertPlan(candidate, { allowDuplicateName: args.allowDuplicateName });
-  if (!res.ok && res.reason === 'duplicate-id') {
-    const committed = await getPlan(candidate.id);
-    if (committed) res = { ok: true, plan: committed };
-  }
-  if (!res.ok) {
-    const mappedReason: CoachTxConflictReason =
-      res.reason === 'capacity'
-        ? 'dirty-state'
-        : res.reason === 'duplicate-name' || res.reason === 'duplicate-id'
-          ? 'state-conflict'
-          : 'storage';
-    if (res.reason === 'capacity') {
-      throw new TxConflictError(mappedReason, `计划数量已达 ${MAX_PLANS} 上限：${res.message}`);
-    }
-    throw new TxConflictError(mappedReason, res.message);
-  }
+  const txResult = await wrapMainTx(() =>
+    executeCoachMainTx({
+      operationId,
+      toolName: 'create_plan_from_draft',
+      argsForDigest: {
+        draft: args.draft,
+        allowDuplicateName: Boolean(args.allowDuplicateName),
+      },
+      expectedEpoch: args.expectedEpoch,
+      stores: ['plans'],
+      planId: validatedCandidate.id,
+      needAllPlans: true,
+      fallbackVaultEpoch,
+      prepare: ({ now, currentEpoch, allPlans }) => {
+        const plans = allPlans ?? [];
+        if (plans.some((p) => p.id === validatedCandidate.id)) {
+          throw new TxConflictError('state-conflict', '该计划 ID 已存在，请更换草稿或重试');
+        }
+        if (plans.length >= MAX_PLANS) {
+          throw new TxConflictError(
+            'dirty-state',
+            `计划数量已达 ${MAX_PLANS} 上限，请先删除不用的计划后再创建`,
+          );
+        }
+        const name = validatedCandidate.name.trim();
+        if (plans.some((p) => p.name.trim() === name) && !args.allowDuplicateName) {
+          throw new TxConflictError(
+            'state-conflict',
+            `已经有一个同名计划「${name}」。如需创建同名新计划请确认 allowDuplicateName。`,
+          );
+        }
 
-  hooks?.onPlanCommitted?.(res.plan);
+        const opLog: CoachMainOpLogRecord = {
+          schemaVersion: 2,
+          operationId,
+          receiptId: makeReceiptId(),
+          toolName: 'create_plan_from_draft',
+          argsDigest: '',
+          createdAt: now,
+          restoreEpoch: currentEpoch,
+          scope: 'plan',
+          summary: `新建训练计划「${validatedCandidate.name}」（${validatedCandidate.days.length} 个训练日）`,
+          entityType: 'plan',
+          entityId: validatedCandidate.id,
+          planId: validatedCandidate.id,
+          beforeRevision: 0,
+          afterRevision: 1,
+          beforePlanRevision: 0,
+          afterPlanRevision: validatedCandidate.updatedAt,
+          undoable: true,
+          undone: false,
+          touchedTargets: [{ kind: 'plan-created', planId: validatedCandidate.id }],
+        };
+        return { insertPlan: validatedCandidate, opLog };
+      },
+    }),
+  );
 
-  const epoch = await getCoachRestoreEpoch();
-  const receipt: CoachOperationReceipt = {
-    id: makeReceiptId(),
-    operationId,
-    toolName: 'create_plan_from_draft',
-    createdAt: Date.now(),
-    scope: 'plan',
-    summary: `新建训练计划「${res.plan.name}」（${res.plan.days.length} 个训练日）`,
-    entityType: 'plan',
-    entityId: res.plan.id,
-    planId: res.plan.id,
-    beforeRevision: 0,
-    afterRevision: 1,
-    beforePlanRevision: 0,
-    afterPlanRevision: res.plan.updatedAt,
-    restoreEpoch: epoch,
-    undone: false,
-    touchedTargets: [{ kind: 'plan-created', planId: res.plan.id }],
-  };
-  await saveCoachReceipt(receipt);
-  hooks?.onReceiptSaved?.(receipt);
-  return { receipt, plan: res.plan };
+  await saveCoachReceipt(txResult.receipt);
+  if (txResult.plan && !txResult.replayed) hooks?.onPlanCommitted?.(txResult.plan);
+  hooks?.onReceiptSaved?.(txResult.receipt);
+  return { receipt: txResult.receipt, plan: txResult.plan, replayed: txResult.replayed };
 }
 
 /* ── 工具 6：已有计划定向修改（原子读-核验-写 plans store） ── */
@@ -1150,130 +1979,560 @@ export async function atomicUpdatePlanInTx(
 
 export type ModifyPlanAction =
   | { kind: 'rename_plan'; name: string }
-  | { kind: 'rename_day'; dayId: string; name: string }
-  | { kind: 'add_exercise'; dayId: string; name: string; target?: ExerciseTarget }
-  | { kind: 'remove_exercise'; dayId: string; exId: string }
-  | { kind: 'update_target'; dayId: string; exId: string; patch: Partial<ExerciseTarget>; restSec?: number }
-  | { kind: 'pair_superset'; dayId: string; exIds: string[] }
-  | { kind: 'unpair_superset'; dayId: string; exIds: string[] };
+  | { kind: 'rename_day'; dayId?: string; dayName?: string; name: string }
+  | {
+      kind: 'add_exercise';
+      dayId?: string;
+      dayName?: string;
+      name: string;
+      target?: ExerciseTarget;
+      form?: TrainingForm;
+      sets?: number;
+      repsMin?: number;
+      repsMax?: number;
+      suggestedWeightKg?: number | null;
+      weightMode?: WeightMode;
+      dumbbellBasis?: DumbbellBasis;
+      restSec?: number;
+      restInSec?: number;
+      restAfterSec?: number;
+      stages?: CoachTargetStageInput[];
+      setupNote?: string;
+    }
+  | { kind: 'remove_exercise'; dayId?: string; dayName?: string; exId?: string; exerciseName?: string }
+  | {
+      kind: 'replace_exercise';
+      dayId?: string;
+      dayName?: string;
+      exId?: string;
+      exerciseName?: string;
+      newName: string;
+      keepIdentity?: boolean;
+      form?: TrainingForm;
+      sets?: number;
+      repsMin?: number;
+      repsMax?: number;
+      suggestedWeightKg?: number | null;
+      weightMode?: WeightMode;
+      dumbbellBasis?: DumbbellBasis;
+      restSec?: number;
+      restInSec?: number;
+      restAfterSec?: number;
+      stages?: CoachTargetStageInput[];
+    }
+  | {
+      kind: 'update_target';
+      dayId?: string;
+      dayName?: string;
+      exId?: string;
+      exerciseName?: string;
+      patch?: Partial<ExerciseTarget>;
+      form?: TrainingForm;
+      sets?: number;
+      setsMax?: number;
+      repsMin?: number;
+      repsMax?: number;
+      suggestedWeightKg?: number | null;
+      weightMode?: WeightMode;
+      dumbbellBasis?: DumbbellBasis;
+      toFailure?: boolean;
+      restSec?: number;
+      restInSec?: number;
+      restAfterSec?: number;
+      stages?: CoachTargetStageInput[];
+    }
+  | { kind: 'pair_superset'; dayId?: string; dayName?: string; exIds: string[] }
+  | { kind: 'unpair_superset'; dayId?: string; dayName?: string; exIds: string[] }
+  | {
+      kind: 'add_warmup';
+      dayId?: string;
+      dayName?: string;
+      name: string;
+      unit?: 'reps' | 'time' | 'breath';
+      targetText?: string;
+    }
+  | {
+      kind: 'update_warmup';
+      dayId?: string;
+      dayName?: string;
+      warmupId?: string;
+      warmupName?: string;
+      name?: string;
+      unit?: 'reps' | 'time' | 'breath';
+      targetText?: string;
+    }
+  | { kind: 'remove_warmup'; dayId?: string; dayName?: string; warmupId?: string; warmupName?: string }
+  | {
+      kind: 'add_cardio';
+      dayId?: string;
+      dayName?: string;
+      preset: CardioPreset;
+      name?: string;
+      params?: CardioParams;
+      note?: string;
+    }
+  | {
+      kind: 'update_cardio';
+      dayId?: string;
+      dayName?: string;
+      cardioId?: string;
+      cardioName?: string;
+      name?: string;
+      params?: Partial<CardioParams>;
+      note?: string;
+    }
+  | { kind: 'remove_cardio'; dayId?: string; dayName?: string; cardioId?: string; cardioName?: string };
+
+function resolvePlanDay(plan: Plan, selector: { dayId?: string; dayName?: string }): PlanDay {
+  if (selector.dayId) {
+    const exact = plan.days.find((d) => d.id === selector.dayId);
+    if (!exact) throw new TxConflictError('not-found', '找不到目标训练日');
+    return exact;
+  }
+  const needle = (selector.dayName ?? '').trim().toLowerCase();
+  if (needle) {
+    const exact = plan.days.filter((d) => d.name.trim().toLowerCase() === needle);
+    if (exact.length === 1) return exact[0];
+    const fuzzy = plan.days.filter((d) => d.name.trim().toLowerCase().includes(needle));
+    if (fuzzy.length === 1) return fuzzy[0];
+    if (fuzzy.length > 1 || exact.length > 1) {
+      throw new TxConflictError('invalid-input', `找到多个匹配「${selector.dayName}」的训练日，请指定具体训练日`);
+    }
+  }
+  if (plan.days.length === 1) return plan.days[0];
+  throw new TxConflictError('not-found', '请明确指定要修改的训练日');
+}
+
+function resolvePlanExercise(
+  day: PlanDay,
+  selector: { exId?: string; exerciseName?: string },
+): PlanExercise {
+  if (selector.exId) {
+    const exact = day.exercises.find((e) => e.id === selector.exId);
+    if (!exact) throw new TxConflictError('not-found', '找不到目标计划动作');
+    return exact;
+  }
+  const needle = (selector.exerciseName ?? '').trim().toLowerCase();
+  if (!needle) throw new TxConflictError('invalid-input', '未指定要修改的计划动作');
+  const exact = day.exercises.filter((e) => e.name.trim().toLowerCase() === needle);
+  if (exact.length === 1) return exact[0];
+  const fuzzy = day.exercises.filter((e) => e.name.trim().toLowerCase().includes(needle));
+  if (fuzzy.length === 1) return fuzzy[0];
+  if (fuzzy.length > 1 || exact.length > 1) {
+    throw new TxConflictError('invalid-input', `训练日「${day.name}」中有多个匹配「${selector.exerciseName}」的动作`);
+  }
+  throw new TxConflictError('not-found', `训练日「${day.name}」里没有「${selector.exerciseName}」`);
+}
 
 export async function coachModifyExistingPlan(
   args: {
     operationId?: string;
     planId: string;
     expectedUpdatedAt?: number;
+    modelExpectedUpdatedAt?: number;
+    expectedEpoch?: number;
+    priorBatchOpIds?: string[];
     action: ModifyPlanAction;
   },
   hooks?: CoachTxHooks,
 ): Promise<CoachCommitResult> {
   const operationId = args.operationId ?? makeOpId('mod-plan');
-  const existing = await getCoachReceiptByOperationId(operationId);
-  if (existing) {
-    return { receipt: existing, plan: await getPlan(args.planId) };
-  }
+  const fallbackVaultEpoch = await getCoachVaultRestoreEpoch().catch(() => 0);
 
-  let summary = '';
-  const { beforePlan, afterPlan } = await atomicUpdatePlanInTx(
-    args.planId,
-    args.expectedUpdatedAt,
-    (current) => {
+  const txResult = await wrapMainTx(() =>
+    executeCoachMainTx({
+      operationId,
+      toolName: 'modify_existing_plan',
+      argsForDigest: args,
+      expectedEpoch: args.expectedEpoch,
+      priorBatchOpIds: args.priorBatchOpIds,
+      stores: ['plans'],
+      planId: args.planId,
+      fallbackVaultEpoch,
+      prepare: ({ now, currentEpoch, currentPlan, priorOpLogs }) => {
+        if (!currentPlan) {
+          throw new TxConflictError('not-found', '找不到要修改的计划');
+        }
+        const expectedPlanRev =
+          args.expectedUpdatedAt !== undefined
+            ? advanceRevisionFromPriorOps(
+                args.expectedUpdatedAt,
+                'plan',
+                currentPlan.id,
+                currentEpoch,
+                priorOpLogs,
+              )
+            : undefined;
+        if (expectedPlanRev !== undefined) {
+          if (currentPlan.updatedAt !== expectedPlanRev) {
+            throw new TxConflictError(
+              'version-conflict',
+              '目标计划已在别处被修改，已拒绝对计划的过期覆盖',
+              currentPlan.updatedAt,
+            );
+          }
+          if (
+            args.modelExpectedUpdatedAt !== undefined &&
+            (args.modelExpectedUpdatedAt < args.expectedUpdatedAt! ||
+              args.modelExpectedUpdatedAt > expectedPlanRev)
+          ) {
+            throw new TxConflictError(
+              'version-conflict',
+              '目标计划当前版本与模型指定的期望版本不一致，已拒绝覆盖',
+              currentPlan.updatedAt,
+            );
+          }
+        } else if (args.modelExpectedUpdatedAt !== undefined) {
+          const selfModelPlanRev = advanceRevisionFromPriorOps(
+            args.modelExpectedUpdatedAt,
+            'plan',
+            currentPlan.id,
+            currentEpoch,
+            priorOpLogs,
+          );
+          if (currentPlan.updatedAt !== selfModelPlanRev) {
+            throw new TxConflictError(
+              'version-conflict',
+              '目标计划已在别处被修改，已拒绝对计划的过期覆盖',
+              currentPlan.updatedAt,
+            );
+          }
+        }
+        const beforePlan = structuredClone(currentPlan);
+        const current = structuredClone(currentPlan);
+        let summary = '';
+        const nextRaw: Plan = (() => {
       const act = args.action;
       if (act.kind === 'rename_plan') {
         summary = `重命名计划为「${act.name.trim()}」`;
         return renamePlan(current, act.name);
       }
       if (act.kind === 'rename_day') {
+        const day = resolvePlanDay(current, act);
         summary = `重命名训练日为「${act.name.trim()}」`;
-        return renameDay(current, act.dayId, act.name);
+        return renameDay(current, day.id, act.name);
       }
       if (act.kind === 'add_exercise') {
-        const res = addExercise(current, act.dayId, act.name, act.target);
+        const day = resolvePlanDay(current, act);
+        const built = act.target
+          ? { target: ensureStageIds(act.target), restSec: act.restSec ?? 120 }
+          : buildExerciseTargetFromInput(act.name, act);
+        const res = addExercise(current, day.id, act.name, built.target);
         if (!res.added) {
           throw new TxConflictError(
             res.reason === 'capacity' ? 'dirty-state' : 'not-found',
             res.reason === 'capacity' ? '该训练日动作数量已达上限' : '找不到目标训练日',
           );
         }
-        summary = `在计划中新增动作「${act.name}」`;
-        return res.plan;
+        const addedDay = res.plan.days.find((d) => d.id === day.id)!;
+        const addedEx = addedDay.exercises[addedDay.exercises.length - 1];
+        let nextPlan = res.plan;
+        if (addedEx) {
+          const setup = parseSetupNote(act.setupNote);
+          if (!setup.ok) throw new TxConflictError('invalid-input', setup.message);
+          nextPlan = updateExercise(nextPlan, day.id, addedEx.id, {
+            exerciseId: exerciseIdFromName(act.name),
+            restSec: built.restSec,
+            ...(setup.note ? { setupNote: setup.note } : {}),
+          });
+        }
+        summary = `在「${day.name}」新增动作「${act.name.trim()}」（${summarizeTargetLabel(built.target, built.restSec)}）`;
+        return nextPlan;
       }
       if (act.kind === 'remove_exercise') {
-        const targetDay = current.days.find((d) => d.id === act.dayId);
-        const targetEx = targetDay?.exercises.find((e) => e.id === act.exId);
-        if (!targetDay || !targetEx) {
-          throw new TxConflictError('not-found', '找不到要移除的计划动作');
-        }
-        summary = `从计划移除动作「${targetEx.name}」并自动清理孤立配对`;
-        return removeExercise(current, act.dayId, act.exId);
+        const targetDay = resolvePlanDay(current, act);
+        const targetEx = resolvePlanExercise(targetDay, act);
+        summary = `从「${targetDay.name}」移除动作「${targetEx.name}」`;
+        return removeExercise(current, targetDay.id, targetEx.id);
+      }
+      if (act.kind === 'replace_exercise') {
+        const targetDay = resolvePlanDay(current, act);
+        const targetEx = resolvePlanExercise(targetDay, act);
+        const cleanNew = act.newName.trim();
+        if (!cleanNew) throw new TxConflictError('invalid-input', '替换后的动作名称不能为空');
+        const hasTargetOverride =
+          act.form !== undefined ||
+          act.sets !== undefined ||
+          act.repsMin !== undefined ||
+          act.repsMax !== undefined ||
+          act.suggestedWeightKg !== undefined ||
+          act.stages !== undefined ||
+          act.restSec !== undefined ||
+          act.restInSec !== undefined ||
+          act.restAfterSec !== undefined;
+        const built = hasTargetOverride
+          ? buildExerciseTargetFromInput(cleanNew, act, act.keepIdentity ? targetEx.target : undefined, targetEx.restSec)
+          : { target: ensureStageIds(structuredClone(targetEx.target)), restSec: targetEx.restSec };
+        let nextPlan = renameExercise(current, targetDay.id, targetEx.id, cleanNew, {
+          keepIdentity: Boolean(act.keepIdentity),
+        });
+        nextPlan = updateExercise(nextPlan, targetDay.id, targetEx.id, {
+          ...(act.keepIdentity ? {} : { exerciseId: exerciseIdFromName(cleanNew) }),
+          target: built.target,
+          restSec: built.restSec,
+        });
+        summary = `将「${targetDay.name}」中的「${targetEx.name}」替换为「${cleanNew}」`;
+        return nextPlan;
       }
       if (act.kind === 'update_target') {
-        const targetDay = current.days.find((d) => d.id === act.dayId);
-        const targetEx = targetDay?.exercises.find((e) => e.id === act.exId);
-        if (!targetDay || !targetEx) {
-          throw new TxConflictError('not-found', '找不到要调整目标的计划动作');
+        const targetDay = resolvePlanDay(current, act);
+        const targetEx = resolvePlanExercise(targetDay, act);
+        const usesSpec =
+          act.form !== undefined ||
+          act.stages !== undefined ||
+          act.sets !== undefined ||
+          act.setsMax !== undefined ||
+          act.repsMin !== undefined ||
+          act.repsMax !== undefined ||
+          act.suggestedWeightKg !== undefined ||
+          act.weightMode !== undefined ||
+          act.dumbbellBasis !== undefined ||
+          act.toFailure !== undefined ||
+          act.restInSec !== undefined ||
+          act.restAfterSec !== undefined ||
+          !act.patch;
+        if (usesSpec) {
+          const built = buildExerciseTargetFromInput(targetEx.name, act, targetEx.target, targetEx.restSec);
+          const updated = updateExercise(current, targetDay.id, targetEx.id, {
+            target: built.target,
+            restSec: built.restSec,
+          });
+          summary = `修改计划动作「${targetEx.name}」：${summarizeTargetLabel(built.target, built.restSec)}`;
+          return updated;
         }
-        let updated = updateTarget(current, act.dayId, act.exId, act.patch);
+        let updated = updateTarget(current, targetDay.id, targetEx.id, act.patch!);
         if (act.restSec !== undefined) {
-          updated = updateExercise(updated, act.dayId, act.exId, { restSec: act.restSec });
+          updated = updateExercise(updated, targetDay.id, targetEx.id, { restSec: act.restSec });
         }
         summary = `修改计划动作「${targetEx.name}」目标参数`;
         return updated;
       }
       if (act.kind === 'pair_superset') {
-        const day = current.days.find((d) => d.id === act.dayId);
-        if (!day) throw new TxConflictError('not-found', '找不到目标训练日');
+        const day = resolvePlanDay(current, act);
         const paired = pairExercisesAsSuperset(day.exercises, act.exIds);
         if (!paired.ok) throw new TxConflictError('invalid-input', paired.message);
         summary = `将计划训练日「${day.name}」内动作配对为超级组`;
         return {
           ...current,
-          days: current.days.map((d) => (d.id === act.dayId ? { ...d, exercises: paired.exercises } : d)),
+          days: current.days.map((d) => (d.id === day.id ? { ...d, exercises: paired.exercises } : d)),
         };
       }
-      const day = current.days.find((d) => d.id === act.dayId);
-      if (!day) throw new TxConflictError('not-found', '找不到目标训练日');
-      summary = `解除计划训练日「${day.name}」内指定超级组配对`;
+      if (act.kind === 'unpair_superset') {
+        const day = resolvePlanDay(current, act);
+        summary = `解除计划训练日「${day.name}」内指定超级组配对`;
+        return {
+          ...current,
+          days: current.days.map((d) =>
+            d.id === day.id
+              ? { ...d, exercises: unpairSupersetExercises(d.exercises, { exerciseIds: act.exIds }) }
+              : d,
+          ),
+        };
+      }
+      if (act.kind === 'add_warmup') {
+        const day = resolvePlanDay(current, act);
+        if (day.warmups.length >= MAX_EXERCISES) {
+          throw new TxConflictError('dirty-state', `热身项数已达 ${MAX_EXERCISES} 上限`);
+        }
+        const added = addWarmup(current, day.id, act.name);
+        const updatedDay = added.days.find((d) => d.id === day.id)!;
+        const newest = updatedDay.warmups[updatedDay.warmups.length - 1];
+        const nextPlan: Plan = {
+          ...added,
+          days: added.days.map((d) =>
+            d.id !== day.id
+              ? d
+              : {
+                  ...d,
+                  warmups: d.warmups.map((w) =>
+                    w.id === newest.id
+                      ? {
+                          ...w,
+                          ...(act.unit ? { unit: act.unit } : {}),
+                          ...(act.targetText !== undefined ? { targetText: act.targetText.trim() || w.targetText } : {}),
+                        }
+                      : w,
+                  ),
+                },
+          ),
+        };
+        summary = `在「${day.name}」新增热身「${act.name.trim()}」`;
+        return nextPlan;
+      }
+      if (act.kind === 'update_warmup') {
+        const day = resolvePlanDay(current, act);
+        const wNeedle = (act.warmupName ?? '').trim().toLowerCase();
+        const w =
+          (act.warmupId ? day.warmups.find((x) => x.id === act.warmupId) : undefined) ??
+          (wNeedle ? day.warmups.find((x) => x.name.trim().toLowerCase().includes(wNeedle)) : undefined);
+        if (!w) throw new TxConflictError('not-found', '找不到要修改的热身项');
+        let nextPlan = act.targetText !== undefined ? updateWarmup(current, day.id, w.id, act.targetText) : current;
+        if (act.name !== undefined || act.unit !== undefined) {
+          nextPlan = {
+            ...nextPlan,
+            days: nextPlan.days.map((d) =>
+              d.id !== day.id
+                ? d
+                : {
+                    ...d,
+                    warmups: d.warmups.map((item) =>
+                      item.id === w.id
+                        ? {
+                            ...item,
+                            ...(act.name?.trim() ? { name: act.name.trim() } : {}),
+                            ...(act.unit ? { unit: act.unit } : {}),
+                          }
+                        : item,
+                    ),
+                  },
+            ),
+          };
+        }
+        summary = `修改「${day.name}」热身「${w.name}」`;
+        return nextPlan;
+      }
+      if (act.kind === 'remove_warmup') {
+        const day = resolvePlanDay(current, act);
+        const wNeedle = (act.warmupName ?? '').trim().toLowerCase();
+        const w =
+          (act.warmupId ? day.warmups.find((x) => x.id === act.warmupId) : undefined) ??
+          (wNeedle ? day.warmups.find((x) => x.name.trim().toLowerCase().includes(wNeedle)) : undefined);
+        if (!w) throw new TxConflictError('not-found', '找不到要删除的热身项');
+        summary = `移除「${day.name}」热身「${w.name}」`;
+        return removeWarmup(current, day.id, w.id);
+      }
+      if (act.kind === 'add_cardio') {
+        const day = resolvePlanDay(current, act);
+        if (day.kind !== 'cardio') {
+          throw new TxConflictError('state-conflict', `「${day.name}」不是有氧日，无法添加计划内有氧目标`);
+        }
+        const list = day.cardio ?? [];
+        if (list.length >= MAX_CARDIO_ENTRIES) {
+          throw new TxConflictError('dirty-state', `单日有氧项目已达 ${MAX_CARDIO_ENTRIES} 项上限`);
+        }
+        const defaultParams =
+          CARDIO_PRESET_CHOICES.find((c) => c.preset === act.preset)?.params ?? {};
+        const normalized = normalizeCardioParams(act.preset, {
+          ...defaultParams,
+          ...(act.params ?? {}),
+        });
+        const issues = validateCardioParams(act.preset, normalized);
+        if (issues.length) throw new TxConflictError('invalid-input', issues[0].message);
+        const item: PlanCardio = {
+          id: newId('pcardio'),
+          preset: act.preset,
+          name: (act.name ?? CARDIO_PRESET_LABEL[act.preset]).trim() || CARDIO_PRESET_LABEL[act.preset],
+          target: normalized,
+          ...(act.note?.trim() ? { note: act.note.trim() } : {}),
+        };
+        summary = `在有氧日「${day.name}」添加「${item.name}」`;
+        return {
+          ...current,
+          days: current.days.map((d) => (d.id === day.id ? { ...d, cardio: [...list, item] } : d)),
+        };
+      }
+      if (act.kind === 'update_cardio') {
+        const day = resolvePlanDay(current, act);
+        if (day.kind !== 'cardio') {
+          throw new TxConflictError('state-conflict', `「${day.name}」不是有氧日`);
+        }
+        const list = day.cardio ?? [];
+        const needle = (act.cardioName ?? '').trim().toLowerCase();
+        const target =
+          (act.cardioId ? list.find((c) => c.id === act.cardioId) : undefined) ??
+          (needle ? list.find((c) => c.name.trim().toLowerCase().includes(needle)) : list.length === 1 ? list[0] : undefined);
+        if (!target) throw new TxConflictError('not-found', '找不到要修改的计划有氧项');
+        const nextParams = act.params
+          ? normalizeCardioParams(target.preset, { ...target.target, ...act.params })
+          : target.target;
+        const issues = validateCardioParams(target.preset, nextParams);
+        if (issues.length) throw new TxConflictError('invalid-input', issues[0].message);
+        summary = `修改有氧日「${day.name}」中的「${target.name}」`;
+        return {
+          ...current,
+          days: current.days.map((d) =>
+            d.id !== day.id
+              ? d
+              : {
+                  ...d,
+                  cardio: list.map((c) =>
+                    c.id === target.id
+                      ? {
+                          ...c,
+                          ...(act.name?.trim() ? { name: act.name.trim() } : {}),
+                          target: nextParams,
+                          ...(act.note !== undefined ? (act.note.trim() ? { note: act.note.trim() } : { note: undefined }) : {}),
+                        }
+                      : c,
+                  ),
+                },
+          ),
+        };
+      }
+      // remove_cardio
+      const day = resolvePlanDay(current, act);
+      const list = day.cardio ?? [];
+      const needle = (act.cardioName ?? '').trim().toLowerCase();
+      const target =
+        (act.cardioId ? list.find((c) => c.id === act.cardioId) : undefined) ??
+        (needle ? list.find((c) => c.name.trim().toLowerCase().includes(needle)) : undefined);
+      if (!target) throw new TxConflictError('not-found', '找不到要移除的计划有氧项');
+      summary = `从「${day.name}」移除有氧「${target.name}」`;
       return {
         ...current,
         days: current.days.map((d) =>
-          d.id === act.dayId
-            ? { ...d, exercises: unpairSupersetExercises(d.exercises, { exerciseIds: act.exIds }) }
-            : d,
+          d.id === day.id ? { ...d, cardio: list.filter((c) => c.id !== target.id) } : d,
         ),
       };
-    },
+        })();
+
+        const candidatePlan: Plan = {
+          ...nextRaw,
+          days: nextRaw.days.map((d) => ({ ...d, exercises: cleanOrphanPairIds(d.exercises) })),
+          updatedAt: Math.max(now, currentPlan.updatedAt + 1),
+        };
+        const valid = validateDataDeep({ plans: [candidatePlan], sessions: [] });
+        if (!valid.ok) {
+          throw new TxConflictError('invalid-input', `计划校验失败：${valid.issues[0]?.message ?? ''}`);
+        }
+        const afterPlan = valid.value.plans[0];
+        const opLog: CoachMainOpLogRecord = {
+          schemaVersion: 2,
+          operationId,
+          receiptId: makeReceiptId(),
+          toolName: 'modify_existing_plan',
+          argsDigest: '',
+          createdAt: now,
+          restoreEpoch: currentEpoch,
+          scope: 'plan',
+          summary,
+          entityType: 'plan',
+          entityId: afterPlan.id,
+          planId: afterPlan.id,
+          beforeRevision: 1,
+          afterRevision: 1,
+          beforePlanRevision: beforePlan.updatedAt,
+          afterPlanRevision: afterPlan.updatedAt,
+          undoable: true,
+          undone: false,
+          touchedTargets: [
+            {
+              kind: 'plan-day',
+              planId: afterPlan.id,
+              beforePlan,
+              afterPlan: structuredClone(afterPlan),
+            },
+          ],
+        };
+        return { nextPlan: afterPlan, opLog };
+      },
+    }),
   );
 
-  hooks?.onPlanCommitted?.(afterPlan);
-  const epoch = await getCoachRestoreEpoch();
-  const receipt: CoachOperationReceipt = {
-    id: makeReceiptId(),
-    operationId,
-    toolName: 'modify_existing_plan',
-    createdAt: Date.now(),
-    scope: 'plan',
-    summary,
-    entityType: 'plan',
-    entityId: afterPlan.id,
-    planId: afterPlan.id,
-    beforeRevision: 1,
-    afterRevision: 1,
-    beforePlanRevision: beforePlan.updatedAt,
-    afterPlanRevision: afterPlan.updatedAt,
-    restoreEpoch: epoch,
-    undone: false,
-    touchedTargets: [
-      {
-        kind: 'plan-day',
-        planId: afterPlan.id,
-        beforePlan,
-        afterPlan: structuredClone(afterPlan),
-      },
-    ],
-  };
-  await saveCoachReceipt(receipt);
-  hooks?.onReceiptSaved?.(receipt);
-  return { receipt, plan: afterPlan };
+  await saveCoachReceipt(txResult.receipt);
+  if (txResult.plan && !txResult.replayed) hooks?.onPlanCommitted?.(txResult.plan);
+  hooks?.onReceiptSaved?.(txResult.receipt);
+  return { receipt: txResult.receipt, plan: txResult.plan, replayed: txResult.replayed };
 }
 
 /* ── 工具 7：完训 / 编排同步回原计划（显式区分仅改本次会话 vs 同步原计划） ── */
@@ -1284,7 +2543,12 @@ export async function coachSyncSessionToPlan(
     sessionId: string;
     scope: 'session-only' | 'sync-to-plan';
     expectedPlanUpdatedAt?: number;
+    modelExpectedPlanUpdatedAt?: number;
     expectedSessionRevision?: number;
+    modelExpectedRevision?: number;
+    expectedEpoch?: number;
+    priorBatchOpIds?: string[];
+    strictSessionRevision?: boolean;
     alsoFinishSession?: boolean;
     advanceCycle?: boolean;
   },
@@ -1298,188 +2562,1459 @@ export async function coachSyncSessionToPlan(
   session?: Session;
 }> {
   const operationId = args.operationId ?? makeOpId('sync-plan');
-  const currentSession = await getSession(args.sessionId);
-  if (!currentSession) {
+  const preSession = await getSession(args.sessionId);
+  if (!preSession) {
     throw new TxConflictError('not-found', '找不到目标训练记录');
-  }
-  const sessionRev = revisionOf(currentSession);
-  if (args.expectedSessionRevision !== undefined && sessionRev !== args.expectedSessionRevision) {
-    throw new TxConflictError('version-conflict', `训练版本已变更为 r${sessionRev}`, sessionRev);
   }
 
   if (args.scope === 'session-only') {
+    if (args.alsoFinishSession && preSession.status === 'active') {
+      const fin = await coachFinishActiveSession(
+        {
+          operationId,
+          sessionId: args.sessionId,
+          expectedRevision: args.expectedSessionRevision,
+          modelExpectedRevision: args.modelExpectedRevision,
+          expectedEpoch: args.expectedEpoch,
+          priorBatchOpIds: args.priorBatchOpIds,
+          strictSessionRevision: true,
+          syncBackToPlanDay: false,
+          advanceCycle: args.advanceCycle,
+        },
+        hooks,
+      );
+      return {
+        scope: 'session-only',
+        synced: false,
+        message: fin.receipt.summary,
+        receipt: fin.receipt,
+        session: fin.session,
+      };
+    }
+    const preRev = revisionOf(preSession);
+    if (args.expectedSessionRevision !== undefined && preRev !== args.expectedSessionRevision) {
+      throw new TxConflictError('version-conflict', `训练版本已变更为 r${preRev}`, preRev);
+    }
+    if (
+      args.modelExpectedRevision !== undefined &&
+      preRev !== args.modelExpectedRevision
+    ) {
+      throw new TxConflictError('version-conflict', `训练版本已变更为 r${preRev}`, preRev);
+    }
     return {
       scope: 'session-only',
       synced: false,
       message: '已确认仅保留本次训练内的临时编排，原训练计划模板未作任何修改。',
-      session: currentSession,
+      session: preSession,
     };
   }
 
-  const existingReceipt = await getCoachReceiptByOperationId(operationId);
-  if (existingReceipt) {
+  if (args.alsoFinishSession && preSession.status === 'active') {
+    const fin = await coachFinishActiveSession(
+      {
+        operationId,
+        sessionId: args.sessionId,
+        expectedRevision: args.expectedSessionRevision,
+        modelExpectedRevision: args.modelExpectedRevision,
+        expectedEpoch: args.expectedEpoch,
+        priorBatchOpIds: args.priorBatchOpIds,
+        strictSessionRevision: true,
+        syncBackToPlanDay: true,
+        advanceCycle: args.advanceCycle,
+      },
+      hooks,
+    );
     return {
       scope: 'sync-to-plan',
       synced: true,
-      message: existingReceipt.summary,
-      receipt: existingReceipt,
-      plan: existingReceipt.planId ? await getPlan(existingReceipt.planId) : undefined,
-      session: await getSession(args.sessionId),
+      message: fin.receipt.summary,
+      receipt: fin.receipt,
+      plan: fin.plan,
+      session: fin.session,
     };
   }
 
-  // 若用户顺便请求以“带同步计划”方式完训，直接走 tx.ts 原子完训通道
-  if (args.alsoFinishSession && currentSession.status === 'active') {
-    const runtime = getActiveSessionRuntime(currentSession.id);
-    if (runtime) await runtime.awaitPendingWrites();
-    const freshPlanBefore = await getPlan(currentSession.planId);
-    const ended: Session = {
-      ...currentSession,
-      revision: sessionRev,
-      status: 'completed',
-      endedAt: Date.now(),
-      advancedCycle: args.advanceCycle ?? true,
-    };
-    const finRes = await atomicFinishSession({
-      session: ended,
-      guard: {
-        editorId: runtime?.editorId,
-        expectedVersion: sessionRev,
-        advanceCycle: args.advanceCycle ?? true,
-        syncBackToPlanDay: true,
-        lockPolicy: runtime ? 'required' : 'optional',
-      },
-    });
-    if (!finRes.ok) {
-      throw new TxConflictError(finRes.reason, finRes.message);
-    }
-    hooks?.onSessionCommitted?.(finRes.session);
-    if (finRes.plan) hooks?.onPlanCommitted?.(finRes.plan);
-    const epoch = await getCoachRestoreEpoch();
-    const targets: CoachReceiptTouchedTarget[] = [];
-    if (freshPlanBefore && finRes.plan) {
-      targets.push({
-        kind: 'plan-day',
-        planId: finRes.plan.id,
-        beforePlan: structuredClone(freshPlanBefore),
-        afterPlan: structuredClone(finRes.plan),
-      });
-    }
-    const receipt: CoachOperationReceipt = {
-      id: makeReceiptId(),
+  const fallbackVaultEpoch = await getCoachVaultRestoreEpoch().catch(() => 0);
+  const txResult = await wrapMainTx(() =>
+    executeCoachMainTx({
       operationId,
       toolName: 'sync_session_to_plan',
-      createdAt: Date.now(),
-      scope: 'session+plan',
-      summary: `已结束训练，并将本次编排同步更新回计划「${finRes.plan?.name ?? currentSession.planName}」`,
-      entityType: 'session+plan',
-      entityId: finRes.session.id,
-      planId: finRes.plan?.id,
-      beforeRevision: sessionRev,
-      afterRevision: finRes.revision,
-      beforePlanRevision: freshPlanBefore?.updatedAt,
-      afterPlanRevision: finRes.plan?.updatedAt,
-      restoreEpoch: epoch,
-      undone: false,
-      touchedTargets: targets,
-    };
-    await saveCoachReceipt(receipt);
-    hooks?.onReceiptSaved?.(receipt);
-    return {
-      scope: 'sync-to-plan',
-      synced: true,
-      message: receipt.summary,
-      receipt,
-      plan: finRes.plan,
-      session: finRes.session,
-    };
-  }
-
-  // 直接将当前训练（active 或 completed）的编排差量写回原计划模板（保留长期计划中另行新增的无关动作）
-  let diffMessage = '';
-  const { beforePlan, afterPlan } = await atomicUpdatePlanInTx(
-    currentSession.planId,
-    args.expectedPlanUpdatedAt,
-    (curPlan) => {
-      const diff = diffSessionVsPlanDay(currentSession, curPlan);
-      if (!diff.canSync) {
-        if (diff.planUpdatedDuringSession) {
+      argsForDigest: args,
+      expectedEpoch: args.expectedEpoch,
+      priorBatchOpIds: args.priorBatchOpIds,
+      stores: ['plans', 'sessions'],
+      sessionId: args.sessionId,
+      planId: preSession.planId,
+      fallbackVaultEpoch,
+      prepare: ({ now, currentEpoch, currentSession, currentPlan, priorOpLogs }) => {
+        if (!currentSession) {
+          throw new TxConflictError('not-found', '找不到目标训练记录');
+        }
+        const sessRev = revisionOf(currentSession);
+        assertSessionVersionOrPrecondition({
+          currentSession,
+          expectedRevision: args.expectedSessionRevision,
+          modelExpectedRevision: args.modelExpectedRevision,
+          currentEpoch,
+          priorOpLogs,
+          strictSessionRevision: true,
+          entityLabel: '训练记录',
+        });
+        if (!currentPlan) {
+          throw new TxConflictError('not-found', '找不到原训练计划');
+        }
+        const expectedPlanRev =
+          args.expectedPlanUpdatedAt !== undefined
+            ? advanceRevisionFromPriorOps(
+                args.expectedPlanUpdatedAt,
+                'plan',
+                currentPlan.id,
+                currentEpoch,
+                priorOpLogs,
+              )
+            : undefined;
+        if (expectedPlanRev !== undefined) {
+          if (currentPlan.updatedAt !== expectedPlanRev) {
+            throw new TxConflictError(
+              'version-conflict',
+              '原训练计划已被更新，请刷新后再同步',
+              currentPlan.updatedAt,
+            );
+          }
+          if (
+            args.modelExpectedPlanUpdatedAt !== undefined &&
+            (args.modelExpectedPlanUpdatedAt < args.expectedPlanUpdatedAt! ||
+              args.modelExpectedPlanUpdatedAt > expectedPlanRev)
+          ) {
+            throw new TxConflictError(
+              'version-conflict',
+              '原训练计划当前版本与模型指定期望版本不一致，请刷新后再同步',
+              currentPlan.updatedAt,
+            );
+          }
+        } else if (args.modelExpectedPlanUpdatedAt !== undefined) {
+          const selfModelPlanRev = advanceRevisionFromPriorOps(
+            args.modelExpectedPlanUpdatedAt,
+            'plan',
+            currentPlan.id,
+            currentEpoch,
+            priorOpLogs,
+          );
+          if (currentPlan.updatedAt !== selfModelPlanRev) {
+            throw new TxConflictError(
+              'version-conflict',
+              '原训练计划已被更新，请刷新后再同步',
+              currentPlan.updatedAt,
+            );
+          }
+        }
+        const beforePlan = structuredClone(currentPlan);
+        const diff = diffSessionVsPlanDay(currentSession, currentPlan);
+        if (!diff.canSync) {
+          if (diff.planUpdatedDuringSession) {
+            throw new TxConflictError(
+              'version-conflict',
+              diff.blockerMessage ?? '原计划在训练开始后也被独立修改，请先核对后再手动调整计划',
+              currentPlan.updatedAt,
+            );
+          }
           throw new TxConflictError(
-            'version-conflict',
-            diff.blockerMessage ?? '原计划在训练开始后也被独立修改，请先核对后再手动调整计划',
-            curPlan.updatedAt,
+            'state-conflict',
+            diff.blockerMessage ?? '当前训练不符合同步回原计划的条件',
           );
         }
-        throw new TxConflictError(
-          'state-conflict',
-          diff.blockerMessage ?? '当前训练不符合同步回原计划的条件',
+        if (!diff.hasDiff) {
+          throw new TxConflictError('state-conflict', '本次训练动作编排与原计划训练日一致，无需重复同步');
+        }
+        const syncResult = applySessionArrangementToPlan(
+          structuredClone(currentPlan),
+          currentSession.day.dayId,
+          currentSession,
         );
-      }
-      if (!diff.hasDiff) {
-        throw new TxConflictError('state-conflict', '本次训练动作编排与原计划训练日一致，无需重复同步');
-      }
-      const syncResult = applySessionArrangementToPlan(
-        curPlan,
-        currentSession.day.dayId,
-        currentSession,
-      );
-      if (!syncResult.ok) {
-        throw new TxConflictError('state-conflict', syncResult.message);
-      }
-      diffMessage = `已将「${diff.dayName}」编排同步回原计划（${diff.summaryText}）`;
-      return syncResult.plan;
-    },
+        if (!syncResult.ok) {
+          throw new TxConflictError('state-conflict', syncResult.message);
+        }
+        const diffMessage = `已将「${diff.dayName}」编排同步回原计划（${diff.summaryText}）`;
+        const candidatePlan: Plan = {
+          ...syncResult.plan,
+          days: syncResult.plan.days.map((d) => ({ ...d, exercises: cleanOrphanPairIds(d.exercises) })),
+          updatedAt: Math.max(now, currentPlan.updatedAt + 1),
+        };
+        const valid = validateDataDeep({ plans: [candidatePlan], sessions: [] });
+        if (!valid.ok) {
+          throw new TxConflictError('invalid-input', `计划校验失败：${valid.issues[0]?.message ?? ''}`);
+        }
+        const afterPlan = valid.value.plans[0];
+        const opLog: CoachMainOpLogRecord = {
+          schemaVersion: 2,
+          operationId,
+          receiptId: makeReceiptId(),
+          toolName: 'sync_session_to_plan',
+          argsDigest: '',
+          createdAt: now,
+          restoreEpoch: currentEpoch,
+          scope: 'plan',
+          summary: diffMessage,
+          entityType: 'plan',
+          entityId: afterPlan.id,
+          planId: afterPlan.id,
+          beforeRevision: sessRev,
+          afterRevision: sessRev,
+          beforePlanRevision: beforePlan.updatedAt,
+          afterPlanRevision: afterPlan.updatedAt,
+          undoable: true,
+          undone: false,
+          touchedTargets: [
+            {
+              kind: 'plan-day',
+              planId: afterPlan.id,
+              beforePlan,
+              afterPlan: structuredClone(afterPlan),
+            },
+          ],
+        };
+        return { nextPlan: afterPlan, opLog };
+      },
+    }),
   );
 
-  hooks?.onPlanCommitted?.(afterPlan);
-  const epoch = await getCoachRestoreEpoch();
-  const receipt: CoachOperationReceipt = {
-    id: makeReceiptId(),
-    operationId,
-    toolName: 'sync_session_to_plan',
-    createdAt: Date.now(),
-    scope: 'plan',
-    summary: diffMessage,
-    entityType: 'plan',
-    entityId: afterPlan.id,
-    planId: afterPlan.id,
-    beforeRevision: sessionRev,
-    afterRevision: sessionRev,
-    beforePlanRevision: beforePlan.updatedAt,
-    afterPlanRevision: afterPlan.updatedAt,
-    restoreEpoch: epoch,
-    undone: false,
-    touchedTargets: [
-      {
-        kind: 'plan-day',
-        planId: afterPlan.id,
-        beforePlan,
-        afterPlan: structuredClone(afterPlan),
-      },
-    ],
-  };
-  await saveCoachReceipt(receipt);
-  hooks?.onReceiptSaved?.(receipt);
+  await saveCoachReceipt(txResult.receipt);
+  if (txResult.plan && !txResult.replayed) hooks?.onPlanCommitted?.(txResult.plan);
+  hooks?.onReceiptSaved?.(txResult.receipt);
   return {
     scope: 'sync-to-plan',
     synced: true,
-    message: receipt.summary,
-    receipt,
-    plan: afterPlan,
-    session: currentSession,
+    message: txResult.receipt.summary,
+    receipt: txResult.receipt,
+    plan: txResult.plan,
+    session: txResult.session,
   };
 }
 
-/* ── 字段级独立撤销（允许教练改第2组 → 用户改第3组 → 撤销第2组并完整保留第3组） ── */
+/* ── 工具 8：进行中动作管理（替换/新增/移除/切训练形式/跳过） ── */
 
-function setsEqualCore(a: SessionSet, b: SessionSet): boolean {
-  return (
-    a.reps === b.reps &&
-    a.weightKg === b.weightKg &&
-    a.status === b.status &&
-    Boolean(a.toFailure) === Boolean(b.toFailure)
+export type ManageActiveExerciseInput =
+  | {
+      operationId?: string;
+      sessionId: string;
+      expectedRevision?: number;
+      expectedEpoch?: number;
+      deferTimerDispatch?: boolean;
+      mode: 'replace';
+      exId?: string;
+      exerciseName?: string;
+      newName: string;
+      form?: TrainingForm;
+      sets?: number;
+      repsMin?: number;
+      repsMax?: number;
+      suggestedWeightKg?: number | null;
+      weightMode?: WeightMode;
+      dumbbellBasis?: DumbbellBasis;
+      restSec?: number;
+      restInSec?: number;
+      restAfterSec?: number;
+      stages?: CoachTargetStageInput[];
+      setupNote?: string;
+      allowDiscardLoggedData?: boolean;
+    }
+  | {
+      operationId?: string;
+      sessionId: string;
+      expectedRevision?: number;
+      expectedEpoch?: number;
+      deferTimerDispatch?: boolean;
+      mode: 'add';
+      newName: string;
+      insertAfterExId?: string;
+      form?: TrainingForm;
+      sets?: number;
+      repsMin?: number;
+      repsMax?: number;
+      suggestedWeightKg?: number | null;
+      weightMode?: WeightMode;
+      dumbbellBasis?: DumbbellBasis;
+      restSec?: number;
+      restInSec?: number;
+      restAfterSec?: number;
+      stages?: CoachTargetStageInput[];
+      setupNote?: string;
+    }
+  | {
+      operationId?: string;
+      sessionId: string;
+      expectedRevision?: number;
+      expectedEpoch?: number;
+      deferTimerDispatch?: boolean;
+      mode: 'remove' | 'skip_remaining' | 'unskip';
+      exId?: string;
+      exerciseName?: string;
+      allowDiscardLoggedData?: boolean;
+    }
+  | {
+      operationId?: string;
+      sessionId: string;
+      expectedRevision?: number;
+      expectedEpoch?: number;
+      deferTimerDispatch?: boolean;
+      mode: 'convert_form';
+      exId?: string;
+      exerciseName?: string;
+      form: TrainingForm;
+      sets?: number;
+      repsMin?: number;
+      repsMax?: number;
+      suggestedWeightKg?: number | null;
+      weightMode?: WeightMode;
+      dumbbellBasis?: DumbbellBasis;
+      restSec?: number;
+      restInSec?: number;
+      restAfterSec?: number;
+      stages?: CoachTargetStageInput[];
+      allowDiscardLoggedData?: boolean;
+    };
+
+function buildBlankSetsFromTarget(target: ExerciseTarget): SessionSet[] {
+  const groups = groupsFromTarget(target);
+  const sets: SessionSet[] = [];
+  for (const g of groups) {
+    for (let si = 1; si <= g.stageCount; si += 1) {
+      const stage = target.kind === 'dropSet' ? target.stages[si - 1] : undefined;
+      sets.push({
+        id: newId('set'),
+        roundIndex: g.index,
+        stageIndex: si,
+        ...(stage?.id ? { stageId: stage.id } : {}),
+        reps: null,
+        weightKg: null,
+        status: 'blank',
+        ...(target.kind === 'straight' ? (target.toFailure ? { toFailure: true } : {}) : stage?.toFailure ? { toFailure: true } : {}),
+      });
+    }
+  }
+  return sets;
+}
+
+export async function coachManageActiveExercise(
+  input: ManageActiveExerciseInput & CoachTxPreconditionArgs,
+  hooks?: CoachTxHooks,
+): Promise<CoachCommitResult> {
+  const operationId = input.operationId ?? makeOpId('manage-ex');
+  const nextNameRaw = input.mode === 'replace' || input.mode === 'add' ? input.newName.trim() : '';
+  if ((input.mode === 'replace' || input.mode === 'add') && !nextNameRaw) {
+    throw new TxConflictError('invalid-input', '请提供新动作的名称');
+  }
+  const newExerciseId = nextNameRaw ? exerciseIdFromName(nextNameRaw) : '';
+  const newTemplate = newExerciseId ? await getExerciseTemplate(newExerciseId) : undefined;
+
+  return runActiveSessionMutation(
+    {
+      operationId,
+      toolName: 'manage_active_exercise',
+      sessionId: input.sessionId,
+      expectedRevision: input.expectedRevision,
+      modelExpectedRevision: input.modelExpectedRevision,
+      expectedEpoch: input.expectedEpoch,
+      frozenPrecondition: input.frozenPrecondition,
+      priorBatchOpIds: input.priorBatchOpIds,
+      strictSessionRevision: input.strictSessionRevision,
+      deferTimerDispatch: input.deferTimerDispatch,
+      argsForDigest: input,
+      compute: (current) => {
+        const beforeSnapshot = structuredClone(current);
+
+        if (input.mode === 'replace') {
+          const old = resolveSessionExercise(current, input);
+          const focus = checkFocusConflict({ sessionId: current.id, exId: old.id });
+          if (focus.conflict) {
+            throw new TxConflictError('focus-conflict', focus.message ?? '原动作输入框正在编辑中');
+          }
+          const prot = exerciseRemovalProtection(old);
+          if (prot.protected && !input.allowDiscardLoggedData) {
+            throw new TxConflictError(
+              'dirty-state',
+              `「${old.name}」${prot.reasons.join('、')}，为避免误丢已练数据，已停止直接替换；若确认丢弃并替换请明确说明，或让我新增一个动作。`,
+            );
+          }
+          const hasExplicitSpec =
+            input.form !== undefined ||
+            input.sets !== undefined ||
+            input.repsMin !== undefined ||
+            input.repsMax !== undefined ||
+            input.suggestedWeightKg !== undefined ||
+            input.weightMode !== undefined ||
+            input.dumbbellBasis !== undefined ||
+            input.restSec !== undefined ||
+            input.restInSec !== undefined ||
+            input.restAfterSec !== undefined ||
+            Boolean(input.stages?.length);
+          const built = buildExerciseTargetFromInput(
+            nextNameRaw,
+            input,
+            hasExplicitSpec ? undefined : newTemplate?.target,
+            newTemplate?.restSec ?? old.restSec ?? 120,
+          );
+          const setupParsed = parseSetupNote(input.setupNote);
+          if (!setupParsed.ok) throw new TxConflictError('invalid-input', setupParsed.message);
+          const resolvedSetup = setupParsed.note ?? setupNoteFor({}, newTemplate);
+          const replacement: SessionExercise = {
+            id: newId('sex'),
+            exerciseId: newExerciseId,
+            planExerciseId: null,
+            replacedFrom: old.name,
+            name: nextNameRaw,
+            restSec: built.restSec,
+            target: built.target,
+            status: 'pending',
+            groups: groupsFromTarget(built.target),
+            sets: buildBlankSetsFromTarget(built.target),
+            note: '',
+            ...(resolvedSetup ? { setupNote: resolvedSetup } : {}),
+          };
+          const exercises = cleanOrphanPairIds(
+            current.exercises.map((e) => (e.id === old.id ? replacement : e)),
+          );
+          const nextSession: Session = { ...current, exercises };
+          return {
+            nextSession,
+            summary: `将「${old.name}」替换为「${nextNameRaw}」（${summarizeTargetLabel(built.target, built.restSec)}）`,
+            touchedTargets: [
+              {
+                kind: 'session-snapshot',
+                sessionId: current.id,
+                beforeSession: beforeSnapshot,
+                afterSession: structuredClone(nextSession),
+              },
+            ],
+          };
+        }
+
+        if (input.mode === 'add') {
+          if (current.exercises.length >= MAX_EXERCISES) {
+            throw new TxConflictError('dirty-state', `单次训练最多 ${MAX_EXERCISES} 个动作，无法继续添加`);
+          }
+          const built = buildExerciseTargetFromInput(
+            nextNameRaw,
+            input,
+            newTemplate?.target,
+            newTemplate?.restSec ?? 120,
+          );
+          const setupParsed = parseSetupNote(input.setupNote);
+          if (!setupParsed.ok) throw new TxConflictError('invalid-input', setupParsed.message);
+          const resolvedSetup = setupParsed.note ?? setupNoteFor({}, newTemplate);
+          const addedEx: SessionExercise = {
+            id: newId('sex'),
+            exerciseId: newExerciseId,
+            planExerciseId: null,
+            name: nextNameRaw,
+            restSec: built.restSec,
+            target: built.target,
+            status: 'pending',
+            groups: groupsFromTarget(built.target),
+            sets: buildBlankSetsFromTarget(built.target),
+            note: '',
+            added: true,
+            ...(resolvedSetup ? { setupNote: resolvedSetup } : {}),
+          };
+          const nextExercises = [...current.exercises];
+          const insertIdx = input.insertAfterExId
+            ? nextExercises.findIndex((e) => e.id === input.insertAfterExId)
+            : -1;
+          if (insertIdx >= 0) nextExercises.splice(insertIdx + 1, 0, addedEx);
+          else nextExercises.push(addedEx);
+          const nextSession: Session = { ...current, exercises: nextExercises };
+          return {
+            nextSession,
+            summary: `新增动作「${nextNameRaw}」（${summarizeTargetLabel(built.target, built.restSec)}）`,
+            touchedTargets: [
+              {
+                kind: 'session-snapshot',
+                sessionId: current.id,
+                beforeSession: beforeSnapshot,
+                afterSession: structuredClone(nextSession),
+              },
+            ],
+          };
+        }
+
+        if (input.mode === 'remove') {
+          const ex = resolveSessionExercise(current, input);
+          const focus = checkFocusConflict({ sessionId: current.id, exId: ex.id });
+          if (focus.conflict) {
+            throw new TxConflictError('focus-conflict', focus.message ?? '目标动作输入框正在编辑中');
+          }
+          const prot = exerciseRemovalProtection(ex);
+          if (prot.protected && !input.allowDiscardLoggedData) {
+            throw new TxConflictError(
+              'dirty-state',
+              `「${ex.name}」${prot.reasons.join('、')}，确认要移除并丢弃已记录内容后再操作`,
+            );
+          }
+          const rem = removeExerciseFromSession(current, ex.id);
+          const nextSession: Session = {
+            ...rem.session,
+            exercises: cleanOrphanPairIds(rem.session.exercises),
+          };
+          return {
+            nextSession,
+            summary: `移除本次训练中的「${ex.name}」`,
+            touchedTargets: [
+              {
+                kind: 'session-snapshot',
+                sessionId: current.id,
+                beforeSession: beforeSnapshot,
+                afterSession: structuredClone(nextSession),
+              },
+            ],
+          };
+        }
+
+        if (input.mode === 'convert_form') {
+          const ex = resolveSessionExercise(current, input);
+          const focus = checkFocusConflict({ sessionId: current.id, exId: ex.id, fields: ['target'] });
+          if (focus.conflict) {
+            throw new TxConflictError('focus-conflict', focus.message ?? '目标字段正在编辑中');
+          }
+          const beforeForm = trainingFormOf(ex.target);
+          const built = buildExerciseTargetFromInput(ex.name, input, ex.target, ex.restSec);
+          const impact = planTargetApply(ex, built.target);
+          if (impact.removedWithData.length > 0 && !input.allowDiscardLoggedData) {
+            throw new TxConflictError(
+              'dirty-state',
+              `转换形式会移除 ${impact.removedWithData.length} 条已录入实绩，请先确认允许覆盖或保留原记录`,
+            );
+          }
+          const applied = applyTargetToSessionExercise(current, ex.id, built.target, { confirmImpact: true });
+          if (!applied.applied) {
+            throw new TxConflictError('dirty-state', applied.message);
+          }
+          const nextSession = withExercise(applied.session, ex.id, { restSec: built.restSec });
+          return {
+            nextSession,
+            summary: `将「${ex.name}」从${trainingFormLabel(beforeForm)}切换为${trainingFormLabel(input.form)}（${summarizeTargetLabel(built.target, built.restSec)}）`,
+            touchedTargets: [
+              {
+                kind: 'session-snapshot',
+                sessionId: current.id,
+                beforeSession: beforeSnapshot,
+                afterSession: structuredClone(nextSession),
+              },
+            ],
+          };
+        }
+
+        const ex = resolveSessionExercise(current, input);
+        const nextSession =
+          input.mode === 'skip_remaining' ? skipRemaining(current, ex.id) : unskipExercise(current, ex.id);
+        return {
+          nextSession,
+          summary:
+            input.mode === 'skip_remaining'
+              ? `已将「${ex.name}」未开始组标为跳过`
+              : `已恢复「${ex.name}」被跳过的组`,
+          touchedTargets: [
+            {
+              kind: 'session-snapshot',
+              sessionId: current.id,
+              beforeSession: beforeSnapshot,
+              afterSession: structuredClone(nextSession),
+            },
+          ],
+        };
+      },
+    },
+    hooks,
   );
 }
+
+/* ── 工具 9：进行中训练写备注（整场 / 动作 / 单组） ── */
+
+export type UpdateActiveNoteInput = {
+  operationId?: string;
+  sessionId: string;
+  expectedRevision?: number;
+  expectedEpoch?: number;
+  scope: 'session' | 'exercise' | 'set';
+  exId?: string;
+  exerciseName?: string;
+  setId?: string;
+  roundIndex?: number;
+  stageIndex?: number;
+  targetMode?: 'next_pending' | 'last_completed';
+  note: string;
+  append?: boolean;
+} & CoachTxPreconditionArgs;
+
+export async function coachUpdateActiveNote(
+  input: UpdateActiveNoteInput,
+  hooks?: CoachTxHooks,
+): Promise<CoachCommitResult> {
+  const operationId = input.operationId ?? makeOpId('act-note');
+  const maxLen = input.scope === 'set' ? 500 : MAX_TEXT;
+  if (input.note.length > maxLen) {
+    throw new TxConflictError('invalid-input', `备注最多 ${maxLen} 个字符`);
+  }
+
+  return runActiveSessionMutation(
+    {
+      operationId,
+      toolName: 'update_active_note',
+      sessionId: input.sessionId,
+      expectedRevision: input.expectedRevision,
+      modelExpectedRevision: input.modelExpectedRevision,
+      expectedEpoch: input.expectedEpoch,
+      frozenPrecondition: input.frozenPrecondition,
+      priorBatchOpIds: input.priorBatchOpIds,
+      strictSessionRevision: input.strictSessionRevision,
+      argsForDigest: input,
+      compute: (current) => {
+        const beforeSnapshot = structuredClone(current);
+        const mergeNote = (oldNote: string | undefined): string => {
+          const incoming = input.note.trim();
+          if (!input.append) return incoming;
+          const prev = (oldNote ?? '').trim();
+          if (!prev) return incoming;
+          if (!incoming) return prev;
+          const joined = `${prev}；${incoming}`;
+          if (joined.length > maxLen) {
+            throw new TxConflictError('invalid-input', `追加后备注超过 ${maxLen} 字上限`);
+          }
+          return joined;
+        };
+
+        if (input.scope === 'session') {
+          const nextNote = mergeNote(current.note);
+          const nextSession: Session = { ...current, note: nextNote };
+          return {
+            nextSession,
+            summary: nextNote ? `更新本场训练备注：${nextNote.slice(0, 36)}` : '清空本场训练备注',
+            touchedTargets: [
+              {
+                kind: 'session-snapshot',
+                sessionId: current.id,
+                beforeSession: beforeSnapshot,
+                afterSession: structuredClone(nextSession),
+              },
+            ],
+          };
+        }
+
+        const ex = resolveSessionExercise(current, input);
+        if (input.scope === 'exercise') {
+          const focus = checkFocusConflict({ sessionId: current.id, exId: ex.id, fields: ['note'] });
+          if (focus.conflict) {
+            throw new TxConflictError('focus-conflict', focus.message ?? '动作备注正在编辑中');
+          }
+          const nextNote = mergeNote(ex.note);
+          const nextSession = withExercise(current, ex.id, { note: nextNote });
+          return {
+            nextSession,
+            summary: nextNote ? `记录「${ex.name}」备注：${nextNote.slice(0, 36)}` : `清空「${ex.name}」备注`,
+            touchedTargets: [
+              {
+                kind: 'session-snapshot',
+                sessionId: current.id,
+                beforeSession: beforeSnapshot,
+                afterSession: structuredClone(nextSession),
+              },
+            ],
+          };
+        }
+
+        const targetSet = resolveTargetSet(ex, input);
+        const focus = checkFocusConflict({
+          sessionId: current.id,
+          exId: ex.id,
+          setId: targetSet.id,
+          fields: ['note'],
+        });
+        if (focus.conflict) {
+          throw new TxConflictError('focus-conflict', focus.message ?? '单组备注正在编辑中');
+        }
+        const nextNote = mergeNote(targetSet.note);
+        const nextSession = withSetAndPrefillFollowingWeight(current, ex.id, targetSet.id, {
+          note: nextNote || undefined,
+        });
+        const afterSet = nextSession.exercises.find((e) => e.id === ex.id)!.sets.find((s) => s.id === targetSet.id)!;
+        return {
+          nextSession,
+          summary: nextNote
+            ? `记录「${ex.name}」第 ${targetSet.roundIndex} 组备注：${nextNote.slice(0, 32)}`
+            : `清空「${ex.name}」第 ${targetSet.roundIndex} 组备注`,
+          touchedTargets: [
+            {
+              kind: 'session-set',
+              sessionId: current.id,
+              exId: ex.id,
+              setId: targetSet.id,
+              beforeSet: structuredClone(targetSet),
+              afterSet: structuredClone(afterSet),
+            },
+          ],
+        };
+      },
+    },
+    hooks,
+  );
+}
+
+/* ── 工具 10：直接结束当前进行中训练 ── */
+
+export async function coachFinishActiveSession(
+  args: {
+    operationId?: string;
+    sessionId: string;
+    expectedRevision?: number;
+    expectedEpoch?: number;
+    syncBackToPlanDay?: boolean;
+    advanceCycle?: boolean;
+    note?: string;
+  } & CoachTxPreconditionArgs,
+  hooks?: CoachTxHooks,
+): Promise<CoachCommitResult> {
+  const operationId = args.operationId ?? makeOpId('finish-sess');
+  const runtime = getActiveSessionRuntime(args.sessionId);
+  if (runtime) {
+    await runtime.awaitPendingWrites();
+    if (runtime.hasBlockingDrafts()) {
+      throw new TxConflictError(
+        'focus-conflict',
+        '训练页还有未确认或未落盘的手工输入草稿，请先点一下空白处保存后再结束训练',
+      );
+    }
+  }
+  if (args.note !== undefined && args.note.length > MAX_TEXT) {
+    throw new TxConflictError('invalid-input', `训练备注最多 ${MAX_TEXT} 个字符`);
+  }
+
+  const preSession = await getSession(args.sessionId);
+  if (!preSession) {
+    throw new TxConflictError('not-found', '找不到要结束的训练记录');
+  }
+  const fallbackVaultEpoch = await getCoachVaultRestoreEpoch().catch(() => 0);
+
+  const txResult = await wrapMainTx(() =>
+    executeCoachMainTx({
+      operationId,
+      toolName: 'finish_active_session',
+      argsForDigest: args,
+      expectedEpoch: args.expectedEpoch,
+      priorBatchOpIds: args.priorBatchOpIds,
+      stores: ['sessions', 'plans'],
+      sessionId: args.sessionId,
+      planId: preSession.planId,
+      lockCheck: {
+        sessionId: args.sessionId,
+        editorId: runtime?.editorId,
+        lockPolicy: runtime ? 'required' : 'optional',
+      },
+      fallbackVaultEpoch,
+      prepare: ({ now, currentEpoch, currentSession, currentPlan, priorOpLogs }) => {
+        if (!currentSession) {
+          throw new TxConflictError('not-found', '找不到要结束的训练记录');
+        }
+        if (currentSession.status !== 'active') {
+          throw new TxConflictError('state-conflict', '这场训练已经结束，无需重复收尾');
+        }
+        const curRev = revisionOf(currentSession);
+        assertSessionVersionOrPrecondition({
+          currentSession,
+          expectedRevision: args.expectedRevision,
+          modelExpectedRevision: args.modelExpectedRevision,
+          currentEpoch,
+          priorOpLogs,
+          frozenPrecondition: args.frozenPrecondition,
+          strictSessionRevision: args.strictSessionRevision ?? true,
+          entityLabel: '训练记录',
+        });
+
+        const advance = args.advanceCycle ?? true;
+        const syncPlan = Boolean(args.syncBackToPlanDay);
+        const freshPlanBefore = currentPlan ? structuredClone(currentPlan) : undefined;
+        let workingPlan = currentPlan ? structuredClone(currentPlan) : undefined;
+        if (syncPlan) {
+          if (!workingPlan) {
+            throw new TxConflictError(
+              'state-conflict',
+              '原计划已不存在，无法将今日动作编排同步回计划',
+            );
+          }
+          const synced = applySessionArrangementToPlan(
+            workingPlan,
+            currentSession.day.dayId,
+            currentSession,
+            now,
+          );
+          if (!synced.ok) {
+            throw new TxConflictError('state-conflict', synced.message);
+          }
+          workingPlan = synced.plan;
+        }
+        const shouldAdvance =
+          advance && !currentSession.advancedCycle && !!workingPlan && workingPlan.days.length > 0;
+        const movedPlan = shouldAdvance && workingPlan ? pushCycle(workingPlan) : undefined;
+        const planToPersist =
+          movedPlan && workingPlan
+            ? { ...workingPlan, ...movedPlan }
+            : syncPlan
+              ? workingPlan
+              : undefined;
+
+        const finalizedCardio = Array.isArray(currentSession.cardio)
+          ? currentSession.cardio.map((c) => finalizeCardioForFinish(c, now))
+          : currentSession.cardio;
+        const nextSession: Session = {
+          ...currentSession,
+          ...(finalizedCardio ? { cardio: finalizedCardio } : {}),
+          ...(args.note !== undefined ? { note: args.note.trim() } : {}),
+          status: 'completed',
+          endedAt: now,
+          advancedCycle: Boolean(shouldAdvance),
+          cycleIndexAfter: movedPlan
+            ? movedPlan.cursor
+            : (workingPlan?.cursor ?? currentSession.cycleIndexAtStart),
+          revision: curRev + 1,
+        };
+
+        const sum = summarizeSession(nextSession);
+        const targets: CoachReceiptTouchedTarget[] = [];
+        if (syncPlan && freshPlanBefore && planToPersist) {
+          targets.push({
+            kind: 'plan-day',
+            planId: planToPersist.id,
+            beforePlan: freshPlanBefore,
+            afterPlan: structuredClone(planToPersist),
+          });
+        }
+        const opLog: CoachMainOpLogRecord = {
+          schemaVersion: 2,
+          operationId,
+          receiptId: makeReceiptId(),
+          toolName: 'finish_active_session',
+          argsDigest: '',
+          createdAt: now,
+          restoreEpoch: currentEpoch,
+          scope: syncPlan ? 'session+plan' : 'session',
+          summary: syncPlan
+            ? `已结束「${nextSession.day.dayName}」（完成 ${sum.completedSets} 组）并同步更新原计划`
+            : `已结束「${nextSession.day.dayName}」（完成 ${sum.completedSets} 组）`,
+          entityType: syncPlan ? 'session+plan' : 'session',
+          entityId: nextSession.id,
+          planId: (planToPersist ?? workingPlan)?.id,
+          beforeRevision: curRev,
+          afterRevision: curRev + 1,
+          beforePlanRevision: freshPlanBefore?.updatedAt,
+          afterPlanRevision: planToPersist?.updatedAt,
+          undoable: false,
+          undone: false,
+          touchedTargets: targets,
+        };
+        return {
+          nextSession,
+          nextPlan: planToPersist,
+          deleteRestTimerSessionId: currentSession.id,
+          opLog,
+        };
+      },
+    }),
+  );
+
+  await saveCoachReceipt(txResult.receipt);
+  if (!txResult.replayed) {
+    runtime?.stopRestTimer?.();
+    if (txResult.session) {
+      runtime?.applyCommittedSession(txResult.session);
+      hooks?.onSessionCommitted?.(txResult.session);
+    }
+    if (txResult.plan) hooks?.onPlanCommitted?.(txResult.plan);
+  }
+  hooks?.onReceiptSaved?.(txResult.receipt);
+  return {
+    receipt: txResult.receipt,
+    session: txResult.session,
+    plan: txResult.plan,
+    replayed: txResult.replayed,
+  };
+}
+
+/* ── 工具 11：进行中热身管理 ── */
+
+export type ManageActiveWarmupInput = {
+  operationId?: string;
+  sessionId: string;
+  expectedRevision?: number;
+  expectedEpoch?: number;
+  action: 'toggle_done' | 'add' | 'update' | 'remove';
+  warmupId?: string;
+  warmupName?: string;
+  done?: boolean;
+  name?: string;
+  unit?: 'reps' | 'time' | 'breath';
+  targetText?: string;
+} & CoachTxPreconditionArgs;
+
+export async function coachManageActiveWarmup(
+  input: ManageActiveWarmupInput,
+  hooks?: CoachTxHooks,
+): Promise<CoachCommitResult> {
+  const operationId = input.operationId ?? makeOpId('warmup');
+  return runActiveSessionMutation(
+    {
+      operationId,
+      toolName: 'manage_active_warmup',
+      sessionId: input.sessionId,
+      expectedRevision: input.expectedRevision,
+      modelExpectedRevision: input.modelExpectedRevision,
+      expectedEpoch: input.expectedEpoch,
+      frozenPrecondition: input.frozenPrecondition,
+      priorBatchOpIds: input.priorBatchOpIds,
+      strictSessionRevision: input.strictSessionRevision,
+      argsForDigest: input,
+      compute: (current) => {
+        const beforeSnapshot = structuredClone(current);
+        const resolveWarmup = () => {
+          if (input.warmupId) {
+            const w = current.warmups.find((x) => x.id === input.warmupId);
+            if (!w) throw new TxConflictError('not-found', '找不到目标热身项');
+            return w;
+          }
+          const needle = (input.warmupName ?? input.name ?? '').trim().toLowerCase();
+          if (needle) {
+            const exact = current.warmups.filter((x) => x.name.trim().toLowerCase() === needle);
+            if (exact.length === 1) return exact[0];
+            if (exact.length > 1) throw new TxConflictError('ambiguous-target', '找到多个同名热身项，请明确指定');
+            const fuzzy = current.warmups.filter((x) => x.name.trim().toLowerCase().includes(needle));
+            if (fuzzy.length === 1) return fuzzy[0];
+            if (fuzzy.length > 1) throw new TxConflictError('ambiguous-target', '找到多个匹配热身项，请明确全称');
+          }
+          if (current.warmups.length === 1) return current.warmups[0];
+          throw new TxConflictError('not-found', '本次训练中找不到对应热身项');
+        };
+
+        let nextWarmups = [...current.warmups];
+        let summary = '';
+
+        if (input.action === 'add') {
+          if (nextWarmups.length >= MAX_EXERCISES) {
+            throw new TxConflictError('dirty-state', `热身项数已达 ${MAX_EXERCISES} 上限`);
+          }
+          const name = (input.name ?? input.warmupName ?? '').trim();
+          const targetText = (input.targetText ?? '2 × 10').trim();
+          if (!name) throw new TxConflictError('invalid-input', '请提供热身项目名称');
+          if (name.length > 200 || targetText.length > 200) {
+            throw new TxConflictError('invalid-input', '热身名称与目标文字最多 200 字');
+          }
+          nextWarmups.push({
+            id: newId('w'),
+            name,
+            unit: input.unit ?? 'reps',
+            targetText,
+            done: Boolean(input.done),
+          });
+          summary = `新增热身「${name}」（${targetText}）`;
+        } else if (input.action === 'remove') {
+          const w = resolveWarmup();
+          nextWarmups = nextWarmups.filter((x) => x.id !== w.id);
+          summary = `移除热身「${w.name}」`;
+        } else if (input.action === 'update') {
+          const w = resolveWarmup();
+          const nextName = input.name !== undefined ? input.name.trim() : w.name;
+          const nextText = input.targetText !== undefined ? input.targetText.trim() : w.targetText;
+          if (!nextName || nextName.length > 200 || nextText.length > 200) {
+            throw new TxConflictError('invalid-input', '热身名称不能为空且名称/目标均不能超过 200 字');
+          }
+          nextWarmups = nextWarmups.map((x) =>
+            x.id === w.id
+              ? {
+                  ...x,
+                  name: nextName,
+                  unit: input.unit ?? x.unit,
+                  targetText: nextText,
+                  ...(input.done !== undefined ? { done: input.done } : {}),
+                }
+              : x,
+          );
+          summary = `更新热身「${nextName}」（${nextText}）`;
+        } else {
+          const w = resolveWarmup();
+          const nextDone = input.done !== undefined ? input.done : !w.done;
+          nextWarmups = nextWarmups.map((x) => (x.id === w.id ? { ...x, done: nextDone } : x));
+          summary = `${nextDone ? '完成' : '取消完成'}热身「${w.name}」`;
+        }
+
+        const nextSession: Session = { ...current, warmups: nextWarmups };
+        return {
+          nextSession,
+          summary,
+          touchedTargets: [
+            {
+              kind: 'session-snapshot',
+              sessionId: current.id,
+              beforeSession: beforeSnapshot,
+              afterSession: structuredClone(nextSession),
+            },
+          ],
+        };
+      },
+    },
+    hooks,
+  );
+}
+
+/* ── 工具 12：进行中有氧管理（6 种有氧预设全面放开） ── */
+
+export type ManageActiveCardioInput = {
+  operationId?: string;
+  sessionId: string;
+  expectedRevision?: number;
+  expectedEpoch?: number;
+  action: 'add' | 'update_params' | 'start' | 'pause' | 'resume' | 'complete' | 'remove';
+  cardioId?: string;
+  cardioName?: string;
+  preset?: CardioPreset;
+  name?: string;
+  params?: Partial<CardioParams>;
+  note?: string;
+} & CoachTxPreconditionArgs;
+
+export async function coachManageActiveCardio(
+  input: ManageActiveCardioInput,
+  hooks?: CoachTxHooks,
+): Promise<CoachCommitResult> {
+  const operationId = input.operationId ?? makeOpId('cardio');
+  return runActiveSessionMutation(
+    {
+      operationId,
+      toolName: 'manage_active_cardio',
+      sessionId: input.sessionId,
+      expectedRevision: input.expectedRevision,
+      modelExpectedRevision: input.modelExpectedRevision,
+      expectedEpoch: input.expectedEpoch,
+      frozenPrecondition: input.frozenPrecondition,
+      priorBatchOpIds: input.priorBatchOpIds,
+      strictSessionRevision: input.strictSessionRevision,
+      argsForDigest: input,
+      compute: (current) => {
+        const beforeSnapshot = structuredClone(current);
+        const list = current.cardio ?? [];
+        const resolveEntry = () => {
+          if (input.cardioId) {
+            const c = list.find((x) => x.id === input.cardioId);
+            if (!c) throw new TxConflictError('not-found', '找不到目标有氧项目');
+            return c;
+          }
+          const needle = (input.cardioName ?? input.name ?? '').trim().toLowerCase();
+          if (needle) {
+            const exact = list.filter((x) => x.name.trim().toLowerCase() === needle);
+            if (exact.length === 1) return exact[0];
+            const fuzzy = list.filter((x) => x.name.trim().toLowerCase().includes(needle));
+            if (fuzzy.length === 1) return fuzzy[0];
+            if (fuzzy.length > 1) throw new TxConflictError('invalid-input', '找到多个匹配有氧项目，请明确名称');
+          }
+          if (list.length === 1) return list[0];
+          throw new TxConflictError('not-found', '当前训练中找不到对应有氧项目');
+        };
+
+        let nextSession: Session = current;
+        let summary = '';
+
+        if (input.action === 'add') {
+          const preset: CardioPreset = input.preset ?? 'free-cardio';
+          const defaultParams =
+            CARDIO_PRESET_CHOICES.find((c) => c.preset === preset)?.params ?? {};
+          const normalized = normalizeCardioParams(preset, {
+            ...defaultParams,
+            ...(input.params ?? {}),
+          });
+          const issues = validateCardioParams(preset, normalized);
+          if (issues.length) throw new TxConflictError('invalid-input', issues[0].message);
+          let entry = createCardioEntry({
+            preset,
+            name: (input.name ?? CARDIO_PRESET_LABEL[preset]).trim() || CARDIO_PRESET_LABEL[preset],
+            params: normalized,
+          });
+          if (input.note?.trim()) {
+            if (input.note.trim().length > MAX_TEXT) throw new TxConflictError('invalid-input', `备注最多 ${MAX_TEXT} 字`);
+            entry = { ...entry, note: input.note.trim() };
+          }
+          const added = addCardioToSession(current, entry);
+          if (!added) {
+            throw new TxConflictError('dirty-state', `单次训练最多 ${MAX_CARDIO_ENTRIES} 个有氧项目`);
+          }
+          nextSession = added;
+          summary = `追加有氧项目「${entry.name}」`;
+        } else if (input.action === 'remove') {
+          const entry = resolveEntry();
+          nextSession = removeCardioFromSession(current, entry.id);
+          summary = `移除有氧项目「${entry.name}」`;
+        } else {
+          let entry = resolveEntry();
+          if (input.note !== undefined) {
+            if (input.note.length > MAX_TEXT) throw new TxConflictError('invalid-input', `备注最多 ${MAX_TEXT} 字`);
+            entry = input.note.trim() ? { ...entry, note: input.note.trim() } : { ...entry, note: undefined };
+            if (entry.note === undefined) delete entry.note;
+          }
+          if (input.action === 'update_params') {
+            const merged = normalizeCardioParams(entry.preset, { ...entry.currentParams, ...(input.params ?? {}) });
+            const issues = validateCardioParams(entry.preset, merged);
+            if (issues.length) throw new TxConflictError('invalid-input', issues[0].message);
+            const res = commitCardioParams(entry, merged);
+            if (!res.ok) throw new TxConflictError('dirty-state', res.reason);
+            entry = res.entry;
+            summary = `调整有氧「${entry.name}」参数`;
+          } else if (input.action === 'start') {
+            if (list.some((c) => c.id !== entry.id && c.status === 'running')) {
+              throw new TxConflictError('state-conflict', '已有另一项有氧正在计时，请先暂停或完成它');
+            }
+            entry = startCardio(entry);
+            summary = `开始有氧「${entry.name}」计时`;
+          } else if (input.action === 'pause') {
+            entry = pauseCardio(entry);
+            summary = `暂停有氧「${entry.name}」`;
+          } else if (input.action === 'resume') {
+            if (list.some((c) => c.id !== entry.id && c.status === 'running')) {
+              throw new TxConflictError('state-conflict', '已有另一项有氧正在计时，请先暂停或完成它');
+            }
+            entry = resumeCardio(entry);
+            summary = `恢复有氧「${entry.name}」计时`;
+          } else {
+            entry = completeCardio(entry);
+            summary = `完成有氧「${entry.name}」`;
+          }
+          nextSession = withCardioEntry(current, entry);
+        }
+
+        return {
+          nextSession,
+          summary,
+          touchedTargets: [
+            {
+              kind: 'session-snapshot',
+              sessionId: current.id,
+              beforeSession: beforeSnapshot,
+              afterSession: structuredClone(nextSession),
+            },
+          ],
+        };
+      },
+    },
+    hooks,
+  );
+}
+
+/* ── 工具 13：跨计划器械档位备忘读写 ── */
+
+export async function coachUpdateSetupNote(
+  args: {
+    operationId?: string;
+    sessionId?: string;
+    exId?: string;
+    exerciseName?: string;
+    exerciseId?: string;
+    expectedRevision?: number;
+    expectedEpoch?: number;
+    note: string;
+  } & CoachTxPreconditionArgs,
+  hooks?: CoachTxHooks,
+): Promise<CoachCommitResult> {
+  const operationId = args.operationId ?? makeOpId('setup-note');
+  const parsed = parseSetupNote(args.note);
+  if (!parsed.ok) {
+    throw new TxConflictError('invalid-input', parsed.message);
+  }
+  const nextNote = parsed.note;
+
+  const runtime = args.sessionId ? getActiveSessionRuntime(args.sessionId) : null;
+  if (runtime) await runtime.awaitPendingWrites();
+
+  let preSession: Session | undefined;
+  let preEx: SessionExercise | undefined;
+  if (args.sessionId) {
+    preSession = await getSession(args.sessionId);
+    if (preSession && preSession.status === 'active') {
+      try {
+        preEx = resolveSessionExercise(preSession, { exId: args.exId, exerciseName: args.exerciseName });
+      } catch (err) {
+        if (!args.exerciseId) throw err;
+      }
+    }
+  }
+
+  const targetExerciseId =
+    args.exerciseId?.trim() ||
+    preEx?.exerciseId ||
+    (args.exerciseName?.trim() ? exerciseIdFromName(args.exerciseName.trim()) : '');
+  const displayName = preEx?.name || args.exerciseName?.trim() || targetExerciseId;
+  if (!targetExerciseId) {
+    throw new TxConflictError('invalid-input', '请指定要设置器械档位备忘的动作名称');
+  }
+
+  const fallbackVaultEpoch = await getCoachVaultRestoreEpoch().catch(() => 0);
+
+  const txResult = await wrapMainTx(() =>
+    executeCoachMainTx({
+      operationId,
+      toolName: 'update_setup_note',
+      argsForDigest: {
+        sessionId: args.sessionId,
+        exId: args.exId,
+        exerciseName: args.exerciseName,
+        exerciseId: targetExerciseId,
+        note: nextNote,
+      },
+      expectedEpoch: args.expectedEpoch,
+      priorBatchOpIds: args.priorBatchOpIds,
+      stores: preEx && preSession ? ['sessions'] : [],
+      sessionId: preEx && preSession ? preSession.id : undefined,
+      templateExerciseId: targetExerciseId,
+      lockCheck:
+        preEx && preSession
+          ? {
+              sessionId: preSession.id,
+              editorId: runtime?.editorId,
+              lockPolicy: runtime ? 'required' : 'optional',
+            }
+          : undefined,
+      fallbackVaultEpoch,
+      prepare: ({ now, currentEpoch, currentSession, currentTemplate, priorOpLogs }) => {
+        let activeEx: SessionExercise | undefined;
+        let beforeRev = 0;
+        let afterRev = 0;
+        let nextSession: Session | undefined;
+
+        if (preEx && args.sessionId) {
+          if (!currentSession || currentSession.status !== 'active') {
+            throw new TxConflictError('state-conflict', '训练已结束或不存在，无法联动修改器械档位');
+          }
+          beforeRev = revisionOf(currentSession);
+          assertSessionVersionOrPrecondition({
+            currentSession,
+            expectedRevision: args.expectedRevision,
+            modelExpectedRevision: args.modelExpectedRevision,
+            currentEpoch,
+            priorOpLogs,
+            frozenPrecondition: args.frozenPrecondition,
+            strictSessionRevision: args.strictSessionRevision,
+            entityLabel: '训练记录',
+          });
+          activeEx = resolveSessionExercise(currentSession, {
+            exId: args.exId ?? preEx.id,
+            exerciseName: args.exerciseName,
+          });
+          afterRev = beforeRev + 1;
+          nextSession = {
+            ...currentSession,
+            revision: afterRev,
+            exercises: currentSession.exercises.map((e) =>
+              e.id === activeEx!.id ? withSetupNote(e, nextNote) : e,
+            ),
+          };
+        }
+
+        const baseTemplate: ExerciseTemplate =
+          currentTemplate ??
+          exerciseTemplateFromConfig({
+            exerciseId: targetExerciseId,
+            name: displayName,
+            target: activeEx?.target ?? {
+              kind: 'straight',
+              sets: 3,
+              setsMax: 3,
+              repsMin: 8,
+              repsMax: 12,
+              weightMode: 'external',
+              suggestedWeightKg: null,
+            },
+            restSec: activeEx?.restSec ?? 120,
+          });
+        const candidateRaw = withSetupNote(baseTemplate, nextNote);
+        const committedTemplate: ExerciseTemplate = {
+          ...candidateRaw,
+          schemaVersion: 1,
+          key: `exercise-template:${targetExerciseId}`,
+          revision: currentTemplate ? currentTemplate.revision + 1 : 1,
+          updatedAt: now,
+        };
+
+        const opLog: CoachMainOpLogRecord = {
+          schemaVersion: 2,
+          operationId,
+          receiptId: makeReceiptId(),
+          toolName: 'update_setup_note',
+          argsDigest: '',
+          createdAt: now,
+          restoreEpoch: currentEpoch,
+          scope: activeEx && currentSession ? 'session' : 'plan',
+          summary: nextNote
+            ? `更新「${displayName}」器械档位备忘：${nextNote}`
+            : `清空「${displayName}」器械档位备忘`,
+          entityType: activeEx && currentSession ? 'session' : 'plan',
+          entityId: activeEx && currentSession ? currentSession.id : targetExerciseId,
+          beforeRevision: beforeRev,
+          afterRevision: afterRev,
+          undoable: true,
+          undone: false,
+          touchedTargets: [
+            {
+              kind: 'setup-note',
+              ...(activeEx && currentSession
+                ? {
+                    sessionId: currentSession.id,
+                    exId: activeEx.id,
+                    beforeSessionNote: activeEx.setupNote,
+                    afterSessionNote: nextNote,
+                  }
+                : {}),
+              exerciseId: targetExerciseId,
+              ...(currentTemplate ? { beforeTemplate: structuredClone(currentTemplate) } : {}),
+              afterTemplate: structuredClone(committedTemplate),
+            },
+          ],
+        };
+
+        return {
+          ...(nextSession ? { nextSession } : {}),
+          nextTemplate: committedTemplate,
+          opLog,
+        };
+      },
+    }),
+  );
+
+  await saveCoachReceipt(txResult.receipt);
+  if (!txResult.replayed) {
+    if (txResult.session) {
+      runtime?.applyCommittedSession(txResult.session);
+      hooks?.onSessionCommitted?.(txResult.session);
+    }
+    hooks?.onTemplatesChanged?.();
+  }
+  hooks?.onReceiptSaved?.(txResult.receipt);
+  return { receipt: txResult.receipt, session: txResult.session, replayed: txResult.replayed };
+}
+
+/* ── 工具 14：Hermes 式持久记忆管理 ── */
+
+export async function coachManageMemory(
+  args: {
+    operationId?: string;
+    expectedEpoch?: number;
+    action: 'save' | 'delete';
+    id?: string;
+    category?: CoachMemoryCategory;
+    title?: string;
+    content?: string;
+    pinned?: boolean;
+    source?: 'coach' | 'user';
+  },
+  hooks?: CoachTxHooks,
+): Promise<CoachCommitResult & { memory: CoachMemoryStore; savedItem?: CoachMemoryItem; removedItem?: CoachMemoryItem }> {
+  const operationId = args.operationId ?? makeOpId('mem');
+  const currentEpoch = await getCoachRestoreEpoch();
+  if (args.expectedEpoch !== undefined && currentEpoch !== args.expectedEpoch) {
+    throw new TxConflictError('epoch-mismatch', '备份已恢复，请刷新上下文后再操作记忆');
+  }
+  const existingReceipt = await getCoachReceiptByOperationId(operationId);
+  const currentMem = await loadCoachMemory();
+  if (existingReceipt) {
+    let removedItem: CoachMemoryItem | undefined;
+    let savedItem: CoachMemoryItem | undefined;
+    const target = existingReceipt.touchedTargets.find((t) => t.kind === 'coach-memory');
+    if (target && target.kind === 'coach-memory') {
+      if (args.action === 'delete') {
+        const afterIds = new Set(target.afterMemory.items.map((x) => x.id));
+        removedItem = target.beforeMemory.items.find((x) => !afterIds.has(x.id));
+      } else {
+        savedItem = target.afterMemory.items.find(
+          (x) =>
+            (args.id && x.id === args.id) ||
+            (args.title && x.title === args.title.trim()) ||
+            x.updatedAt === existingReceipt.afterRevision,
+        );
+      }
+    }
+    return {
+      receipt: existingReceipt,
+      memory: currentMem,
+      replayed: true,
+      ...(savedItem ? { savedItem } : {}),
+      ...(removedItem ? { removedItem } : {}),
+    };
+  }
+
+  let afterMem: CoachMemoryStore;
+  let summary = '';
+  let savedItem: CoachMemoryItem | undefined;
+  let removedItem: CoachMemoryItem | undefined;
+
+  if (args.action === 'delete') {
+    const res = removeCoachMemoryItem(currentMem, { id: args.id, title: args.title });
+    if (!res.removed) {
+      throw new TxConflictError('not-found', '找不到要删除的教练记忆');
+    }
+    afterMem = res.store;
+    removedItem = res.removed;
+    summary = `忘记记忆「${res.removed.title}」`;
+  } else {
+    const title = (args.title ?? '').trim();
+    const content = (args.content ?? '').trim();
+    if (!title || !content) {
+      throw new TxConflictError('invalid-input', '写入长期记忆需要提供标题和内容');
+    }
+    const res = upsertCoachMemoryItem(currentMem, {
+      id: args.id,
+      category: args.category ?? 'preference',
+      title,
+      content,
+      source: args.source ?? 'coach',
+      pinned: args.pinned,
+    });
+    afterMem = res.store;
+    savedItem = res.item;
+    summary = `${res.created ? '记住' : '更新'}「${res.item.title}」：${res.item.content}`;
+  }
+
+  const receipt: CoachOperationReceipt = {
+    id: makeReceiptId(),
+    operationId,
+    schemaVersion: 2,
+    toolName: 'manage_coach_memory',
+    createdAt: Date.now(),
+    scope: 'memory',
+    summary,
+    entityType: 'memory',
+    entityId: 'coach-memory',
+    beforeRevision: currentMem.updatedAt,
+    afterRevision: afterMem.updatedAt,
+    restoreEpoch: currentEpoch,
+    undone: false,
+    touchedTargets: [
+      {
+        kind: 'coach-memory',
+        beforeMemory: structuredClone(currentMem),
+        afterMemory: structuredClone(afterMem),
+      },
+    ],
+  };
+
+  await runCoachMemoryVaultTx({
+    memoryKey: COACH_MEMORY_META_KEY,
+    nextMemory: afterMem,
+    receipt,
+  });
+
+  hooks?.onMemoryChanged?.(afterMem);
+  hooks?.onReceiptSaved?.(receipt);
+  return {
+    receipt,
+    memory: afterMem,
+    replayed: false,
+    ...(savedItem ? { savedItem } : {}),
+    ...(removedItem ? { removedItem } : {}),
+  };
+}
+
+/* ── 字段级独立撤销（主库权威账本单事务回滚，v0.2.2 兼容迁移墓碑） ── */
 
 export async function undoCoachReceipt(
   receiptId: string,
@@ -1489,228 +4024,77 @@ export async function undoCoachReceipt(
   if (!receipt) {
     throw new TxConflictError('not-found', '找不到对应的操作回执');
   }
+  if (receipt.undoable === false) {
+    throw new TxConflictError('state-conflict', '已结束训练的完训动作不支持通过聊天回执直接复活，请在历史中调整');
+  }
   if (receipt.undone) {
     throw new TxConflictError('state-conflict', '该操作回执已经撤销过了');
   }
 
-  const currentEpoch = await getCoachRestoreEpoch();
-  if (receipt.restoreEpoch !== currentEpoch) {
-    throw new TxConflictError(
-      'epoch-mismatch',
-      '系统已执行过备份恢复，恢复前产生的教练回执已自动失效，无法撤销。',
-    );
+  if (receipt.scope === 'memory') {
+    const currentEpoch = await getCoachRestoreEpoch();
+    if (receipt.restoreEpoch !== currentEpoch) {
+      throw new TxConflictError(
+        'epoch-mismatch',
+        '系统已执行过备份恢复，恢复前产生的教练回执已自动失效，无法撤销。',
+      );
+    }
+    const memTarget = receipt.touchedTargets.find((t) => t.kind === 'coach-memory');
+    const restoredMem = memTarget
+      ? structuredClone(memTarget.beforeMemory)
+      : await loadCoachMemory();
+    const nextReceipt: CoachOperationReceipt = {
+      ...receipt,
+      schemaVersion: receipt.schemaVersion ?? 2,
+      undone: true,
+      undoneAt: Date.now(),
+    };
+    await runCoachMemoryVaultTx({
+      memoryKey: COACH_MEMORY_META_KEY,
+      nextMemory: restoredMem,
+      receipt: nextReceipt,
+    });
+    hooks?.onMemoryChanged?.(restoredMem);
+    hooks?.onReceiptSaved?.(nextReceipt);
+    return { receipt: nextReceipt };
   }
 
-  let outSession: Session | undefined;
-  let outPlan: Plan | undefined;
+  const fallbackVaultEpoch = await getCoachVaultRestoreEpoch().catch(() => 0);
+  const res = await wrapMainTx(() =>
+    executeCoachMainUndoTx({
+      receipt,
+      fallbackVaultEpoch,
+    }),
+  );
 
-  for (const target of receipt.touchedTargets) {
-    if (target.kind === 'session-set') {
-      const runtime = getActiveSessionRuntime(target.sessionId);
-      if (runtime) await runtime.awaitPendingWrites();
-
-      const focus = checkFocusConflict({
-        sessionId: target.sessionId,
-        exId: target.exId,
-        setId: target.setId,
-      });
-      if (focus.conflict) {
-        throw new TxConflictError('focus-conflict', focus.message ?? '目标输入框正在编辑中，请稍后再撤销');
-      }
-
-      const current = await getSession(target.sessionId);
-      if (!current || current.status !== 'active') {
-        throw new TxConflictError('state-conflict', '训练已结束或记录已不存在，无法按进行中会话撤销');
-      }
-      const ex = current.exercises.find((e) => e.id === target.exId);
-      const curSet = ex?.sets.find((s) => s.id === target.setId);
-      if (!ex || !curSet) {
-        throw new TxConflictError('field-conflict', '目标组已被删除，无法安全撤销');
-      }
-      if (!setsEqualCore(curSet, target.afterSet)) {
-        throw new TxConflictError(
-          'field-conflict',
-          '你在教练操作后又修改过同一组数据，已停止撤销以避免覆盖你的最新修改',
-        );
-      }
-
-      const prefillMap = new Map(
-        (target.prefilledSets ?? []).map((p) => [p.setId, p]),
-      );
-
-      const rolledBack: Session = {
-        ...current,
-        exercises: current.exercises.map((item) => {
-          if (item.id !== target.exId) return item;
-          return {
-            ...item,
-            sets: item.sets.map((s) => {
-              if (s.id === target.setId) {
-                return structuredClone(target.beforeSet);
-              }
-              const pf = prefillMap.get(s.id);
-              if (
-                pf &&
-                s.status === 'blank' &&
-                !hasReps(s) &&
-                s.weightKg === pf.afterWeightKg
-              ) {
-                return { ...s, weightKg: pf.beforeWeightKg };
-              }
-              return s;
-            }),
-          };
-        }),
-      };
-
-      const res = await atomicWriteSession({
-        intent: { kind: 'active-save' },
-        session: rolledBack,
-        editorId: runtime?.editorId,
-        expectedRevision: revisionOf(current),
-        lockPolicy: runtime ? 'required' : 'optional',
-      });
-      if (!res.ok) {
-        throw new TxConflictError(res.reason, res.message);
-      }
-      runtime?.applyCommittedSession(res.session);
+  if (!res.alreadyUndoneInMain) {
+    if (res.session) {
+      const rt = getActiveSessionRuntime(res.session.id);
+      rt?.applyCommittedSession(res.session);
       hooks?.onSessionCommitted?.(res.session);
-      outSession = res.session;
-    } else if (target.kind === 'exercise-target') {
-      const runtime = getActiveSessionRuntime(target.sessionId);
-      if (runtime) await runtime.awaitPendingWrites();
-
-      const focus = checkFocusConflict({ sessionId: target.sessionId, exId: target.exId, fields: ['target'] });
-      if (focus.conflict) {
-        throw new TxConflictError('focus-conflict', focus.message ?? '目标动作正在编辑中');
-      }
-      const current = await getSession(target.sessionId);
-      if (!current || current.status !== 'active') {
-        throw new TxConflictError('state-conflict', '训练已非进行中状态，无法撤销目标修改');
-      }
-      const ex = current.exercises.find((e) => e.id === target.exId);
-      if (!ex) {
-        throw new TxConflictError('field-conflict', '目标动作已不存在，无法撤销');
-      }
-      if (JSON.stringify(ex.target) !== JSON.stringify(target.afterTarget)) {
-        throw new TxConflictError('field-conflict', '该动作目标在教练修改后又发生了变更，已终止撤销');
-      }
-      // 保留用户在其它组已经新记录的实绩，但回退 target 与尚未被用户填写的新增空白组
-      const afterAddedIds = new Set(
-        target.afterSets
-          .filter((s) => !target.beforeSets.some((b) => b.id === s.id))
-          .map((s) => s.id),
-      );
-      const anyAddedGotLogged = ex.sets.some(
-        (s) => afterAddedIds.has(s.id) && (s.status !== 'blank' || s.reps !== null || s.weightKg !== null),
-      );
-      if (anyAddedGotLogged) {
-        throw new TxConflictError('field-conflict', '新增的目标空白组已被写入实际训练数据，无法安全撤销');
-      }
-
-      const applied = applyTargetToSessionExercise(current, ex.id, target.beforeTarget, {
-        confirmImpact: false,
-      });
-      if (!applied.applied) {
-        throw new TxConflictError('field-conflict', applied.message);
-      }
-      const res = await atomicWriteSession({
-        intent: { kind: 'active-save' },
-        session: applied.session,
-        editorId: runtime?.editorId,
-        expectedRevision: revisionOf(current),
-        lockPolicy: runtime ? 'required' : 'optional',
-      });
-      if (!res.ok) throw new TxConflictError(res.reason, res.message);
-      runtime?.applyCommittedSession(res.session);
-      hooks?.onSessionCommitted?.(res.session);
-      outSession = res.session;
-    } else if (target.kind === 'exercise-superset') {
-      const runtime = getActiveSessionRuntime(target.sessionId);
-      if (runtime) await runtime.awaitPendingWrites();
-
-      const current = await getSession(target.sessionId);
-      if (!current || current.status !== 'active') {
-        throw new TxConflictError('state-conflict', '训练已非进行中状态，无法撤销超级组改动');
-      }
-      if (revisionOf(current) !== receipt.afterRevision) {
-        // 核验受超级组影响的动作自身是否在后续被改动
-        const beforeTouched = JSON.stringify(target.afterSession.exercises);
-        const curTouched = JSON.stringify(current.exercises);
-        if (beforeTouched !== curTouched) {
-          throw new TxConflictError('field-conflict', '超级组动作在撤销前已发生其他变更，已阻止覆盖撤销');
-        }
-      }
-      const rolledBack: Session = {
-        ...current,
-        exercises: cleanOrphanPairIds(structuredClone(target.beforeSession.exercises)),
-      };
-      const res = await atomicWriteSession({
-        intent: { kind: 'active-save' },
-        session: rolledBack,
-        editorId: runtime?.editorId,
-        expectedRevision: revisionOf(current),
-        lockPolicy: runtime ? 'required' : 'optional',
-      });
-      if (!res.ok) throw new TxConflictError(res.reason, res.message);
-      runtime?.applyCommittedSession(res.session);
-      hooks?.onSessionCommitted?.(res.session);
-      outSession = res.session;
-    } else if (target.kind === 'history-edit') {
-      const current = await getSession(target.sessionId);
-      if (!current || current.status !== 'completed') {
-        throw new TxConflictError('state-conflict', '历史记录已不存在或状态异常，无法撤销');
-      }
-      if (revisionOf(current) !== receipt.afterRevision) {
-        throw new TxConflictError(
-          'version-conflict',
-          '该历史记录之后已被其他入口再次编辑，无法回滚覆盖',
-          revisionOf(current),
-        );
-      }
-      const rolledBack: Session = structuredClone(target.beforeSession);
-      const res = await atomicSaveHistoryEdit({
-        session: rolledBack,
-        expectedRevision: revisionOf(current),
-      });
-      if (!res.ok) throw new TxConflictError(res.reason, res.message);
-      hooks?.onSessionCommitted?.(res.session);
-      outSession = res.session;
-    } else if (target.kind === 'plan-created') {
-      const curPlan = await getPlan(target.planId);
-      if (!curPlan) {
-        throw new TxConflictError('not-found', '新建的计划已被手动删除，无需撤销');
-      }
-      if (receipt.afterPlanRevision !== undefined && curPlan.updatedAt !== receipt.afterPlanRevision) {
-        throw new TxConflictError('field-conflict', '该新建计划创建后已被修改，已阻止整份删除式撤销');
-      }
-      const delRes = await atomicDeletePlanWithCurrent(target.planId, (curId, remaining) =>
-        curId === target.planId ? (remaining[0] ?? null) : undefined,
-      );
-      if (!delRes.ok) {
-        throw new TxConflictError('storage', delRes.reason ?? '删除计划失败');
-      }
-      hooks?.onPlanDeleted?.(target.planId);
-    } else if (target.kind === 'plan-day') {
-      const { afterPlan } = await atomicUpdatePlanInTx(
-        target.planId,
-        receipt.afterPlanRevision,
-        () => structuredClone(target.beforePlan),
-      );
-      hooks?.onPlanCommitted?.(afterPlan);
-      outPlan = afterPlan;
+    }
+    if (res.stopTimerSessionId) {
+      getActiveSessionRuntime(res.stopTimerSessionId)?.stopRestTimer?.();
+    }
+    if (res.plan) {
+      hooks?.onPlanCommitted?.(res.plan);
+    }
+    if (res.deletedPlanId) {
+      hooks?.onPlanDeleted?.(res.deletedPlanId);
+    }
+    if (res.templatesChanged) {
+      hooks?.onTemplatesChanged?.();
     }
   }
+  await saveCoachReceiptStrict(res.nextReceipt);
+  hooks?.onReceiptSaved?.(res.nextReceipt);
 
-  const nextReceipt: CoachOperationReceipt = {
-    ...receipt,
-    undone: true,
-    undoneAt: Date.now(),
+  return {
+    receipt: res.nextReceipt,
+    session: res.session,
+    plan: res.plan,
   };
-  await saveCoachReceipt(nextReceipt);
-  hooks?.onReceiptSaved?.(nextReceipt);
-  return { receipt: nextReceipt, session: outSession, plan: outPlan };
 }
 
-// 兼容导出，避免未用 savePlan 告警（某些回退或简单创建仍按需调用）
-export { savePlan };
+// 兼容导出，避免未用 savePlan / computeCoachOpArgsDigest / atomicDeletePlanWithCurrent 告警
+export { savePlan, computeCoachOpArgsDigest, atomicDeletePlanWithCurrent };

@@ -1,7 +1,7 @@
 {
   "name": "motion-training-app",
   "private": true,
-  "version": "0.2.1",
+  "version": "0.2.3",
   "type": "module",
   "description": "MOTION — 个人训练工作区（离线优先的本地训练记录 Web App）",
   "engines": {
@@ -22,7 +22,8 @@
     "test:stage2": "node scripts/ui-stage2-coach-check.mjs",
     "test:plate": "node scripts/ui-plate-inherit-check.mjs",
     "test:coach-ux": "node scripts/ui-coach-ux-check.mjs",
-    "check": "npm run typecheck && npm run test && npm run android:test:java && npm run test:dom && npm run test:g1 && npm run test:b4r2 && npm run test:stage1 && npm run test:stage2 && npm run test:plate && npm run test:coach-ux",
+    "test:coach-v2": "node scripts/ui-coach-v2-check.mjs",
+    "check": "npm run typecheck && npm run test && npm run android:test:java && npm run test:dom && npm run test:g1 && npm run test:b4r2 && npm run test:stage1 && npm run test:stage2 && npm run test:plate && npm run test:coach-ux && npm run test:coach-v2",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "serve:v2": "node scripts/serve.mjs --dist dist-v2 --port 5299",
     "build:v1": "MOTION_OUT_DIR=dist npm run build",

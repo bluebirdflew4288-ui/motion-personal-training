@@ -324,7 +324,7 @@ describe('电子教练基础体验升级：拉取模型 / 思考深度 / 视频�
 
     await saveCoachMessages(threadMsgs);
     const idbCheck = await new Promise<number>((resolve, reject) => {
-      const req = indexedDB.open(COACH_VAULT_DB_NAME, 1);
+      const req = indexedDB.open(COACH_VAULT_DB_NAME);
       req.onsuccess = () => {
         const db = req.result;
         const ver = db.version;
@@ -333,7 +333,7 @@ describe('电子教练基础体验升级：拉取模型 / 思考深度 / 视频�
       };
       req.onerror = () => reject(req.error);
     });
-    expect(idbCheck).toBe(1);
+    expect(idbCheck).toBe(2);
 
     const backup = await buildBackup(CURRENT_APP_VERSION);
     expect(findV4Contraband(backup)).toEqual([]);

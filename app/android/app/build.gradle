@@ -7,12 +7,11 @@ android {
         applicationId "app.motion.personal"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        // 版本身份：0.1.19 / versionCode 21（折线图去框红点打磨 + Wave 3 全量核心新功能：结束训练同步回原计划、历史纠错全覆盖、渐进超负荷提示与杠铃配片速算、同口径 PR 印章 + 完赛小票本地 PNG 导图 + 月历出勤印章视图）。
-        // 0.1.18（versionCode 19）已完成荣耀真机验收；每个可安装的更新版本必须递增
+        // 版本身份：0.2.3 / versionCode 24（AI 教练确定性事务幂等 + 三协议原生适配 + 三层前缀缓存与真实计费账单）。
         // applicationId 固定为 app.motion.personal，
         // 不因测试版本更换包名（同包名才能覆盖安装并保住 IndexedDB 数据）。
-        versionCode 22
-        versionName "0.2.1"
+        versionCode 24
+        versionName "0.2.3"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.

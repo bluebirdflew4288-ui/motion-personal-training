@@ -19,6 +19,7 @@ import {
   buildGeminiRequest,
   buildOpenAICompatibleRequest,
   streamCoachTurn,
+  type CoachStreamEvent,
   type CoachToolDefinition,
 } from '../src/coach/providerAdapter';
 import { backStack } from '../src/lib/backIntent';
@@ -368,7 +369,7 @@ describe('阶段 1 · 薄窄模型接口（图片多模态 + 工具调用 + 自�
     expect(aborted).toBe(true);
   });
 
-  it('畸形或截断的 tool_call JSON 显式返回 parseError，不静默吞错为 {}', async () => {
+  it('畸形或截断的 tool_call JSON 返回 malformed_tool_call 且整批阻断不放出调用', async () => {
     const badFetch: typeof fetch = async () =>
       sseResponse([
         'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_bad","function":{"name":"extract_plan_draft","arguments":"{\\"planName\\":\\"未闭合"}}]},"finish_reason":"tool_calls"}]}\n\n',
@@ -376,19 +377,22 @@ describe('阶段 1 · 薄窄模型接口（图片多模态 + 工具调用 + 自�
       ]);
 
     const calls = [];
+    let doneEv: Extract<CoachStreamEvent, { type: 'done' }> | undefined;
     for await (const ev of streamCoachTurn(
       { kind: 'openai-compatible', baseUrl: 'https://api.example.com/v1', model: 'demo', fetch: badFetch },
       [{ role: 'user', parts: [{ type: 'text', text: '测试畸形参数' }] }],
       sampleTools,
     )) {
       if (ev.type === 'tool_call') calls.push(ev.call);
+      if (ev.type === 'done') doneEv = ev;
     }
-    expect(calls).toHaveLength(1);
-    expect(calls[0].parseError).toBeTruthy();
-    expect(calls[0].arguments).toEqual({});
+    expect(calls).toHaveLength(0);
+    expect(doneEv?.outcomeKind).toBe('malformed_tool_call');
+    expect(doneEv?.errorMessage).toBeTruthy();
+    expect(doneEv?.toolCalls).toEqual([]);
   });
 
-  it('Gemini 连续多条 role=tool 回传合并到同一个 user turn 的 parts 数组', () => {
+  it('Gemini 连续多条 role=tool 回传合并到同一个 user turn 的 parts 数组并配对服务端 ID', () => {
     const gemReq = buildGeminiRequest(
       { kind: 'gemini', baseUrl: 'https://generativelanguage.googleapis.com/v1beta', model: 'gemini-2.5-flash' },
       [
@@ -413,10 +417,10 @@ describe('阶段 1 · 薄窄模型接口（图片多模态 + 工具调用 + 自�
     expect(body.contents[2].role).toBe('user');
     expect(body.contents[2].parts).toHaveLength(2);
     expect(body.contents[2].parts[0]).toEqual({
-      functionResponse: { name: 'tool_a', response: { result: '{"a":1}' } },
+      functionResponse: { id: 'c1', name: 'tool_a', response: { result: '{"a":1}' } },
     });
     expect(body.contents[2].parts[1]).toEqual({
-      functionResponse: { name: 'tool_b', response: { result: '{"b":2}' } },
+      functionResponse: { id: 'c2', name: 'tool_b', response: { result: '{"b":2}' } },
     });
   });
 

@@ -23,6 +23,16 @@ import {
   saveRestTimerSnapshot,
   type RestTimerSource,
 } from '../lib/restTimerSnapshot';
+import {
+  clearDurableRestTimer,
+  clearDurableRestTimerIfMatches,
+  loadDurableRestTimer,
+  reconcileRestTimerRecovery,
+  saveDurableRestTimer,
+  syncLoadDurableRestTimerLs,
+  type DurableRestTimerRecord,
+} from '../lib/restTimerDurable';
+import { readMainRestoreEpoch } from '../db/idb';
 
 export interface RestTimerApi {
   /** 当前是否在计时（含暂停态） */
@@ -52,7 +62,16 @@ export interface RestTimerApi {
    * 避免刚点暂停（请求在途）就闪错误。
    */
   cancelFailed: boolean;
-  start: (sec: number, source?: RestTimerSource) => void;
+  start: (
+    sec: number,
+    source?: RestTimerSource,
+    opts?: {
+      token?: string;
+      deadlineAtMs?: number;
+      coachOperationId?: string;
+      restoreEpoch?: number;
+    },
+  ) => void;
   pause: () => void;
   resume: () => void;
   adjust: (deltaSec: number) => void;
@@ -100,6 +119,10 @@ export function useRestTimer(
   sessionRef.current = sessionId;
   const hasSourceRef = useRef(hasSource);
   hasSourceRef.current = hasSource;
+  const nativeScheduledRef = useRef<boolean>(false);
+  const restoreEpochRef = useRef<number>(0);
+  const coachOperationIdRef = useRef<string | undefined>(undefined);
+  const userActionSeqRef = useRef<number>(0);
 
   /**
    * 排程协调器：负责异步响应的归属、迟到补偿与代次提交（REVIEW-1 #2）。
@@ -156,6 +179,7 @@ export function useRestTimer(
        * 若此刻已暂停，就保持 paused（不能回写成 running）。
        */
       genRef.current = generation;
+      nativeScheduledRef.current = true;
       saveRestTimerSnapshot({
         sessionId: sid,
         token: committedToken,
@@ -165,6 +189,21 @@ export function useRestTimer(
         endsAt: live.status === 'running' ? live.endsAt : null,
         pausedRemaining: live.status === 'paused' ? live.pausedRemaining : null,
         status: live.status,
+      });
+      void saveDurableRestTimer({
+        v: 1,
+        sessionId: sid,
+        token: committedToken,
+        source: sourceRef.current,
+        generation,
+        intentWatermark: intentSeqRef.current,
+        endsAt: live.status === 'running' ? live.endsAt : null,
+        pausedRemaining: live.status === 'paused' ? live.pausedRemaining : null,
+        status: live.status,
+        savedAt: Date.now(),
+        restoreEpoch: restoreEpochRef.current,
+        ...(coachOperationIdRef.current ? { coachOperationId: coachOperationIdRef.current } : {}),
+        nativeScheduled: true,
       });
     },
     [],
@@ -240,7 +279,10 @@ export function useRestTimer(
     status: 'running' | 'paused';
     endsAt: number | null;
     pausedRemaining: number | null;
-  }) => {
+  }, opts?: { fromMountRestore?: boolean }) => {
+    if (!opts?.fromMountRestore) {
+      userActionSeqRef.current += 1;
+    }
     // 先更新实时镜像（ack 回写要用它判断此刻真实状态）
     liveStateRef.current = {
       token: snap.token,
@@ -252,7 +294,10 @@ export function useRestTimer(
     if (!sid) return;
     if (!snap.token) {
       lastPersistRef.current = null;
+      nativeScheduledRef.current = false;
+      coachOperationIdRef.current = undefined;
       clearRestTimerSnapshot(sid);
+      void clearDurableRestTimer(sid);
       return;
     }
     lastPersistRef.current = {
@@ -278,48 +323,81 @@ export function useRestTimer(
       pausedRemaining: snap.pausedRemaining,
       status: snap.status,
     });
+    void saveDurableRestTimer({
+      v: 1,
+      sessionId: sid,
+      token: snap.token,
+      source: sourceRef.current,
+      generation: controller.snapshot.generation,
+      intentWatermark: intentSeqRef.current,
+      endsAt: snap.endsAt,
+      pausedRemaining: snap.pausedRemaining,
+      status: snap.status,
+      savedAt: Date.now(),
+      restoreEpoch: restoreEpochRef.current,
+      ...(coachOperationIdRef.current ? { coachOperationId: coachOperationIdRef.current } : {}),
+      nativeScheduled: nativeScheduledRef.current,
+    });
   }, [controller]);
 
-  const start = useCallback((sec?: number, nextSource?: RestTimerSource) => {
-    sourceRef.current = nextSource ?? null;
-    setSource(nextSource ?? null);
-    pendingOriginRef.current = 'user-start';
-    const nextToken = newRestToken();
-    const ms = Math.max(0, (sec ?? defaultRef.current) * 1000);
-    /**
-     * B4-R2：**用户点击这一刻**就定下绝对目标截止，并交给原生。
-     * UI 与原生从此共享同一个截止真源，排队耗时不再变成额外休息。
-     */
-    const clickNow = Date.now();
-    const targetDeadline = clickNow + ms;
-    tokenRef.current = nextToken;
-    setToken(nextToken);
-    setPausedRemaining(null);
+  const start = useCallback(
+    (
+      sec?: number,
+      nextSource?: RestTimerSource,
+      opts?: {
+        token?: string;
+        deadlineAtMs?: number;
+        coachOperationId?: string;
+        restoreEpoch?: number;
+      },
+    ) => {
+      sourceRef.current = nextSource ?? null;
+      setSource(nextSource ?? null);
+      pendingOriginRef.current = 'user-start';
+      const nextToken = opts?.token || newRestToken();
+      const clickNow = Date.now();
+      const targetDeadline =
+        typeof opts?.deadlineAtMs === 'number' && Number.isFinite(opts.deadlineAtMs)
+          ? opts.deadlineAtMs
+          : clickNow + Math.max(0, (sec ?? defaultRef.current) * 1000);
+      const ms =
+        opts?.deadlineAtMs !== undefined
+          ? Math.max(0, targetDeadline - clickNow)
+          : Math.max(0, (sec ?? defaultRef.current) * 1000);
+      nativeScheduledRef.current = false;
+      coachOperationIdRef.current = opts?.coachOperationId;
+      if (typeof opts?.restoreEpoch === 'number' && Number.isFinite(opts.restoreEpoch)) {
+        restoreEpochRef.current = opts.restoreEpoch;
+      } else {
+        void readMainRestoreEpoch().then((ep) => {
+          if (ep !== null && tokenRef.current === nextToken) restoreEpochRef.current = ep;
+        });
+      }
+      tokenRef.current = nextToken;
+      setToken(nextToken);
+      setPausedRemaining(null);
 
-    /**
-     * REVIEW-1 #2：交给协调器处理异步归属。
-     * ms<=0（start(0) 跳过）时协调器会取消旧提醒而不排新的 ——
-     * 旧实现直接不排程、也不取消 A，导致旧提醒仍响。
-     */
-    controller.arm(nextToken, ms, targetDeadline, ms > 0 ? nextIntentId() : 0);
+      controller.arm(nextToken, ms, targetDeadline, ms > 0 ? nextIntentId() : 0);
 
-    if (ms <= 0) {
-      // 归零：UI 上不显示计时
-      setEndsAt(null);
-      tokenRef.current = null;
-      setToken(null);
-      genRef.current = 0;
-      sourceRef.current = null;
-      setSource(null);
-      persist({ token: null, status: 'running', endsAt: null, pausedRemaining: null });
-      return;
-    }
+      if (ms <= 0) {
+        // 归零：UI 上不显示计时
+        setEndsAt(null);
+        tokenRef.current = null;
+        setToken(null);
+        genRef.current = 0;
+        sourceRef.current = null;
+        setSource(null);
+        persist({ token: null, status: 'running', endsAt: null, pausedRemaining: null });
+        return;
+      }
 
-    // 与交给原生的 deadline 用**同一个** clickNow，UI 与原生不产生分叉
-    const nextEndsAt = targetDeadline;
-    setEndsAt(nextEndsAt);
-    persist({ token: nextToken, status: 'running', endsAt: nextEndsAt, pausedRemaining: null });
-  }, [controller, persist]);
+      // 与交给原生的 deadline 用**同一个** targetDeadline，UI 与原生不产生分叉
+      const nextEndsAt = targetDeadline;
+      setEndsAt(nextEndsAt);
+      persist({ token: nextToken, status: 'running', endsAt: nextEndsAt, pausedRemaining: null });
+    },
+    [controller, persist],
+  );
 
   const pause = useCallback(() => {
     const prev = liveStateRef.current.endsAt;
@@ -524,10 +602,15 @@ export function useRestTimer(
      * 现在：仅当「同 sessionId 且 controller 仍持有当前意图」时才跳过；
      * 否则继续走下面的恢复/接管逻辑（幂等，不会重复排程）。
      */
+    let cancelled = false;
+    const mountActionSeq = userActionSeqRef.current;
+    const cleanup = () => {
+      cancelled = true;
+    };
     const sameSession = boundSessionRef.current === sid;
     const controllerHoldsIntent =
       controller.snapshot.active && controller.snapshot.token === tokenRef.current;
-    if (sameSession && controllerHoldsIntent) return;
+    if (sameSession && controllerHoldsIntent) return cleanup;
     const prevSid = boundSessionRef.current;
     boundSessionRef.current = sid;
 
@@ -550,15 +633,208 @@ export function useRestTimer(
       // 旧实例的原生提醒不应由新实例的控制器持有（只清内存归属，不碰原生与旧快照）
       controller.reset();
     }
-    if (!sid) return;
-    const snap = loadRestTimerSnapshot(sid);
-    const decision = decideRestore(snap);
-    if (decision.kind === 'none') return;
-    if (decision.kind === 'expired') {
-      clearRestTimerSnapshot(sid);
-      return;
+    if (!sid) return cleanup;
+    const syncDurableFallback = (): DurableRestTimerRecord | null => syncLoadDurableRestTimerLs(sid);
+    const durableFromLs = syncDurableFallback();
+    const snap =
+      loadRestTimerSnapshot(sid) ??
+      (durableFromLs
+        ? {
+            v: 1 as const,
+            sessionId: durableFromLs.sessionId,
+            token: durableFromLs.token,
+            generation: durableFromLs.generation,
+            source: durableFromLs.source,
+            endsAt: durableFromLs.endsAt,
+            pausedRemaining: durableFromLs.pausedRemaining,
+            status: durableFromLs.status,
+            intentWatermark: durableFromLs.intentWatermark,
+            savedAt: durableFromLs.savedAt,
+          }
+        : null);
+    if (durableFromLs) {
+      restoreEpochRef.current = durableFromLs.restoreEpoch;
+      coachOperationIdRef.current = durableFromLs.coachOperationId;
+      nativeScheduledRef.current = durableFromLs.nativeScheduled ?? durableFromLs.generation !== null;
     }
-    if (!snap) return;
+
+    const restoreFromDurableAsync = async () => {
+      try {
+        const [durableRec, mainEpoch, nativeInfo] = await Promise.all([
+          loadDurableRestTimer(sid),
+          readMainRestoreEpoch(),
+          getActiveRest().catch(() => null),
+        ]);
+        if (
+          cancelled ||
+          controller.isDisposed ||
+          sessionRef.current !== sid ||
+          userActionSeqRef.current !== mountActionSeq
+        ) {
+          return;
+        }
+        const recovery = reconcileRestTimerRecovery({
+          record: durableRec,
+          nativeActive: nativeInfo
+            ? {
+                ...nativeInfo,
+                token: nativeInfo.token ?? undefined,
+              }
+            : null,
+          currentRestoreEpoch: mainEpoch ?? undefined,
+        });
+        if (recovery.kind === 'stale-epoch' || recovery.kind === 'expired') {
+          if (durableRec && tokenRef.current === durableRec.token) {
+            tokenRef.current = null;
+            setToken(null);
+            setEndsAt(null);
+            setPausedRemaining(null);
+            sourceRef.current = null;
+            setSource(null);
+            liveStateRef.current = { token: null, status: 'running', endsAt: null, pausedRemaining: null };
+          }
+          if (durableRec) {
+            const snapCur = loadRestTimerSnapshot(sid);
+            if (!snapCur || snapCur.token === durableRec.token) {
+              clearRestTimerSnapshot(sid);
+            }
+            if (
+              nativeInfo?.active &&
+              nativeInfo.token === durableRec.token &&
+              typeof (nativeInfo.generation ?? durableRec.generation) === 'number'
+            ) {
+              void cancelRestReminder({
+                token: durableRec.token,
+                generation: nativeInfo.generation ?? durableRec.generation ?? 0,
+              }).catch(() => {});
+            }
+            await clearDurableRestTimerIfMatches(sid, {
+              token: durableRec.token,
+              restoreEpoch: durableRec.restoreEpoch,
+            });
+          }
+          return;
+        }
+        if (recovery.kind === 'none') return;
+        if (tokenRef.current !== null && tokenRef.current !== recovery.record.token) return;
+        const checkSrc = hasSourceRef.current;
+        if (recovery.record.source && checkSrc && !checkSrc(recovery.record.source)) {
+          await clearDurableRestTimerIfMatches(sid, {
+            token: recovery.record.token,
+            restoreEpoch: recovery.record.restoreEpoch,
+          });
+          return;
+        }
+        if (tokenRef.current === null) {
+          tokenRef.current = recovery.record.token;
+          setToken(recovery.record.token);
+          sourceRef.current = recovery.record.source;
+          setSource(recovery.record.source);
+          genRef.current = recovery.record.generation ?? 0;
+          restoreEpochRef.current = recovery.record.restoreEpoch;
+          coachOperationIdRef.current = recovery.record.coachOperationId;
+          nativeScheduledRef.current = recovery.record.nativeScheduled ?? false;
+          if (recovery.kind === 'restore-paused') {
+            liveStateRef.current = {
+              token: recovery.record.token,
+              status: 'paused',
+              endsAt: null,
+              pausedRemaining: recovery.pausedRemaining,
+            };
+            controller.adopt(recovery.record.token, recovery.record.generation);
+            setEndsAt(null);
+            setPausedRemaining(recovery.pausedRemaining);
+            persist(
+              {
+                token: recovery.record.token,
+                status: 'paused',
+                endsAt: null,
+                pausedRemaining: recovery.pausedRemaining,
+              },
+              { fromMountRestore: true },
+            );
+          } else if (recovery.kind === 'schedule-pending-native') {
+            liveStateRef.current = {
+              token: recovery.record.token,
+              status: 'running',
+              endsAt: recovery.endsAt,
+              pausedRemaining: null,
+            };
+            pendingOriginRef.current = 'snapshot-restore';
+            controller.arm(recovery.record.token, recovery.remainingMs, recovery.endsAt, nextIntentId());
+            setEndsAt(recovery.endsAt);
+            setPausedRemaining(null);
+            persist(
+              {
+                token: recovery.record.token,
+                status: 'running',
+                endsAt: recovery.endsAt,
+                pausedRemaining: null,
+              },
+              { fromMountRestore: true },
+            );
+          } else if (recovery.kind === 'adopt-native' || recovery.kind === 'restore-running') {
+            liveStateRef.current = {
+              token: recovery.record.token,
+              status: 'running',
+              endsAt: recovery.endsAt,
+              pausedRemaining: null,
+            };
+            pendingOriginRef.current = 'snapshot-restore';
+            controller.adopt(
+              recovery.record.token,
+              recovery.kind === 'adopt-native' ? recovery.generation : recovery.record.generation,
+            );
+            setEndsAt(recovery.endsAt);
+            setPausedRemaining(null);
+            persist(
+              {
+                token: recovery.record.token,
+                status: 'running',
+                endsAt: recovery.endsAt,
+                pausedRemaining: null,
+              },
+              { fromMountRestore: true },
+            );
+          }
+        }
+      } catch {
+        /* fallback safely */
+      }
+    };
+
+    const decision = decideRestore(snap);
+    if (decision.kind === 'none') {
+      void restoreFromDurableAsync();
+      return () => {
+        cancelled = true;
+      };
+    }
+    if (decision.kind === 'expired') {
+      const expiredToken = snap?.token;
+      clearRestTimerSnapshot(sid);
+      void clearDurableRestTimerIfMatches(sid, {
+        token: expiredToken,
+      }).finally(() => {
+        if (
+          !cancelled &&
+          !controller.isDisposed &&
+          sessionRef.current === sid &&
+          userActionSeqRef.current === mountActionSeq
+        ) {
+          void restoreFromDurableAsync();
+        }
+      });
+      return () => {
+        cancelled = true;
+      };
+    }
+    if (!snap) {
+      return () => {
+        cancelled = true;
+      };
+    }
+    void restoreFromDurableAsync();
     /**
      * G3A2：已知 source 但目标已不存在 → 精确清理，不恢复幽灵计时。
      * 旧快照 source 缺失（unknown）保持原兼容策略：照常恢复，由 UI 提示归属未知。
@@ -599,7 +875,7 @@ export function useRestTimer(
       setSource(null);
       liveStateRef.current = { token: null, status: 'running', endsAt: null, pausedRemaining: null };
       void Promise.resolve().then(bumpCancelDuty);
-      return;
+      return cleanup;
     }
 
     tokenRef.current = snap.token;
@@ -700,12 +976,15 @@ export function useRestTimer(
           if (r.generation !== null) {
             genRef.current = r.generation;
             // 用核实到的真实代次回写快照，后续 pause 才能按身份取消
-            persist({
-              token: snap.token,
-              status: 'running',
-              endsAt: decision.endsAt,
-              pausedRemaining: null,
-            });
+            persist(
+              {
+                token: snap.token,
+                status: 'running',
+                endsAt: decision.endsAt,
+                pausedRemaining: null,
+              },
+              { fromMountRestore: true },
+            );
             return;
           }
           /**
@@ -720,7 +999,10 @@ export function useRestTimer(
             genRef.current = 0;
             liveStateRef.current = { token: null, status: 'running', endsAt: null, pausedRemaining: null };
             const sidNow = sessionRef.current;
-            if (sidNow) clearRestTimerSnapshot(sidNow);
+            if (sidNow) {
+              clearRestTimerSnapshot(sidNow);
+              void clearDurableRestTimer(sidNow);
+            }
           }
         });
       } else {
@@ -731,38 +1013,32 @@ export function useRestTimer(
       setEndsAt(decision.endsAt);
       setPausedRemaining(null);
       if (!needVerify) {
-        persist({
-          token: snap.token,
-          status: 'running',
-          endsAt: decision.endsAt,
-          pausedRemaining: null,
-        });
+        persist(
+          {
+            token: snap.token,
+            status: 'running',
+            endsAt: decision.endsAt,
+            pausedRemaining: null,
+          },
+          { fromMountRestore: true },
+        );
         void reconcileUserCancel();
       }
-      return;
+      return cleanup;
     }
-    /**
-     * paused 恢复（REVIEW-4 #2）。
-     *
-     * **暂停时原生本来就应该没有 active 提醒**（pause 已经按身份取消过），
-     * 因此绝不能拿 "原生 active=false" 当作"暂停状态已失效"的证据 ——
-     * 那会把合法的暂停余量清空，导致 resume 无从继续（原 9 项已过行为的回归）。
-     *
-     * 正确做法：
-     *   · 暂停快照**直接恢复余量**，不需要向原生核对；
-     *   · 只有用户点「继续」时才重新排程（resume 内部会 arm）；
-     *   · 也不在这里做任何取消（暂停状态下没有需要取消的原生提醒）。
-     * 未知身份的**running** 恢复仍然要核实（见上面的 resume-running 分支）。
-     */
     controller.adopt(snap.token, snap.generation);
     setEndsAt(null);
     setPausedRemaining(decision.pausedRemaining);
-    persist({
-      token: snap.token,
-      status: 'paused',
-      endsAt: null,
-      pausedRemaining: decision.pausedRemaining,
-    });
+    persist(
+      {
+        token: snap.token,
+        status: 'paused',
+        endsAt: null,
+        pausedRemaining: decision.pausedRemaining,
+      },
+      { fromMountRestore: true },
+    );
+    return cleanup;
     // sessionId 必须进依赖：否则 prop 从 A 变 B 时 effect 不重跑，
     // 会继续显示 A 的计时（REVIEW-2 收尾 P2 的真实失败原因）
   }, [controller, persist, reconcileUserCancel, sessionId]);

@@ -7,6 +7,7 @@ import android.webkit.WebView;
 import com.getcapacitor.Bridge;
 import com.getcapacitor.BridgeActivity;
 
+import app.motion.personal.plugins.CoachStreamPlugin;
 import app.motion.personal.plugins.NativeFileBridgePlugin;
 import app.motion.personal.plugins.RestReminderPlugin;
 import app.motion.personal.plugins.DeletionFeedbackPlugin;
@@ -16,7 +17,7 @@ import app.motion.personal.plugins.DeletionFeedbackPlugin;
  *
  * <p>职责：
  * <ol>
- *   <li>注册本地插件 {@link NativeFileBridgePlugin}、{@link RestReminderPlugin}、{@link DeletionFeedbackPlugin}。</li>
+ *   <li>注册本地插件 {@link NativeFileBridgePlugin}、{@link RestReminderPlugin}、{@link DeletionFeedbackPlugin}、{@link CoachStreamPlugin}。</li>
  *   <li>保持 WebView 硬件加速与默认 InputConnection（不做 captureInput，保证中文 IME 组合输入正常）。</li>
  *   <li>配合 {@link MotionWebView} 为非输入展示区提供 Activity 级 ActionMode 二次兜底。</li>
  * </ol>
@@ -33,6 +34,8 @@ public class MainActivity extends BridgeActivity {
         registerPlugin(RestReminderPlugin.class);
         // F11: 独立删除反馈插件
         registerPlugin(DeletionFeedbackPlugin.class);
+        // 0.2.2：电子教练切后台保活原生流式请求桥
+        registerPlugin(CoachStreamPlugin.class);
         super.onCreate(savedInstanceState);
     }
 

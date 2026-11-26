@@ -37,6 +37,8 @@ const SOURCES = [
   join(PLUGIN_DIR, 'DeleteFeedbackPolicy.java'),
   // G04：WebView 非输入区选词菜单/长按/原生拖拽门禁纯策略判定
   join(PLUGIN_DIR, 'WebViewSelectionPolicy.java'),
+  // 0.2.2：电子教练后台保活流式缓冲、校验与引用计数纯策略
+  join(PLUGIN_DIR, 'CoachStreamPolicy.java'),
 ];
 // 类全名（ExportSpoolTest 放在与插件相同的包里，才能访问包级测试钩子）
 const TESTS = ['BackupIoTest', 'app.motion.personal.plugins.ExportSpoolTest', 'app.motion.personal.plugins.ExportPhaseTest', 'app.motion.personal.plugins.ExportOriginalBindingTest', 'app.motion.personal.plugins.RestArgsTest', 'app.motion.personal.plugins.RestStateTest', 'app.motion.personal.plugins.RestGateTest', 'app.motion.personal.plugins.RestCallArgsTest',
@@ -73,7 +75,11 @@ const TESTS = ['BackupIoTest', 'app.motion.personal.plugins.ExportSpoolTest', 'a
   // G04：WebView 非输入区选词/长按/拖拽门禁纯策略矩阵
   'app.motion.personal.plugins.WebViewSelectionPolicyTest',
   // Wave 1B.2：持续通知栏取消与页面前后台对账纯状态机矩阵
-  'app.motion.personal.plugins.RestUserCancelReconcileTest'];
+  'app.motion.personal.plugins.RestUserCancelReconcileTest',
+  // 0.2.2：电子教练后台保活网络策略与断点续传缓冲测试
+  'app.motion.personal.plugins.CoachStreamPolicyTest',
+  // 0.2.3：教练记组触发休息计时的原生身份门禁与替换测试
+  'app.motion.personal.plugins.RestCoachTimerIdentityTest'];
 
 for (const s of SOURCES) {
   if (!existsSync(s)) {

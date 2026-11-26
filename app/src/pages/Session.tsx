@@ -476,7 +476,7 @@ export function SessionPage({
           awaitPendingWrites: async () => { sealPendingWrites(); await saveQueue.current; },
           applyCommittedSession: applyExternalSessionCommit,
           hasBlockingDrafts: () => hasPendingDraft || unsavedDraftRef.current !== null || rawRiskRef.current.size > 0,
-          startRestTimer: (sec, src) => timerLiveRef.current.start(sec, src),
+          startRestTimer: (sec, src) => timerLiveRef.current.start(sec, src), startRestTimerWithDirective: (d) => timerLiveRef.current.start(d.restSec, d.source, { token: d.token, deadlineAtMs: d.deadlineAtMs, coachOperationId: d.operationId, restoreEpoch: d.restoreEpoch }), stopRestTimer: () => timerLiveRef.current.stop(),
           listRawRiskEntries: (exId) =>
             [...(rawRiskRef.current.get(exId) ?? [])]
               .map((fid) => parseRawRiskField(exId, fid, session.id))

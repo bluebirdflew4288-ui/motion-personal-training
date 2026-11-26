@@ -6,6 +6,7 @@
 
 import { useEffect, useRef } from 'react';
 import type { Session } from '../domain/types';
+import type { CoachRestTimerDirective } from '../lib/restTimerDurable';
 import { setRuntimeDirtyInspector, type CoachEditableField, type FocusEntry } from './focusGuard';
 
 export interface ActiveSessionRuntime {
@@ -15,6 +16,8 @@ export interface ActiveSessionRuntime {
   applyCommittedSession: (committed: Session) => void;
   hasBlockingDrafts: () => boolean;
   startRestTimer: (sec: number, source: { sessionExerciseId: string; setId?: string }) => void;
+  startRestTimerWithDirective?: (directive: CoachRestTimerDirective) => void;
+  stopRestTimer?: () => void;
   listRawRiskEntries?: (exId: string) => FocusEntry[];
 }
 
@@ -78,6 +81,9 @@ export function useSessionRuntimeRegistration(runtime: ActiveSessionRuntime | nu
       applyCommittedSession: (committed) => runtimeRef.current?.applyCommittedSession(committed),
       hasBlockingDrafts: () => runtimeRef.current?.hasBlockingDrafts() ?? false,
       startRestTimer: (sec, source) => runtimeRef.current?.startRestTimer(sec, source),
+      startRestTimerWithDirective: (directive) =>
+        runtimeRef.current?.startRestTimerWithDirective?.(directive),
+      stopRestTimer: () => runtimeRef.current?.stopRestTimer?.(),
       listRawRiskEntries: (exId) => runtimeRef.current?.listRawRiskEntries?.(exId) ?? [],
     };
     registerSessionRuntime(wrapper);

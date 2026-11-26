@@ -996,6 +996,9 @@ export function useSessionPersistence({
 
   const applyExternalSessionCommit = useCallback(
     (committed: Session) => {
+      if (committed.status !== 'active') {
+        intentionallyClosed.current = true;
+      }
       confirmedRevision.current = revisionOf(committed);
       baseSessionRef.current = committed;
       latestRef.current = committed;

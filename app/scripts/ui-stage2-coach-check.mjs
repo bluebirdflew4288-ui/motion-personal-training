@@ -312,7 +312,7 @@ async function main() {
         };
         openReq.onerror = () => reject(openReq.error);
       });
-      const vaultReq = indexedDB.open('motion-coach-vault', 1);
+      const vaultReq = indexedDB.open('motion-coach-vault');
       const vaultData = await new Promise((resolve, reject) => {
         vaultReq.onsuccess = () => {
           const db = vaultReq.result;

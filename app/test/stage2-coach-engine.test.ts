@@ -651,7 +651,7 @@ describe('阶段 2 · 电子教练业务工具、并发事务与字段级独立�
     expect(!wrongFin.ok && wrongFin.reason).toBe('state-conflict');
   });
 
-  it('冷启动第 41 条之外跨历史查询自动触发 ensureFullHistory + 只读范围不越权写热身/有氧/档位', async () => {
+  it('冷启动第 41 条之外跨历史查询自动触发 ensureFullHistory + 热身/器械档位备忘已解锁读写与撤销', async () => {
     const plan = createV32Plan(NOW);
     await savePlan(plan);
 
@@ -690,22 +690,36 @@ describe('阶段 2 · 电子教练业务工具、并发事务与字段级独立�
     expect(ensureFullHistory).toHaveBeenCalledTimes(2);
     expect(queryReply.text).toContain('45');
 
-    // 只读范围：要求改热身 / 器械档位备忘 → 诚实拒改且不生成写回执
+    // 已解锁：调整进行中热身目标 + 改器械档位备忘，并支持独立撤销还原
     const { session: actSess } = await seedPlanAndActiveSession({ sessionId: 'sess-ro-1', mountRuntime: true });
-    const roTurn = await runCoachTurn({
-      userText: '帮我把今天的热身肩袖改为 3 组，并把器械档位备忘改成第 5 格',
+    const warmupTurn = await runCoachTurn({
+      userText: '把肩袖热身改为 3 组',
       history: [],
       toolContext: { activeSession: actSess },
       streamChunkDelayMs: 0,
     });
-    expect(roTurn.receipts.length).toBe(0);
-    expect(roTurn.text).toContain('只读');
+    expect(warmupTurn.receipts.length).toBe(1);
+    expect((await getSession('sess-ro-1'))!.warmups[0].targetText).toBe('3组');
+    await undoCoachReceipt(warmupTurn.receipts[0].id);
+    expect((await getSession('sess-ro-1'))!.warmups[0].targetText).toBe('2 × 15');
+
+    const latestAct = (await getSession('sess-ro-1'))!;
+    const firstExName = latestAct.exercises[0].name;
+    const setupTurn = await runCoachTurn({
+      userText: `把${firstExName}的器械档位备忘改成座椅第 5 格`,
+      history: [],
+      toolContext: { activeSession: latestAct },
+      streamChunkDelayMs: 0,
+    });
+    expect(setupTurn.receipts.length).toBe(1);
+    expect((await getSession('sess-ro-1'))!.exercises[0].setupNote).toBe('座椅第 5 格');
+    await undoCoachReceipt(setupTurn.receipts[0].id);
     expect((await getSession('sess-ro-1'))!.exercises[0].setupNote).toBe('座椅第 4 格，保护杆第 2 孔');
 
-    // 通过底层 executeCoachToolCall 也不存在任何未注册写工具
+    // 未注册的工具名仍严格拒绝
     const unknownOutcome = await executeCoachToolCall(
-      { id: 'c-bad', name: 'mutate_setup_note', argumentsText: '{}', arguments: {} },
-      { activeSession: actSess },
+      { id: 'c-bad', name: 'unknown_nonexistent_tool', argumentsText: '{}', arguments: {} },
+      { activeSession: (await getSession('sess-ro-1'))! },
     );
     expect(unknownOutcome.ok).toBe(false);
   });

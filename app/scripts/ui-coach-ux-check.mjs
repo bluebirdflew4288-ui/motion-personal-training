@@ -49,6 +49,14 @@ async function setReactInput(page, selector, val) {
 
 async function sendText(page, text) {
   await setReactInput(page, SEL('coach-input'), text);
+  await page.waitForFunction(
+    (sel) => {
+      const btn = document.querySelector(sel);
+      return Boolean(btn && !btn.disabled);
+    },
+    { timeout: 10000 },
+    SEL('coach-send-btn'),
+  );
   await page.click(SEL('coach-send-btn'));
   await page.waitForFunction(
     () => !document.querySelector('[data-testid="coach-cancel-stream-btn"]'),
@@ -109,6 +117,9 @@ async function main() {
             : '';
       if (body.tools?.length && typeof lastUser?.content === 'string' && lastUser.content === '延迟回复测试') {
         await sleep(2000);
+      }
+      if (body.tools?.length && typeof lastUser?.content === 'string' && lastUser.content.includes('晚到回调测试')) {
+        await sleep(850);
       }
       const contentText = typeof lastUser?.content === 'string' ? lastUser.content :
         lastUser?.content?.find?.((part) => part.type === 'text')?.text ?? '';
@@ -190,13 +201,48 @@ async function main() {
     await page.goto(appUrl, { waitUntil: 'load' });
     await page.waitForSelector(SEL('coach-header-btn'));
 
-    // 1. 打开教练小窗并打开设置，验证「获取模型」拉取与搜索勾选
+    const inspectVault = () =>
+      page.evaluate(
+        () =>
+          new Promise((resolve, reject) => {
+            const req = indexedDB.open('motion-coach-vault');
+            req.onerror = () => reject(req.error);
+            req.onsuccess = () => {
+              const db = req.result;
+              const tx = db.transaction(['meta', 'messages'], 'readonly');
+              const metaReq = tx.objectStore('meta').get('threads');
+              const msgReq = tx.objectStore('messages').getAll();
+              tx.oncomplete = () => {
+                db.close();
+                resolve({
+                  threadsState: metaReq.result?.value ?? null,
+                  messages: msgReq.result ?? [],
+                });
+              };
+              tx.onerror = () => {
+                db.close();
+                reject(tx.error);
+              };
+            };
+          }),
+      );
+
+    // 1. 打开教练小窗验证小窗铅笔入口打开单空白草稿且不建空历史，再切主屏验证示例与配置模型
     await page.click(SEL('coach-header-btn'));
     await page.waitForSelector(`${SEL('coach-pane')}[data-pane-role="mini"]`);
+    await page.click(SEL('coach-mini-new-thread-btn'));
+    await page.waitForSelector(SEL('coach-thread-empty'));
+    const miniDraftVault = await inspectVault();
+    const miniDraftCountOk = !miniDraftVault.threadsState || miniDraftVault.threadsState.threads.length <= 1;
     // 点顶部栏互换切到主屏再测（小窗/主屏都能设）
     await page.click(SEL('coach-drag-handle'));
     await page.waitForSelector(SEL('floating-swap-btn'));
     await page.click(SEL('floating-swap-btn'));
+    await page.click(SEL('coach-threads-btn'));
+    await page.waitForSelector(SEL('coach-threads-panel'));
+    await page.click(SEL('coach-thread-item-default'));
+    await page.waitForSelector(SEL('coach-examples-btn'));
+    const hasDefaultExamplesBtn = Boolean(await page.$(SEL('coach-examples-btn')));
     await page.click(SEL('coach-status-model-pill'));
     await page.click(SEL('coach-open-settings-from-plus'));
     await page.waitForSelector(SEL('coach-settings-panel'));
@@ -281,7 +327,100 @@ async function main() {
       JSON.stringify({ switchedModelPill, pendingVideoText, reqModel: lastReq?.model, hasVideoUrlPart }),
     );
 
-    // 5. 「新开对话」空白隔离 + 多轮后「压缩早期上下文」
+    // 5. #7 单空白草稿：连点铅笔不清空、列表不占行、切换旧会话再点铅笔保留草稿+视频、刷新无空历史
+    await page.click(SEL('coach-new-thread-btn'));
+    await page.waitForSelector(SEL('coach-thread-empty'));
+    await setReactInput(page, SEL('coach-input'), '草稿保留文本');
+    const draftVid = await page.$(SEL('coach-video-input'));
+    await draftVid.uploadFile(videoPath);
+    await page.waitForSelector(SEL('coach-pending-attachment'));
+    await page.click(SEL('coach-new-thread-btn'));
+    await page.click(SEL('coach-new-thread-btn'));
+    const afterRepeatedPencilText = await page.$eval(SEL('coach-input'), (el) => el.value);
+    const afterRepeatedPencilVid = await page.$eval(SEL('coach-pending-attachment'), (el) => el.textContent ?? '');
+
+    await page.click(SEL('coach-threads-btn'));
+    await page.waitForSelector(SEL('coach-threads-panel'));
+    const drawerRowsDuringDraft = await page.$$eval('[data-testid^="coach-thread-item-"]', (els) =>
+      els.map((el) => el.dataset.testid),
+    );
+    const vaultDuringDraft = await inspectVault();
+    await page.click(SEL('coach-thread-item-default'));
+    await page.waitForFunction(() => document.querySelector('.coach-messages')?.textContent.includes('卧推容量'));
+    await page.click(SEL('coach-new-thread-btn'));
+    await page.waitForSelector(SEL('coach-thread-empty'));
+    const afterSwitchBackText = await page.$eval(SEL('coach-input'), (el) => el.value);
+    const afterSwitchBackVid = await page.$eval(SEL('coach-pending-attachment'), (el) => el.textContent ?? '');
+    record(
+      '单空白草稿不占列表/Vault 行，连点铅笔及切去旧会话再点铅笔回来保留文字与视频',
+      hasDefaultExamplesBtn &&
+        miniDraftCountOk &&
+        afterRepeatedPencilText === '草稿保留文本' &&
+        afterRepeatedPencilVid.includes('sample-lift.mp4') &&
+        drawerRowsDuringDraft.length === 1 &&
+        vaultDuringDraft.threadsState?.threads.length === 1 &&
+        afterSwitchBackText === '草稿保留文本' &&
+        afterSwitchBackVid.includes('sample-lift.mp4'),
+      JSON.stringify({
+        hasDefaultExamplesBtn,
+        miniDraftCountOk,
+        drawerRowsDuringDraft,
+        vaultThreadCount: vaultDuringDraft.threadsState?.threads.length,
+        afterSwitchBackText,
+      }),
+    );
+
+    // 刷新页面：退出重进不产生空历史，且 default 保留已有真实对话
+    await page.reload({ waitUntil: 'load' });
+    await page.waitForSelector(SEL('coach-header-btn'));
+    const vaultAfterReload = await inspectVault();
+    const zeroEmptyAfterReload =
+      Boolean(vaultAfterReload.threadsState?.threads.length === 1) &&
+      vaultAfterReload.threadsState.threads.every((t) =>
+        vaultAfterReload.messages.some((m) => (m.threadId ?? 'default') === t.id),
+      );
+    await page.click(SEL('coach-header-btn'));
+    await page.waitForSelector(`${SEL('coach-pane')}[data-pane-role="mini"]`);
+    await page.click(SEL('coach-drag-handle'));
+    await page.waitForSelector(SEL('floating-swap-btn'));
+    await page.click(SEL('floating-swap-btn'));
+
+    // 6. 仅附件首条双连点发送互斥锁 + 纯文本首条隔离 + 手动压缩
+    await page.click(SEL('coach-new-thread-btn'));
+    await page.waitForSelector(SEL('coach-thread-empty'));
+    const attOnlyInput = await page.$(SEL('coach-video-input'));
+    await attOnlyInput.uploadFile(videoPath);
+    await page.waitForSelector(SEL('coach-pending-attachment'));
+    await page.evaluate((sel) => {
+      const btn = document.querySelector(sel);
+      btn.click();
+      btn.click();
+    }, SEL('coach-send-btn'));
+    await page.waitForFunction(
+      () => !document.querySelector('[data-testid="coach-cancel-stream-btn"]'),
+      { timeout: 10000 },
+    );
+    await sleep(650);
+    const vaultAfterAttSend = await inspectVault();
+    const attThreads = vaultAfterAttSend.threadsState?.threads.filter((t) => t.id !== 'default') ?? [];
+    const attThreadId = attThreads[0]?.id;
+    const attThreadMsgs = vaultAfterAttSend.messages.filter((m) => m.threadId === attThreadId);
+    const attUserMsgs = attThreadMsgs.filter((m) => m.role === 'user');
+    record(
+      '刷新不建空历史 + 仅附件首条并发连点只建 1 个线程且零重复首消息',
+      zeroEmptyAfterReload &&
+        attThreads.length === 1 &&
+        attUserMsgs.length === 1 &&
+        attThreadMsgs.length === 2,
+      JSON.stringify({
+        zeroEmptyAfterReload,
+        attThreadCount: attThreads.length,
+        attUserMsgsCount: attUserMsgs.length,
+        attThreadMsgsCount: attThreadMsgs.length,
+      }),
+    );
+
+    // 7. 「新开对话」空白隔离 + 多轮后「压缩早期上下文」
     await page.click(SEL('coach-new-thread-btn'));
     await page.waitForSelector(SEL('coach-thread-empty'));
     await sendText(page, '新话题第 1 问：肩推怎么热身？');
@@ -304,13 +443,56 @@ async function main() {
       JSON.stringify({ newThreadPolluted, summaryText }),
     );
 
+    // 8. 他线程流式回复中切入单一草稿 + 晚到异步回调不踢出草稿 + 通过铅笔回到草稿仍保留文字与视频
     await page.click(SEL('coach-threads-panel') + ' .coach-threads-head button');
     await page.evaluate(() => document.documentElement.setAttribute('data-theme', 'light'));
     await page.click(SEL('coach-new-thread-btn'));
+    await page.waitForSelector(SEL('coach-thread-empty'));
+    await setReactInput(page, SEL('coach-input'), '晚到回调测试：深蹲离心如何控制');
+    await page.click(SEL('coach-send-btn'));
+    await page.waitForSelector(SEL('coach-cancel-stream-btn'));
+    await page.click(SEL('coach-new-thread-btn'));
+    await page.waitForSelector(SEL('coach-thread-empty'));
+    await setReactInput(page, SEL('coach-input'), '晚到回复期间草稿');
+    await page.waitForFunction(
+      () => {
+        const btn = document.querySelector('[data-testid="coach-send-btn"]');
+        return Boolean(btn && !btn.disabled);
+      },
+      { timeout: 10000 },
+    );
+    await sleep(200);
+    const stayedInDraftDuringLateReply = Boolean(await page.$(SEL('coach-thread-empty')));
+    const draftDuringLateReply = await page.$eval(SEL('coach-input'), (el) => el.value);
+    const vaultAfterLateReply = await inspectVault();
+    const lateThread = vaultAfterLateReply.threadsState?.threads.find((t) =>
+      vaultAfterLateReply.messages.some(
+        (m) => m.threadId === t.id && m.role === 'user' && m.text.includes('晚到回调测试'),
+      ),
+    );
+    const lateThreadDone = Boolean(
+      lateThread &&
+        lateThread.title !== '新对话' &&
+        vaultAfterLateReply.messages.some(
+          (m) => m.threadId === lateThread.id && m.role === 'assistant' && m.text.includes('收到'),
+        ),
+    );
+    record(
+      '晚到异步回复/标题回调仅更新正式线程，不打断也不清空当前空白草稿',
+      stayedInDraftDuringLateReply && draftDuringLateReply === '晚到回复期间草稿' && lateThreadDone,
+      JSON.stringify({
+        stayedInDraftDuringLateReply,
+        draftDuringLateReply,
+        lateThreadTitle: lateThread?.title,
+        lateThreadDone,
+      }),
+    );
+
     await setReactInput(page, SEL('coach-input'), '延迟回复测试');
     await page.click(SEL('coach-send-btn'));
     await page.waitForSelector(SEL('coach-cancel-stream-btn'));
     await page.click(SEL('coach-new-thread-btn'));
+    await page.waitForSelector(SEL('coach-thread-empty'));
     await setReactInput(page, SEL('coach-input'), '留在第二条的未发草稿');
     const pending = await page.$(SEL('coach-video-input'));
     await pending.uploadFile(videoPath);
@@ -318,20 +500,30 @@ async function main() {
     const blocked = await page.$eval(SEL('coach-send-btn'), (button) => button.disabled);
     await page.click(SEL('coach-threads-btn'));
     const rows = await page.$$('[data-testid^="coach-thread-item-"]');
-    const newThreadId = (await rows[0].evaluate((el) => el.dataset.testid)).replace('coach-thread-item-', '');
-    const runningThreadId = (await rows[1].evaluate((el) => el.dataset.testid)).replace('coach-thread-item-', '');
+    const runningThreadId = (await rows[0].evaluate((el) => el.dataset.testid)).replace('coach-thread-item-', '');
     await page.click(SEL('coach-thread-item-' + runningThreadId));
     await page.waitForFunction(() => document.querySelector('.coach-messages')?.textContent.includes('收到'));
+    await page.waitForFunction(
+      () => !document.querySelector('[data-testid="coach-cancel-stream-btn"]'),
+      { timeout: 10000 },
+    );
+    await sleep(200);
     await page.click(SEL('coach-threads-btn'));
     await page.click(SEL('coach-thread-menu-' + runningThreadId));
     await page.click('.coach-thread-menu-actions button:first-child');
     await setReactInput(page, '.coach-thread-form input', '新对话 · 我的标题');
     await page.click('.coach-thread-form button[type=submit]');
-    await page.click(SEL('coach-thread-item-' + newThreadId));
+    await page.click(SEL('coach-threads-panel') + ' .coach-threads-head button');
+    await page.click(SEL('coach-new-thread-btn'));
+    await page.waitForSelector(SEL('coach-thread-empty'));
     const restored = await page.$eval(SEL('coach-input'), (el) => el.value);
     const restoredAttachment = await page.$eval(SEL('coach-pending-attachment'), (el) => el.textContent);
-    record('切会话保留另一会话回复、草稿和视频', blocked &&
-      restored === '留在第二条的未发草稿' && restoredAttachment.includes('sample-lift.mp4'));
+    record(
+      '他线程流式/改名后点铅笔回到单草稿仍保留文字与视频',
+      blocked &&
+        restored === '留在第二条的未发草稿' &&
+        restoredAttachment.includes('sample-lift.mp4'),
+    );
 
     await page.click(SEL('coach-threads-btn'));
     await page.waitForFunction((selector) => document.querySelector(selector)?.textContent.includes('我的标题'), {}, SEL('coach-thread-item-' + runningThreadId));
@@ -345,7 +537,7 @@ async function main() {
     await page.click('.coach-thread-form button[type=submit]');
     await page.waitForFunction((selector) => !document.querySelector(selector), {}, SEL('coach-thread-item-' + runningThreadId));
     const thatThreadDeleted = await page.evaluate((id) => new Promise((resolve, reject) => {
-      const request = indexedDB.open('motion-coach-vault', 1);
+      const request = indexedDB.open('motion-coach-vault');
       request.onerror = () => reject(request.error);
       request.onsuccess = () => {
         const db = request.result;
@@ -357,6 +549,7 @@ async function main() {
     record('取消删除保留会话，确认删除清理消息且手改标题有效', cancelled && thatThreadDeleted);
 
     await page.click(SEL('coach-threads-panel') + ' .coach-threads-head button');
+    await page.click(SEL('coach-new-thread-btn'));
     await sendText(page, '测试识图建计划');
     await page.waitForSelector(SEL('coach-plan-draft-card'));
     const findPlans = () => page.evaluate(() => new Promise((resolve, reject) => {
@@ -380,6 +573,13 @@ async function main() {
     const afterConfirm = await findPlans();
     record('在线工具先显示编辑草稿，确认只建一个计划且保存每手口径', beforeConfirm.length === 0 &&
       afterConfirm.length === 1 && afterConfirm[0].days[0].exercises[0].target.dumbbellBasis === 'per_hand');
+
+    const finalVault = await inspectVault();
+    const noEmptyThreadsFinal = Boolean(finalVault.threadsState?.threads.length) &&
+      finalVault.threadsState.threads.every((t) =>
+        finalVault.messages.some((m) => (m.threadId ?? 'default') === t.id),
+      );
+    record('全流程结束 Vault 无任何空会话残留', noEmptyThreadsFinal, `threads=${finalVault.threadsState?.threads.length}`);
 
     record('无未捕获浏览器异常', pageErrors.length === 0, pageErrors.join(' | '));
     const failed = checks.filter((c) => !c.ok);

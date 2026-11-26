@@ -13,6 +13,10 @@ export interface StoreDef {
 const DB_NAME = 'motion-training';
 const DB_VERSION = 1;
 
+export const COACH_RESTORE_EPOCH_META_KEY = 'coach-restore-epoch';
+export const COACH_OP_META_PREFIX = 'coach-op:';
+export const REST_TIMER_STATE_META_PREFIX = 'rest-timer-state:';
+
 const STORES: StoreDef[] = [
   { name: 'meta', keyPath: 'key' },
   {
@@ -138,6 +142,32 @@ export function idbDelete(store: string, key: IDBValidKey): Promise<void> {
   return tx(store, 'readwrite', (s) => reqToPromise(s.delete(key)).then(() => undefined));
 }
 
+export function idbDeleteIf<T>(
+  store: string,
+  key: IDBValidKey,
+  predicate: (existing: T | undefined) => boolean,
+): Promise<boolean> {
+  return tx(store, 'readwrite', (s) =>
+    new Promise<boolean>((resolve, reject) => {
+      const getReq = s.get(key) as IDBRequest<T | undefined>;
+      getReq.onerror = () => reject(new StorageError('读取失败', getReq.error));
+      getReq.onsuccess = () => {
+        try {
+          if (!predicate(getReq.result)) {
+            resolve(false);
+            return;
+          }
+          const delReq = s.delete(key);
+          delReq.onerror = () => reject(new StorageError('删除失败', delReq.error));
+          delReq.onsuccess = () => resolve(true);
+        } catch (err) {
+          reject(err instanceof StorageError ? err : new StorageError('删除条件检查失败', err));
+        }
+      };
+    }),
+  );
+}
+
 export function idbClear(store: string): Promise<void> {
   return tx(store, 'readwrite', (s) => reqToPromise(s.clear()).then(() => undefined));
 }
@@ -179,13 +209,37 @@ export function __resetDbHandle(): void {
   dbPromise = null;
 }
 
+export async function readMainRestoreEpoch(): Promise<number | null> {
+  if (typeof indexedDB === 'undefined') return null;
+  try {
+    const rec = await idbGet<{ key: string; value: unknown }>('meta', COACH_RESTORE_EPOCH_META_KEY);
+    if (rec && typeof rec.value === 'number' && Number.isFinite(rec.value) && rec.value >= 0) {
+      return Math.trunc(rec.value);
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export async function syncMainRestoreEpoch(epoch: number): Promise<void> {
+  if (typeof indexedDB === 'undefined') return;
+  const normalized = Number.isFinite(epoch) && epoch >= 0 ? Math.trunc(epoch) : 0;
+  try {
+    await idbPut('meta', { key: COACH_RESTORE_EPOCH_META_KEY, value: normalized });
+  } catch {
+    /* ignore */
+  }
+}
+
 /**
  * G1：全量恢复（plans / sessions / settings / 动作模板）的原子入口。
  *
  * 关键边界：
- * · **绝不把整个 meta store 交给通用 clear**：只删除 `exercise-template:` 前缀的行；
- *   锁（lock:*）、播种（seeded）、恢复前快照（pre-restore-snapshot）等无关元数据
- *   完整保留。恢复成功后在同一事务内写 `seeded = true`（恢复即视为已初始化）。
+ * · **绝不把整个 meta store 交给通用 clear**：只定向清理 `exercise-template:`、`coach-op:`、
+ *   `rest-timer-state:` 前缀；锁（lock:*）、播种（seeded）、恢复前快照（pre-restore-snapshot）
+ *   等无关元数据完整保留。恢复成功后在同一事务内写 `seeded = true` 与递增后的
+ *   `coach-restore-epoch`，使恢复前教练操作/计时立刻失效。
  * · plans / sessions / settings 与模板在一笔 readwrite 事务里替换，
  *   任一步失败整体 abort（原有数据不变）。
  */
@@ -194,11 +248,12 @@ export function idbRestoreAll(payload: {
   sessions: unknown[];
   settings: unknown[];
   exerciseTemplates: unknown[];
-}): Promise<void> {
+  minPriorRestoreEpoch?: number;
+}): Promise<number> {
   const TEMPLATE_PREFIX = 'exercise-template:';
   return openDb().then(
     (db) =>
-      new Promise<void>((resolve, reject) => {
+      new Promise<number>((resolve, reject) => {
         let t: IDBTransaction;
         try {
           t = db.transaction(['plans', 'sessions', 'settings', 'meta'], 'readwrite');
@@ -207,6 +262,7 @@ export function idbRestoreAll(payload: {
           return;
         }
         let failed = false;
+        let nextRestoreEpoch = Math.max(0, Math.trunc(payload.minPriorRestoreEpoch ?? 0)) + 1;
         const fail = (cause: unknown) => {
           if (failed) return;
           failed = true;
@@ -218,7 +274,7 @@ export function idbRestoreAll(payload: {
           reject(cause instanceof StorageError ? cause : new StorageError('恢复失败，原有数据未改变', cause));
         };
         t.oncomplete = () => {
-          if (!failed) resolve();
+          if (!failed) resolve(nextRestoreEpoch);
         };
         t.onerror = () => fail(t.error);
         t.onabort = () => fail(new StorageError('恢复被中止，原有数据未改变', t.error));
@@ -234,22 +290,45 @@ export function idbRestoreAll(payload: {
           for (const row of payload.sessions) sessionsStore.put(row as object);
           for (const row of payload.settings) settingsStore.put(row as object);
 
-          // 只定向清理模板前缀；其它 meta（锁/seed/恢复前快照等）原样保留
-          const keysReq = metaStore.getAllKeys();
-          keysReq.onerror = () => fail(keysReq.error);
-          keysReq.onsuccess = () => {
+          const epochReq = metaStore.get(COACH_RESTORE_EPOCH_META_KEY);
+          epochReq.onerror = () => fail(epochReq.error);
+          epochReq.onsuccess = () => {
             try {
-              for (const key of keysReq.result) {
-                if (typeof key === 'string' && key.startsWith(TEMPLATE_PREFIX)) metaStore.delete(key);
-              }
-              for (const tpl of payload.exerciseTemplates) {
-                const row = tpl as { exerciseId?: unknown };
-                if (typeof row.exerciseId !== 'string' || !row.exerciseId) {
-                  throw new StorageError('动作模板缺少 exerciseId，恢复已取消');
+              const row = epochReq.result as { key?: unknown; value?: unknown } | undefined;
+              const prevMainEpoch =
+                typeof row?.value === 'number' && Number.isFinite(row.value) && row.value >= 0
+                  ? Math.trunc(row.value)
+                  : 0;
+              nextRestoreEpoch =
+                Math.max(prevMainEpoch, Math.trunc(payload.minPriorRestoreEpoch ?? 0)) + 1;
+
+              const keysReq = metaStore.getAllKeys();
+              keysReq.onerror = () => fail(keysReq.error);
+              keysReq.onsuccess = () => {
+                try {
+                  for (const key of keysReq.result) {
+                    if (
+                      typeof key === 'string' &&
+                      (key.startsWith(TEMPLATE_PREFIX) ||
+                        key.startsWith(COACH_OP_META_PREFIX) ||
+                        key.startsWith(REST_TIMER_STATE_META_PREFIX))
+                    ) {
+                      metaStore.delete(key);
+                    }
+                  }
+                  for (const tpl of payload.exerciseTemplates) {
+                    const rowTpl = tpl as { exerciseId?: unknown };
+                    if (typeof rowTpl.exerciseId !== 'string' || !rowTpl.exerciseId) {
+                      throw new StorageError('动作模板缺少 exerciseId，恢复已取消');
+                    }
+                    metaStore.put({ key: `${TEMPLATE_PREFIX}${rowTpl.exerciseId}`, value: tpl });
+                  }
+                  metaStore.put({ key: COACH_RESTORE_EPOCH_META_KEY, value: nextRestoreEpoch });
+                  metaStore.put({ key: 'seeded', value: true });
+                } catch (err) {
+                  fail(err);
                 }
-                metaStore.put({ key: `${TEMPLATE_PREFIX}${row.exerciseId}`, value: tpl });
-              }
-              metaStore.put({ key: 'seeded', value: true });
+              };
             } catch (err) {
               fail(err);
             }
