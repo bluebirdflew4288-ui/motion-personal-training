@@ -37,6 +37,8 @@ keystore.properties
 **/keystore.properties
 *.p12
 *.pfx
+*.pkcs12
+*.pk8
 
 # ── 凭据 / 环境变量 / 会话 ──
 .env
@@ -45,6 +47,11 @@ keystore.properties
 *.key
 secrets.*
 **/credentials.json
+.npmrc
+.netrc
+
+# 用户手动导出的完整备份（保留源码中的预置训练模板与合成测试数据）
+motion-backup-*.json
 
 # ── 本地归档与临时工作目录 ──
 _archive/

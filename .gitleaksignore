@@ -1,0 +1,4 @@
+# Reviewed fixtures and cardio field. These exceptions apply only to the original commits.
+0cc7e012704d590243349e2e5d3c83e6d9caee97:app/test/coach-v023-reliability.test.ts:generic-api-key:3808
+0cc7e012704d590243349e2e5d3c83e6d9caee97:app/test/coach-v023-reliability.test.ts:generic-api-key:4170
+e6d12ca2ccd6aa50c22474d860b6e39bfd73bd73:app/android/native-test/ExportSpoolTest.java:generic-api-key:272

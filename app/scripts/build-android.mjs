@@ -12,7 +12,7 @@
      3. npx cap sync android（把 dist-android 复制进 APK 的 assets/public）
      4. 静态自检：APK 资源里必须是最新构建、且 capacitor 配置无远程 server.url
         （任何自检失败立即中止退出，绝不继续执行 Gradle）
-     5. Gradle 构建 debug / release（release 有签名配置才签）
+     5. Gradle 构建 debug / release（release 有签名配置才签），扫描 release APK 后再交付路径
 
    用法：
      node scripts/build-android.mjs                 # 只构建 debug
@@ -175,6 +175,8 @@ export function executeAndroidBuild({
   const distDir = join(appDir, 'dist-android');
   const androidDir = join(appDir, 'android');
 
+  const buildRoot = env.MOTION_ANDROID_BUILD_DIR || join(env.HOME ?? '', '.motion-android-build');
+
   // 0. 前置门禁（在任何 dist/public 清理或写入前）
   const { sdk } = runPreflightGate({ env, existsFn, runFn });
 
@@ -238,9 +240,12 @@ export function executeAndroidBuild({
   });
   ok('assembleDebug 完成');
 
+  const projectKey = motionProjectKey(androidDir);
+  const appOut = join(buildRoot, projectKey, '_app/outputs/apk');
   if (wantRelease) {
     const signingDir = env.MOTION_SIGNING_DIR || join(env.HOME ?? '', '.motion-android-signing');
-    if (existsFn(join(signingDir, 'keystore.properties'))) {
+    const signed = existsFn(join(signingDir, 'keystore.properties'));
+    if (signed) {
       ok('检测到签名配置，构建已签名 release');
     } else {
       console.log('  · 未发现签名配置（' + signingDir + '/keystore.properties），release 将未签名');
@@ -250,13 +255,13 @@ export function executeAndroidBuild({
       env: { ANDROID_HOME: sdk, ANDROID_SDK_ROOT: sdk },
     });
     ok('assembleRelease 完成');
+    const releaseApk = join(appOut, 'release', signed ? 'app-release.apk' : 'app-release-unsigned.apk');
+    log('扫描 release APK 凭据');
+    runFn('python3', [join(appDir, '../scripts/scan-credentials.py'), releaseApk]);
   }
 
   // 产物位置
   log('产物位置');
-  const buildRoot = env.MOTION_ANDROID_BUILD_DIR || join(env.HOME ?? '', '.motion-android-build');
-  const projectKey = motionProjectKey(androidDir);
-  const appOut = join(buildRoot, projectKey, '_app/outputs/apk');
   console.log(`\n  构建目录指纹: ${projectKey}`);
   for (const [label, p] of [
     ['debug', join(appOut, 'debug/app-debug.apk')],

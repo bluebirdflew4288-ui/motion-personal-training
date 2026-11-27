@@ -1,0 +1,16 @@
+[extend]
+useDefault = true
+
+# Vite preserves this cardio field name in the published JavaScript bundle.
+[[allowlists]]
+description = "Cardio split time field"
+targetRules = ["generic-api-key"]
+regexTarget = "secret"
+regexes = ['''^splitSecPer500m$''']
+
+[[rules]]
+id = "motion-credential-assignment"
+description = "High-entropy literal assigned to a credential field"
+regex = '''(?i)(?:^|[^a-z0-9_])(?:[a-z0-9_-]*[_-])?(?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|provider[_-]?api[_-]?key|web[_-]?search[_-]?api[_-]?key|store[_-]?password|key[_-]?password)["']?\s*[:=]\s*["']([a-z0-9_./+~!@#$%^&*()=:-]{16,180})["']'''
+secretGroup = 1
+entropy = 3.5

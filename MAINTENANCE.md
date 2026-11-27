@@ -62,6 +62,13 @@ Android 完整打包需要 SDK 与必需检查先通过；失败时应在写入 
 
 新包应使用新的版本号和文件名。回滚到 0.1.19 时，数据恢复需要升级前的 v3 备份。签名文件、密码、个人备份、缓存和浏览器 profile 留在本机。
 
+### 凭据扫描
+
+开发机须有 Python 3、`strings` 和 [Gitleaks v8.30.1](https://github.com/gitleaks/gitleaks/releases/tag/v8.30.1)。同步 GitHub 前，在完整克隆中提交本次变更，然后从仓库根目录运行 `python3 scripts/scan-credentials.py`。该命令检查可达提交和历史 APK。现有 CI 在 push 和 pull request 上复跑。
+
+`npm run android:apk:release` 构建完成后会扫描本次生成的 release APK，覆盖解包资源、JS Bundle 和 DEX 字符串。上传 GitHub 或分发前，对最终待上传文件再运行 `python3 scripts/scan-credentials.py /path/to/MOTION-release.apk`。扫描失败即停止同步或发布。发现疑似凭据时在本机脱敏复核，确认泄露即撤销或轮换。
+
+
 ## 5. 真机结论与待验证范围
 
 0.1.7 在同一荣耀手机上，用户将启动管理改为手动并确认三项开启后，短时无 USB 锁屏提醒复测通过；自动管理时曾失败。系统通知创建时间不等于用户听到或感到震动的延迟。
