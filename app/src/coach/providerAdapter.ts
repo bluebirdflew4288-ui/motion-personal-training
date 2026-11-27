@@ -10,6 +10,7 @@
       与 `cache_control` 断点，Gemini 完整 `candidate.content.parts` / `thoughtSignature` / 服务端 `functionCall.id`。 */
 
 import { getCoachFetch } from './coachNativeStream';
+import { redactCredential } from './credentialRedaction';
 import {
   isBailianDeepSeekDeployment,
   resolveProviderCapabilities,
@@ -353,7 +354,7 @@ export async function fetchProviderModels(
   const res = await fetchFn(url, { method: 'GET', headers, signal });
   if (!res.ok) {
     const errText = await res.text().catch(() => '');
-    throw new Error(`获取模型列表失败 (${res.status}): ${errText.slice(0, 200) || res.statusText}`);
+    throw new Error(`获取模型列表失败 (${res.status}): ${redactCredential(errText || res.statusText, config.apiKey).slice(0, 200)}`);
   }
 
   const payload = (await res.json()) as unknown;
@@ -1009,6 +1010,7 @@ export async function* streamCoachTurn(
       yield* streamCoachTurn(config, messages, tools, { ...options, includeUsage: false });
       return;
     }
+    const safeDetail = redactCredential(errText || response.statusText, config.apiKey);
     if (
       config.kind === 'gemini' &&
       options?.webSearch === true &&
@@ -1017,10 +1019,10 @@ export async function* streamCoachTurn(
       /google[_ ]?search|function[_ ]?(?:declaration|calling)|tool use/i.test(errText)
     ) {
       throw new GeminiGroundingConflictError(
-        errText.slice(0, 200) || 'Gemini 不支持同轮混用搜索与函数工具',
+        safeDetail.slice(0, 200) || 'Gemini 不支持同轮混用搜索与函数工具',
       );
     }
-    throw new Error(`模型请求失败 (${response.status}): ${errText.slice(0, 240) || response.statusText}`);
+    throw new Error(`模型请求失败 (${response.status}): ${safeDetail.slice(0, 240)}`);
   }
   if (!response.body) {
     throw new Error('模型响应缺少流式 body');

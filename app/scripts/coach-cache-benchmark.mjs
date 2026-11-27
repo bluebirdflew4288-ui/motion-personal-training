@@ -167,6 +167,7 @@ import { registerSessionRuntime } from './src/coach/sessionRuntimeBridge';
 import { acquireSessionLock } from './src/lib/lock';
 import type { CoachThinkingDepth } from './src/coach/providerAdapter';
 import { iterateSseEvents } from './src/coach/providerAdapter';
+import { redactCredential } from './src/coach/credentialRedaction';
 
 interface BenchOptions {
   live: boolean;
@@ -1171,7 +1172,7 @@ async function postLiveBaselineChat(
     body: JSON.stringify(payload),
   });
   if (!res.ok) {
-    throw new Error('Baseline live HTTP ' + res.status + ': ' + (await res.text()).slice(0, 200));
+    throw new Error('Baseline live HTTP ' + res.status + ': ' + redactCredential(await res.text(), cfg.apiKey).slice(0, 200));
   }
   const json = (await res.json()) as {
     choices?: Array<{

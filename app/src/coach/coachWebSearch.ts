@@ -2,6 +2,7 @@
    在 Android 原生环境下优先走原生 fetch（CoachStream.fetchText），避免 WebView CORS 拦截。 */
 
 import type { CoachWebSearchProvider } from './coachStorage';
+import { redactCredential } from './credentialRedaction';
 
 export interface CoachWebSearchHit {
   title: string;
@@ -276,7 +277,7 @@ async function executeSearchRequest(
     );
     if (!res.ok) {
       const txt = await res.text().catch(() => '');
-      throw new Error(`Tavily 搜索失败 (${res.status}): ${txt.slice(0, 160) || res.statusText}`);
+      throw new Error(`Tavily 搜索失败 (${res.status}): ${redactCredential(txt || res.statusText, apiKey).slice(0, 160)}`);
     }
     const json = (await res.json()) as { results?: Array<Record<string, unknown>> };
     const hits: CoachWebSearchHit[] = [];
@@ -314,7 +315,7 @@ async function executeSearchRequest(
     );
     if (!res.ok) {
       const txt = await res.text().catch(() => '');
-      throw new Error(`博查搜索失败 (${res.status}): ${txt.slice(0, 160) || res.statusText}`);
+      throw new Error(`博查搜索失败 (${res.status}): ${redactCredential(txt || res.statusText, apiKey).slice(0, 160)}`);
     }
     const json = (await res.json()) as {
       data?: { webPages?: { value?: Array<Record<string, unknown>> } };
@@ -352,7 +353,7 @@ async function executeSearchRequest(
   );
   if (!res.ok) {
     const txt = await res.text().catch(() => '');
-    throw new Error(`Brave 搜索失败 (${res.status}): ${txt.slice(0, 160) || res.statusText}`);
+    throw new Error(`Brave 搜索失败 (${res.status}): ${redactCredential(txt || res.statusText, apiKey).slice(0, 160)}`);
   }
   const json = (await res.json()) as { web?: { results?: Array<Record<string, unknown>> } };
   const hits: CoachWebSearchHit[] = [];
